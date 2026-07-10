@@ -5,6 +5,15 @@ node_modules/
 dist/
 *.zip
 
+# local deploy/tool state
+.netlify/
+.playwright-mcp/
+
+# generated screenshots / local notes
+*.png
+README_RUNTIME_PACKAGE.md
+项目汇总版.md
+
 # logs
 npm-debug.log*
 yarn-debug.log*

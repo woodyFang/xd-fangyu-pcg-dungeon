@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#07080d" />
-    <meta name="description" content="A deterministic procedural dungeon generator you can watch build itself, room by room. Scatter → separate → Delaunay → MST + loops → carve → theme, rendered live with Three.js." />
-    <title>Dungeon Forge — Procedural Dungeon Generator</title>
+    <meta name="description" content="XD程序化房间生成器：基于随机种子快速生成房间布局、路径连接与主题化场景，支持实时预览、参数调节和 2D 区域编辑。" />
+    <title>XD程序化房间生成器</title>
 
     <meta name="author" content="Majid Manzarpour" />
     <link rel="author" href="https://x.com/majidmanzarpour" />
@@ -13,16 +13,16 @@
 
     <!-- Social share (Open Graph + Twitter) -->
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="Dungeon Forge — Procedural Dungeon Generator" />
-    <meta property="og:description" content="Watch a dungeon build itself, room by room — scatter, separate, triangulate, carve, theme. A deterministic procgen core rendered live with Three.js." />
+    <meta property="og:title" content="XD程序化房间生成器" />
+    <meta property="og:description" content="XD程序化房间生成器：基于随机种子快速生成房间布局、路径连接与主题化场景，支持实时预览、参数调节和 2D 区域编辑。" />
     <meta property="og:url" content="https://procedural-dungeon.netlify.app/" />
     <meta property="og:image" content="https://procedural-dungeon.netlify.app/og.jpg" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="A procedurally generated dungeon of glowing rooms and corridors seen from above in a moody, ember-lit world." />
+    <meta property="og:image:alt" content="俯视视角下由发光区域和路径组成的程序化场景，笼罩在主题化光影氛围中。" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Dungeon Forge — Procedural Dungeon Generator" />
-    <meta name="twitter:description" content="Watch a dungeon build itself, room by room — scatter, separate, triangulate, carve, theme. A deterministic procgen core rendered live with Three.js." />
+    <meta name="twitter:title" content="XD程序化房间生成器" />
+    <meta name="twitter:description" content="XD程序化房间生成器：基于随机种子快速生成房间布局、路径连接与主题化场景，支持实时预览、参数调节和 2D 区域编辑。" />
     <meta name="twitter:image" content="https://procedural-dungeon.netlify.app/og.jpg" />
     <meta name="twitter:site" content="@majidmanzarpour" />
     <meta name="twitter:creator" content="@majidmanzarpour" />
@@ -32,91 +32,131 @@
   <body>
     <!-- control + telemetry panel -->
     <div id="panel">
-      <button id="collapse" aria-label="Collapse panel" title="Collapse">–</button>
+      <button id="collapse" aria-label="收起面板" title="收起">–</button>
       <div class="head">
-        <div class="brand"><span>DUNGEON&nbsp;FORGE</span><span>procgen&nbsp;core</span></div>
+        <div class="brand"><span>场景锻炉</span><span>程序生成核心</span></div>
         <h1 id="dname">—</h1>
-        <div id="dsub">forging…</div>
+        <div id="dsub">生成中…</div>
       </div>
 
-      <ul class="pipe" id="pipe" aria-label="Generation pipeline">
-        <li>SCATTER</li><li>SEPARATE</li><li>DELAUNAY</li><li>MST+LOOPS</li><li>CARVE</li><li>THEME</li>
+      <ul class="pipe" id="pipe" aria-label="生成流程">
+        <li>散布</li><li>分离</li><li>三角网</li><li>主路径+回环</li><li>铺装</li><li>主题</li>
       </ul>
 
       <div class="sec">
         <div class="row">
-          <label style="flex:1"><span class="lab"><span>SEED</span></span>
+          <label style="flex:1"><span class="lab"><span>种子</span></span>
             <div class="row">
-              <input id="seed" type="number" value="1337" aria-label="Seed">
-              <button class="btn" id="dice" title="Random seed" aria-label="Random seed">⚄</button>
+              <input id="seed" type="number" value="1337" aria-label="种子">
+              <button class="btn" id="dice" title="随机种子" aria-label="随机种子">⚄</button>
             </div>
           </label>
         </div>
-        <button class="btn primary" id="forge" style="width:100%;margin-top:10px">FORGE&nbsp;DUNGEON</button>
+        <button class="btn primary" id="forge" style="width:100%;margin-top:10px">生成场景</button>
       </div>
 
       <div class="sec">
-        <span class="lab"><span>THEME</span><b id="vTheme">AUTO</b></span>
-        <div class="chips" id="chips">
-          <button class="chip on" data-t="auto">AUTO</button>
-          <button class="chip" data-t="ancient">ANCIENT</button>
-          <button class="chip" data-t="molten">MOLTEN</button>
-          <button class="chip" data-t="frost">FROST</button>
-          <button class="chip" data-t="grim">GRIM</button>
-          <button class="chip" data-t="verdant">VERDANT</button>
+        <span class="lab"><span>题材</span><b id="vSetting">自动</b></span>
+        <div class="chips" id="settingChips">
+          <button class="chip on" data-s="auto">自动</button>
+          <button class="chip" data-s="dungeon">遗迹</button>
+          <button class="chip" data-s="hospital">医院</button>
         </div>
       </div>
 
       <div class="sec">
-        <span class="lab"><span>OBJECTS</span><span style="color:#4a4f61">tap to toggle</span></span>
+        <span class="lab"><span>色调</span><b id="vTheme">自动</b></span>
+        <div class="chips" id="paletteChips">
+          <button class="chip on" data-p="auto">自动</button>
+          <button class="chip" data-p="ancient">暖灰</button>
+          <button class="chip" data-p="molten">暖橙</button>
+          <button class="chip" data-p="frost">冷蓝</button>
+          <button class="chip" data-p="grim">暗绿</button>
+          <button class="chip" data-p="verdant">青绿</button>
+          <button class="chip" data-p="sterile">冷白</button>
+          <button class="chip" data-p="abandoned">灰绿</button>
+          <button class="chip" data-p="emergency">警示红</button>
+        </div>
+      </div>
+
+      <div class="sec">
+        <span class="lab"><span>场景对象</span><span style="color:#4a4f61">点击切换</span></span>
         <div class="chips" id="objchips">
-          <button class="chip on" data-o="props" aria-pressed="true">PROPS</button>
-          <button class="chip on" data-o="torches" aria-pressed="true">TORCHES</button>
-          <button class="chip on" data-o="particles" aria-pressed="true">PARTICLES</button>
-          <button class="chip on" data-o="liquids" aria-pressed="true">LIQUIDS</button>
-          <button class="chip on" data-o="lights" aria-pressed="true">LIGHTS</button>
+          <button class="chip on" data-o="props" aria-pressed="true">物件</button>
+          <button class="chip on" data-o="torches" aria-pressed="true">发光点</button>
+          <button class="chip on" data-o="particles" aria-pressed="true">氛围</button>
+          <button class="chip on" data-o="liquids" aria-pressed="true">表面</button>
+          <button class="chip on" data-o="lights" aria-pressed="true">光源</button>
         </div>
       </div>
 
       <div class="sec">
-        <label class="sl"><span class="lab"><span>ROOMS</span><b id="vRooms">42</b></span>
-          <input type="range" id="rooms" min="12" max="80" value="42" aria-label="Room count"></label>
-        <label class="sl"><span class="lab"><span>LOOPINESS</span><b id="vLoops">15%</b></span>
-          <input type="range" id="loops" min="0" max="40" value="15" aria-label="Loop chance"></label>
-        <label class="sl"><span class="lab"><span>DECOR&nbsp;DENSITY</span><b id="vDecor">60%</b></span>
-          <input type="range" id="decor" min="0" max="100" value="60" aria-label="Decoration density"></label>
+        <label class="sl"><span class="lab"><span>区域数量</span><b id="vRooms">42</b></span>
+          <input type="range" id="rooms" min="12" max="80" value="42" aria-label="区域数量"></label>
+        <label class="sl"><span class="lab"><span>回环率</span><b id="vLoops">15%</b></span>
+          <input type="range" id="loops" min="0" max="40" value="15" aria-label="回环概率"></label>
+        <label class="sl"><span class="lab"><span>装饰密度</span><b id="vDecor">60%</b></span>
+          <input type="range" id="decor" min="0" max="100" value="60" aria-label="装饰密度"></label>
       </div>
 
       <div class="sec togs">
-        <label class="tog"><input type="checkbox" id="tGraph"> Graph overlay <span class="key">G</span></label>
-        <label class="tog"><input type="checkbox" id="tHeat"> Difficulty heatmap <span class="key">H</span></label>
-        <label class="tog"><input type="checkbox" id="tAnim" checked> Animate build <span class="key">SPACE&nbsp;skips</span></label>
-        <label class="tog"><input type="checkbox" id="tPost" checked> Post FX <span class="key">P</span></label>
+        <label class="tog"><input type="checkbox" id="tGraph"> 结构叠加 <span class="key">G</span></label>
+        <label class="tog"><input type="checkbox" id="tHeat"> 强度热力图 <span class="key">H</span></label>
+        <label class="tog"><input type="checkbox" id="tAnim" checked> 播放生成动画 <span class="key">空格跳过</span></label>
+        <label class="tog"><input type="checkbox" id="tPost" checked> 后期特效 <span class="key">P</span></label>
       </div>
 
-      <div class="sec legend" aria-label="Room type legend">
-        <span class="lg"><span class="dot" style="background:var(--teal)"></span>Entrance</span>
-        <span class="lg"><span class="dot" style="background:#8f95a3"></span>Combat</span>
-        <span class="lg"><span class="dot" style="background:var(--violet)"></span>Elite</span>
-        <span class="lg"><span class="dot" style="background:var(--gold)"></span>Treasure</span>
-        <span class="lg"><span class="dot" style="background:var(--blue)"></span>Shrine</span>
-        <span class="lg"><span class="dot" style="background:var(--blood)"></span>Boss</span>
+      <div class="sec legend" aria-label="区域类型图例">
+        <span class="lg"><span class="dot" style="background:var(--teal)"></span>起点</span>
+        <span class="lg"><span class="dot" style="background:#8f95a3"></span>常规</span>
+        <span class="lg"><span class="dot" style="background:var(--violet)"></span>强化</span>
+        <span class="lg"><span class="dot" style="background:var(--gold)"></span>奖励</span>
+        <span class="lg"><span class="dot" style="background:var(--blue)"></span>事件</span>
+        <span class="lg"><span class="dot" style="background:var(--blood)"></span>终点</span>
       </div>
 
       <div class="sec stats">
-        <div class="st"><i>ROOMS</i><b id="sRooms">—</b></div>
-        <div class="st"><i>LINKS·LOOPS</i><b id="sEdges">—</b></div>
-        <div class="st"><i>CRIT&nbsp;PATH</i><b id="sCrit">—</b></div>
-        <div class="st"><i>FLOOR&nbsp;TILES</i><b id="sTiles">—</b></div>
-        <div class="st"><i>LIGHTS</i><b id="sLights">—</b></div>
-        <div class="st"><i>GEN&nbsp;TIME</i><b id="sMs" class="hi">—</b></div>
-        <div class="st"><i>DRAW&nbsp;CALLS</i><b id="sCalls">—</b></div>
-        <div class="st"><i>TRIANGLES</i><b id="sTris">—</b></div>
-        <div class="st"><i>FPS</i><b id="sFps">—</b></div>
+        <div class="st"><i>区域</i><b id="sRooms">—</b></div>
+        <div class="st"><i>连接·回环</i><b id="sEdges">—</b></div>
+        <div class="st"><i>关键路径</i><b id="sCrit">—</b></div>
+        <div class="st"><i>铺装格</i><b id="sTiles">—</b></div>
+        <div class="st"><i>光源</i><b id="sLights">—</b></div>
+        <div class="st"><i>生成耗时</i><b id="sMs" class="hi">—</b></div>
+        <div class="st"><i>绘制调用</i><b id="sCalls">—</b></div>
+        <div class="st"><i>三角面</i><b id="sTris">—</b></div>
+        <div class="st"><i>帧率</i><b id="sFps">—</b></div>
       </div>
     </div>
 
-    <div id="hints"><b>drag</b> pan · <b>wheel</b> zoom · <b>shift-drag</b> orbit · <b>R</b> reforge · <b>T</b> theme · <b>G</b> graph · <b>H</b> heat · <b>P</b> post · <b>space</b> skip</div>
+    <div class="sec editor-sec">
+        <input type="checkbox" id="tEditor" checked hidden>
+        <span class="lab editor-title"><span>2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button></span>
+        <div class="editor-canvas-wrap">
+          <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="2D 区域编辑器"></canvas>
+        </div>
+        <div class="editor-panel-resize editor-panel-resize-left" data-editor-resize="left" title="拖拽调整编辑器宽度"></div>
+        <div class="editor-panel-resize editor-panel-resize-bottom" data-editor-resize="bottom" title="拖拽调整编辑器高度"></div>
+        <div class="editor-panel-resize editor-panel-resize-corner" data-editor-resize="corner" title="拖拽调整编辑器大小"></div>
+    </div>
+
+    <div id="editorMenu" class="editor-menu">
+      <button data-action="add-room" data-menu="blank">添加区域</button>
+      <button data-action="delete" data-menu="room">删除区域</button>
+      <button data-action="lock" data-menu="room">锁定/解锁</button>
+      <button data-action="connect" data-menu="room">连接路径到这里</button>
+      <button data-action="entrance" data-menu="room">设为起点</button>
+      <button data-action="boss" data-menu="room">设为终点</button>
+      <button data-action="secret" data-menu="room">设为/取消密室</button>
+      <button data-action="add-bend" data-menu="link">添加转折点</button>
+      <button data-action="reset-link" data-menu="link">重置路径形状</button>
+      <button data-action="narrower" data-menu="link">路径变窄</button>
+      <button data-action="wider" data-menu="link">路径变宽</button>
+      <button data-action="delete-link" data-menu="link">删除路径</button>
+      <button data-action="delete-bend" data-menu="bend">删除转折点</button>
+      <button data-action="reset-door" data-menu="door">重置门槽点</button>
+    </div>
+
+    <div id="hints"><b>拖拽</b> 平移 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
 
     <script type="module" src="./src/main.js"></script>
   </body>

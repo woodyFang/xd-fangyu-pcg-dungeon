@@ -1,10 +1,10 @@
 {
   "name": "dungeon-forge",
   "version": "1.0.0",
-  "description": "A deterministic procedural dungeon generator you can watch build itself, room by room — scatter, separate, Delaunay-triangulate, MST + loops, carve, and theme, rendered live with Three.js.",
+  "description": "XD procedural room generator with seeded layouts, themed scenes, realtime preview, and 2D area editing.",
   "type": "module",
-  "author": "Majid Manzarpour (https://x.com/majidmanzarpour)",
-  "homepage": "https://procedural-dungeon.netlify.app",
+  "author": "woodyFang <707304303@qq.com>",
+  "homepage": "https://xd-fangyu-pcg-dungeon.netlify.app",
   "license": "MIT",
   "keywords": [
     "three.js",
