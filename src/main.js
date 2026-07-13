@@ -278,10 +278,15 @@ function classifyArch(w, h){
   if(m >= 8 || area >= 64) return 'm';
   return 's';
 }
+function roomShapeContains(r, x, y){
+  const cx = Number.isFinite(r.cx) ? r.cx : r.x, cy = Number.isFinite(r.cy) ? r.cy : r.y;
+  if(!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(r.w) || !Number.isFinite(r.h)) return false;
+  return Math.abs(x - cx) <= Math.max(1, r.w/2) && Math.abs(y - cy) <= Math.max(1, r.h/2);
+}
 function makeRoomRecord(id, cx, cy, w, h, shape, locked, roleHint){
   w = Math.max(5, Math.round(w)); h = Math.max(5, Math.round(h));
   cx = Math.round(cx); cy = Math.round(cy);
-  return { id, sourceId:id, cx, cy, w, h, arch:classifyArch(w,h), shape:shape || 'rect',
+  return { id, sourceId:id, cx, cy, w, h, arch:classifyArch(w,h), shape:'rect',
     sx0:cx, sy0:cy, type:TYPE.COMBAT, depth:0, difficulty:0.2, degree:0,
     locked:!!locked, roleHint:roleHint || null };
 }
@@ -294,8 +299,7 @@ function randomScatterRooms(rng, N, idStart, centerX, centerY){
     if(t<0.45){ arch='s'; w=rng.i(5,7);  h=rng.i(5,7); }
     else if(t<0.85){ arch='m'; w=rng.i(8,12); h=rng.i(8,12); }
     else { arch='l'; w=rng.i(13,18); h=rng.i(13,18); large.push(i); }
-    const st = rng.raw();
-    const shape = st<0.60 ? 'rect' : (st<0.82 ? 'ellipse' : 'oct');
+    const shape = 'rect';
     const ang = rng.f(0, Math.PI*2), rad = R*Math.sqrt(rng.raw());
     const cx = Math.cos(ang)*rad + (centerX || 0), cy = Math.sin(ang)*rad + (centerY || 0);
     rooms.push({ id:idStart+i, sourceId:null, cx, cy, w, h, arch, shape, sx0:cx, sy0:cy,
@@ -320,7 +324,7 @@ function initialRoomsFromParams(rng, params){
     cx /= Math.max(1, rooms.length); cy /= Math.max(1, rooms.length);
     rooms.push(...randomScatterRooms(rng, target - rooms.length, rooms.length, cx, cy));
   }
-  rooms.forEach((r,i)=>{ r.id=i; r.degree=0; r.type=TYPE.COMBAT; });
+  rooms.forEach((r,i)=>{ r.id=i; r.degree=0; r.type=TYPE.COMBAT; r.shape='rect'; });
   return rooms;
 }
 function generateDungeon(params){
@@ -598,20 +602,13 @@ function tryGenerate(seed, params){
   const inB = (x,y)=> x>=0 && y>=0 && x<W && y<H;
 
   for(const r of rooms){
-    const rx=r.w/2, ry=r.h/2, sh=r.shape, ch=Math.min(rx,ry)*0.55;
-    const irx2=1/(rx*rx), iry2=1/(ry*ry);
+    const rx=r.w/2, ry=r.h/2;
     const y0=Math.max(0,Math.floor(r.cy-ry)), y1=Math.min(H-1,Math.ceil(r.cy+ry));
     const x0=Math.max(0,Math.floor(r.cx-rx)), x1=Math.min(W-1,Math.ceil(r.cx+rx));
     for(let y=y0;y<=y1;y++){
-      const dy=y-r.cy, ady=Math.abs(dy), row=y*W;
-      if(ady>ry) continue;
+      const row=y*W;
       for(let x=x0;x<=x1;x++){
-        const dx=x-r.cx, adx=Math.abs(dx);
-        if(adx>rx) continue;
-        let ok=true;
-        if(sh==='ellipse') ok = dx*dx*irx2 + dy*dy*iry2 <= 1.0;
-        else if(sh==='oct') ok = adx<=rx-ch || ady<=ry-ch || (adx-(rx-ch))+(ady-(ry-ch)) <= ch;
-        if(ok){ const c=row+x; grid[c]=FLOOR; roomId[c]=r.id; }
+        if(roomShapeContains(r, x, y)){ const c=row+x; grid[c]=FLOOR; roomId[c]=r.id; }
       }
     }
   }
@@ -722,15 +719,33 @@ function tryGenerate(seed, params){
       carveDoor(route[route.length-1], rw);
       forceDoorFallback(A, route[0], rw);
       forceDoorFallback(B, route[route.length-1], rw);
+      e.carvedWidth = rw;
       continue;
     }
     const dx = Math.abs(A.cx-B.cx), dy = Math.abs(A.cy-B.cy);
     const ovX = Math.min(A.cx+A.w/2, B.cx+B.w/2) - Math.max(A.cx-A.w/2, B.cx-B.w/2);
     const ovY = Math.min(A.cy+A.h/2, B.cy+B.h/2) - Math.max(A.cy-A.h/2, B.cy-B.h/2);
-    if(ovX >= w+2 && dy > 0){ const x = Math.round((Math.max(A.cx-A.w/2,B.cx-B.w/2)+Math.min(A.cx+A.w/2,B.cx+B.w/2))/2); vLine(A.cy,B.cy,x,w); }
-    else if(ovY >= w+2 && dx > 0){ const y = Math.round((Math.max(A.cy-A.h/2,B.cy-B.h/2)+Math.min(A.cy+A.h/2,B.cy+B.h/2))/2); hLine(A.cx,B.cx,y,w); }
-    else if(rng.chance(0.5)){ hLine(A.cx,B.cx,A.cy,w); vLine(A.cy,B.cy,B.cx,w); }
-    else { vLine(A.cy,B.cy,A.cx,w); hLine(A.cx,B.cx,B.cy,w); }
+    /* the guessed door-to-door e.route is display metadata only — the real
+       corridor is carved below, so overwrite e.route with the carved centerline */
+    if(ovX >= w+2 && dy > 0){
+      const x = Math.round((Math.max(A.cx-A.w/2,B.cx-B.w/2)+Math.min(A.cx+A.w/2,B.cx+B.w/2))/2);
+      vLine(A.cy,B.cy,x,w);
+      e.route=[{x, y:A.cy},{x, y:B.cy}];
+    }
+    else if(ovY >= w+2 && dx > 0){
+      const y = Math.round((Math.max(A.cy-A.h/2,B.cy-B.h/2)+Math.min(A.cy+A.h/2,B.cy+B.h/2))/2);
+      hLine(A.cx,B.cx,y,w);
+      e.route=[{x:A.cx, y},{x:B.cx, y}];
+    }
+    else if(rng.chance(0.5)){
+      hLine(A.cx,B.cx,A.cy,w); vLine(A.cy,B.cy,B.cx,w);
+      e.route=[{x:A.cx,y:A.cy},{x:B.cx,y:A.cy},{x:B.cx,y:B.cy}];
+    }
+    else {
+      vLine(A.cy,B.cy,A.cx,w); hLine(A.cx,B.cx,B.cy,w);
+      e.route=[{x:A.cx,y:A.cy},{x:A.cx,y:B.cy},{x:B.cx,y:B.cy}];
+    }
+    e.carvedWidth = w;
   }
 
   for(let y=0;y<H;y++){
@@ -1400,12 +1415,16 @@ function setupRTs(){
 let curBg = new THREE.Color(canvasBg);
 const _cBg = new THREE.Color();
 function renderFrame(){
+  /* overlay edit mode renders the scene through a top-down ortho camera kept
+     in lockstep with the 2D editor's pan/zoom, so canvas and scene align 1:1 */
+  const viewCam = editState.ortho ? (syncEditCam(), editCam) : cam;
+  POST.fin.uniforms.uTilt.value = editState.ortho ? 0 : 1;
   if(!POST.enabled){
     /* straight-to-canvas debug path: let three apply sRGB + its ACES tone map */
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setClearColor(curBg);
     renderer.setRenderTarget(null);
-    renderer.render(scene, cam);
+    renderer.render(scene, viewCam);
     return;
   }
   setupRTs();
@@ -1415,7 +1434,7 @@ function renderFrame(){
   /* rtScene stores raw linear HDR (three skips tone-map + colour conversion when
      the target isn't the canvas); the post shaders tone-map and gamma-encode it. */
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
-  renderer.setRenderTarget(POST.rtScene); renderer.render(scene, cam);
+  renderer.setRenderTarget(POST.rtScene); renderer.render(scene, viewCam);
   POST.thresh.uniforms.tS.value = POST.rtScene.texture;
   renderer.setRenderTarget(POST.rtA); renderer.render(POST.sThresh, POST.qcam);
   POST.blur.uniforms.uRes.value.set(POST.w>>2, POST.h>>2);
@@ -2905,7 +2924,7 @@ const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
   vRooms:$('vRooms'), vLoops:$('vLoops'), vDecor:$('vDecor'),
   tGraph:$('tGraph'), tHeat:$('tHeat'), tAnim:$('tAnim'), tPost:$('tPost'),
   tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'),
-  editorMenu:$('editorMenu'),
+  editorMenu:$('editorMenu'), editorExit:$('editorExit'), editorTitleText:$('editorTitleText'), editModeBtn:$('editModeBtn'),
   dname:$('dname'), dsub:$('dsub'), vSetting:$('vSetting'), vTheme:$('vTheme'),
   sRooms:$('sRooms'), sEdges:$('sEdges'), sCrit:$('sCrit'),
   sTiles:$('sTiles'), sLights:$('sLights'), sMs:$('sMs'),
@@ -2999,6 +3018,87 @@ function forgeFromEditor(animate=false){
 const editorCtx = el.editorCanvas ? el.editorCanvas.getContext('2d') : null;
 const editorRoom = id => editor.rooms.find(r=>r.id===id);
 const selectedEditorIndex = () => editor.rooms.findIndex(r=>r.id===editor.selectedId);
+
+/* -------- overlay edit mode: the 2D editor merged into the 3D viewport --------
+   Editor coords equal ground-plane world coords (editorX=worldX, editorY=worldZ),
+   so a top-down ortho camera driven from editor.scale/panX/panY keeps the
+   transparent fullscreen canvas aligned 1:1 with the rendered scene. */
+const editCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 400);
+editCam.up.set(0, 0, -1);   /* screen up = -Z, so canvas y+ matches world z+ */
+const editState = { ortho:false, phase:null, t:0, dur:0.45, from:null, to:null, saved:null };
+const overlayOn = () => editState.ortho || editState.phase === 'in';
+const EDIT_PITCH = 1.56;    /* near top-down; exactly PI/2 degenerates lookAt's up vector */
+const halfFovTan = () => Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV) * 0.5);
+const distForScale = s => Math.min(360, Math.max(45, innerHeight / (s * 2 * halfFovTan())));
+const normYaw = a => { a %= Math.PI*2; if(a > Math.PI) a -= Math.PI*2; if(a < -Math.PI) a += Math.PI*2; return a; };
+function syncEditCam(){
+  const c = el.editorCanvas; if(!c || !c.width) return;
+  const s = editor.scale, cx = -editor.panX / s, cz = -editor.panY / s;
+  editCam.left = -(c.width / 2) / s;  editCam.right  = (c.width / 2) / s;
+  editCam.top  =  (c.height / 2) / s; editCam.bottom = -(c.height / 2) / s;
+  editCam.position.set(cx, 60, cz);
+  editCam.lookAt(cx, 0, cz);
+  editCam.updateProjectionMatrix();
+}
+function enterEditMode(){
+  if(editState.phase || editState.ortho) return;
+  const sec = document.querySelector('.editor-sec'); if(!sec || !editorCtx) return;
+  hideEditorMenu();
+  if(editor.full){ editor.full=false; sec.classList.remove('full'); if(el.editorFullscreen) el.editorFullscreen.textContent='全屏'; }
+  editState.saved = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, tz:camTarget.z };
+  /* frame the overlay on what the user is currently looking at */
+  editor.scale = Math.max(2.5, Math.min(16, innerHeight / (2 * camDist * halfFovTan())));
+  editor.panX = -camTarget.x * editor.scale;
+  editor.panY = -camTarget.z * editor.scale;
+  editor.collapsed = true;   /* the panel comes back as the collapsed pill on exit */
+  sec.classList.remove('collapsed');
+  sec.style.width=''; sec.style.height=''; sec.style.maxHeight='';
+  sec.classList.add('overlay', 'pre');
+  if(el.editorTitleText) el.editorTitleText.textContent = '布局编辑';
+  if(el.editModeBtn) el.editModeBtn.classList.add('hidden');
+  editState.phase = 'in'; editState.t = 0;
+  editState.from = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, tz:camTarget.z };
+  editState.to   = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(editor.scale), tx:camTarget.x, tz:camTarget.z };
+  drawEditor();
+}
+function exitEditMode(){
+  if(editState.phase || !editState.ortho) return;
+  const sec = document.querySelector('.editor-sec'); if(!sec) return;
+  hideEditorMenu();
+  editState.ortho = false;
+  sec.classList.remove('overlay', 'pre');
+  if(el.editorTitleText) el.editorTitleText.textContent = '2D 区域编辑器';
+  if(el.editModeBtn) el.editModeBtn.classList.remove('hidden');
+  setPanelCollapsed(true);
+  /* fly back to the saved orbit pose, but stay over the spot being edited */
+  const s = editor.scale, cx = -editor.panX / s, cz = -editor.panY / s;
+  const saved = editState.saved || { yaw:Math.PI/4, pitch:0.64, dist:170 };
+  editState.phase = 'out'; editState.t = 0;
+  editState.from = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(s), tx:cx, tz:cz };
+  editState.to   = { yaw:saved.yaw, pitch:Math.min(1.15, Math.max(0.32, saved.pitch)), dist:saved.dist, tx:cx, tz:cz };
+}
+function toggleEditMode(){ if(editState.ortho) exitEditMode(); else if(!editState.phase) enterEditMode(); }
+function tickEditTransition(dt){
+  if(!editState.phase) return;
+  editState.t = Math.min(1, editState.t + dt / editState.dur);
+  const k = editState.t, ease = k < 0.5 ? 2*k*k : 1 - Math.pow(-2*k + 2, 2) / 2;
+  const f = editState.from, t = editState.to;
+  yaw = f.yaw + (t.yaw - f.yaw) * ease;
+  pitch = f.pitch + (t.pitch - f.pitch) * ease;
+  camDist = f.dist + (t.dist - f.dist) * ease;
+  camTarget.set(f.tx + (t.tx - f.tx) * ease, 0, f.tz + (t.tz - f.tz) * ease);
+  updateCam();
+  if(k >= 1){
+    const wasIn = editState.phase === 'in';
+    editState.phase = null;
+    if(wasIn){
+      editState.ortho = true;
+      const sec = document.querySelector('.editor-sec');
+      if(sec) sec.classList.remove('pre');
+      drawEditor();
+    }
+  }
+}
 function editorDoorPoint(A, B, margin=1){
   return roomDoorPoint({cx:A.x, cy:A.y, w:A.w, h:A.h}, {cx:B.x, cy:B.y, w:B.w, h:B.h}, margin);
 }
@@ -3151,6 +3251,40 @@ function reassignLinkEndpoint(l, which, room, point){
   unblockEditorLink(l.a, l.b);
   return true;
 }
+/* actual carved route captured after generation; stale while a drag is
+   reshaping this link or moving an endpoint room, so fall back to live
+   computation in that case */
+function autoRouteFresh(l){
+  if(!l || !Array.isArray(l.autoRoute) || l.autoRoute.length<2) return null;
+  if(editor.drag){
+    if(editor.drag.link===l) return null;
+    if(editor.drag.room && (editor.drag.room.id===l.a || editor.drag.room.id===l.b)) return null;
+  }
+  return l.autoRoute;
+}
+/* the whole carved polyline only stands in for the route while the link has
+   no custom bends; with bends the polyline is bend-driven (doors still real) */
+function linkAutoRoute(l){
+  if(l && Array.isArray(l.bends) && l.bends.length) return null;
+  return autoRouteFresh(l);
+}
+function linkDispWidth(l){ return Number.isFinite(l && l.autoWidth) ? l.autoWidth : linkWidth(l); }
+/* carved bands are stamped toward +x/+y of the centerline coordinate
+   (offs(): w=2 covers [c,c+2] → center +1; w=1|3 → +0.5), so shift the drawn
+   polyline onto the corridor's visual center. Endpoints only shift
+   perpendicular to their segment so doors stay on the room wall. */
+function autoRouteDrawPts(l, pts){
+  if(!linkAutoRoute(l) || pts.length<2) return pts;
+  const off = linkDispWidth(l)===2 ? 1 : 0.5;
+  const out = pts.map(p=>({x:p.x+off, y:p.y+off}));
+  const fixEnd=(i,j)=>{
+    const a=pts[i], b=pts[j];
+    if(a.y===b.y && a.x!==b.x) out[i].x=a.x;
+    else if(a.x===b.x && a.y!==b.y) out[i].y=a.y;
+  };
+  fixEnd(0,1); fixEnd(pts.length-1,pts.length-2);
+  return out;
+}
 function linkDoorPoint(l, which){
   const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) return null;
   const drag = editor.drag && editor.drag.mode==='routeDoor' && editor.drag.link===l && editor.drag.which===which ? editor.drag.previewPoint : null;
@@ -3158,7 +3292,11 @@ function linkDoorPoint(l, which){
   const room = which==='a' ? A : B;
   const spec = which==='a' ? l.doorA : l.doorB;
   const auto = which==='a' ? editorDoorPoint(A,B) : editorDoorPoint(B,A);
-  return doorSpecPoint(room, spec) || auto;
+  const specPoint = doorSpecPoint(room, spec);
+  if(specPoint) return specPoint;
+  const ar = autoRouteFresh(l);
+  if(ar){ const p = which==='a' ? ar[0] : ar[ar.length-1]; return {x:p.x, y:p.y, side:p.side || auto.side}; }
+  return auto;
 }
 function linkHandles(l){
   const pts=[];
@@ -3169,13 +3307,17 @@ function linkHandles(l){
   return pts;
 }
 function editorLinkHandleAt(p){
+  /* handles are only drawn for the selected link, so only that link's handles
+     are clickable — a first click on any route selects it / drags the segment,
+     instead of being stolen by invisible door/bend points */
+  if(!editor.selectedLinkKey) return null;
+  const l = editor.links.find(q=>editorLinkKey(q.a,q.b)===editor.selectedLinkKey);
+  if(!l) return null;
   const tol=Math.max(1.4, 9/editor.scale);
   let best=null;
-  for(const l of editor.links){
-    for(const h of linkHandles(l)){
-      const d=Math.hypot(p.x-h.point.x, p.y-h.point.y);
-      if(d<=tol && (!best || d<best.d)) best={...h,d};
-    }
+  for(const h of linkHandles(l)){
+    const d=Math.hypot(p.x-h.point.x, p.y-h.point.y);
+    if(d<=tol && (!best || d<best.d)) best={...h,d};
   }
   return best;
 }
@@ -3185,6 +3327,8 @@ function linkVisualRoute(l){
   const da=linkDoorPoint(l,'a'), db=linkDoorPoint(l,'b');
   if(!da || !db) return [];
   if(Array.isArray(l.bends) && l.bends.length) return [da, ...l.bends.map(p=>({x:p.x,y:p.y})), db];
+  const ar = linkAutoRoute(l);
+  if(ar) return ar.map(p=>({x:p.x, y:p.y, side:p.side}));
   const e={ax:da.x, ay:da.y, aside:da.side, bx:db.x, by:db.y, bside:db.side};
   assignEdgeRoute(e);
   return edgeRoutePoints(e);
@@ -3203,7 +3347,9 @@ function hitRouteSegment(p, pts, tol){
 function editorLinkAt(p){
   let best=null;
   for(const l of editor.links){
-    const tol = Math.max(linkWidth(l)/2, 8/editor.scale);
+    /* +1 covers the visual centering offset of auto routes (drawn line sits
+       up to one cell off the data polyline for width-2 corridors) */
+    const tol = Math.max(linkDispWidth(l)/2 + (linkAutoRoute(l) ? 1 : 0), 8/editor.scale);
     const hit=hitRouteSegment(p, linkVisualRoute(l), tol);
     if(hit && (!best || hit.d<best.hit.d)) best={link:l, hit};
   }
@@ -3269,23 +3415,6 @@ function snapRouteSegmentDelta(l, seg, startPts, delta, lock){
   if(best) out={x:best.x, y:best.y};
   return {x:editorSnap(out.x), y:editorSnap(out.y)};
 }
-function setLinkRoutePoint(l, index, point){
-  const pts=linkVisualRoute(l);
-  if(!pts.length) return;
-  const p={x:editorSnap(point.x), y:editorSnap(point.y)};
-  if(index<=0){
-    if(!Array.isArray(l.bends)) l.bends=[];
-    if(!l.bends.length) l.bends.unshift(p);
-    else { l.bends[0].x=p.x; l.bends[0].y=p.y; }
-  } else if(index>=pts.length-1){
-    if(!Array.isArray(l.bends)) l.bends=[];
-    if(!l.bends.length) l.bends.push(p);
-    else { const i=l.bends.length-1; l.bends[i].x=p.x; l.bends[i].y=p.y; }
-  } else {
-    if(!Array.isArray(l.bends)) l.bends=[];
-    if(l.bends[index-1]){ l.bends[index-1].x=p.x; l.bends[index-1].y=p.y; }
-  }
-}
 function moveLinkRouteSegment(l, seg, startPts, delta){
   if(!l || !startPts || seg<0 || seg>=startPts.length-1) return;
   const a=startPts[seg], b=startPts[seg+1];
@@ -3294,8 +3423,19 @@ function moveLinkRouteSegment(l, seg, startPts, delta){
   if(Math.abs(dx) >= Math.abs(dy)*1.4){ mx=0; lock='y'; }
   else if(Math.abs(dy) >= Math.abs(dx)*1.4){ my=0; lock='x'; }
   const snapped=snapRouteSegmentDelta(l, seg, startPts, {x:mx,y:my}, lock);
-  setLinkRoutePoint(l, seg, {x:a.x+snapped.x, y:a.y+snapped.y});
-  setLinkRoutePoint(l, seg+1, {x:b.x+snapped.x, y:b.y+snapped.y});
+  /* rebuild the interior bends from the drag-start polyline with the segment
+     shifted. Doors (the endpoints) never move — when the dragged segment ends
+     at a door, an elbow is inserted there instead, so the shape the user drags
+     stays axis-aligned and matches what the generator will carve. */
+  const inner = startPts.map((p,i)=>{
+    if(i===seg)   return {x:p.x+snapped.x, y:p.y+snapped.y};
+    if(i===seg+1) return {x:p.x+snapped.x, y:p.y+snapped.y};
+    return {x:p.x, y:p.y};
+  });
+  const bends = inner.slice(1,-1);
+  if(seg===0) bends.unshift(inner[0]);
+  if(seg===startPts.length-2) bends.push(inner[inner.length-1]);
+  l.bends = bends.map(p=>({x:editorSnap(p.x), y:editorSnap(p.y)}));
 }
 function toggleEditorLink(a,b){
   if(!a || !b || a===b) return;
@@ -3361,16 +3501,8 @@ function hitRoomAtWorld(x, z){
   if(!D) return null;
   let best = null, bestArea = Infinity;
   for(const r of D.rooms){
-    const cx = r.cx-D.W/2+0.5, cz = r.cy-D.H/2+0.5;
-    const dx = x-cx, dz = z-cz, ax=Math.abs(dx), az=Math.abs(dz), rx=r.w/2, rz=r.h/2;
-    if(ax>rx || az>rz) continue;
-    let ok = true;
-    if(r.shape==='ellipse') ok = (dx*dx)/(rx*rx) + (dz*dz)/(rz*rz) <= 1;
-    else if(r.shape==='oct'){
-      const ch=Math.min(rx,rz)*0.55;
-      ok = ax<=rx-ch || az<=rz-ch || (ax-(rx-ch))+(az-(rz-ch)) <= ch;
-    }
-    if(!ok) continue;
+    const cx = r.cx-D.W/2+0.5, cy = r.cy-D.H/2+0.5;
+    if(!roomShapeContains({...r, cx, cy}, x, z)) continue;
     const area = r.w*r.h;
     if(area < bestArea){ best=r; bestArea=area; }
   }
@@ -3526,18 +3658,19 @@ function drawEditor(){
   if(!editorCtx) return;
   syncEditorCanvasSize();
   const c=el.editorCanvas, g=editorCtx;
+  const ov = overlayOn();   /* overlay mode: translucent scrim so the 3D scene shows through */
   g.clearRect(0,0,c.width,c.height);
-  g.fillStyle='#080a10'; g.fillRect(0,0,c.width,c.height);
-  g.strokeStyle='#171b29'; g.lineWidth=1;
+  g.fillStyle = ov ? 'rgba(7,9,14,0.30)' : '#080a10'; g.fillRect(0,0,c.width,c.height);
+  g.strokeStyle = ov ? 'rgba(148,163,208,0.08)' : '#171b29'; g.lineWidth=1;
   const step=5*editor.scale, ox=(c.width/2+editor.panX)%step, oy=(c.height/2+editor.panY)%step;
   for(let x=ox; x<c.width; x+=step){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,c.height); g.stroke(); }
   for(let y=oy; y<c.height; y+=step){ g.beginPath(); g.moveTo(0,y); g.lineTo(c.width,y); g.stroke(); }
-  g.strokeStyle='#2b3144'; g.beginPath(); g.moveTo(c.width/2,0); g.lineTo(c.width/2,c.height); g.moveTo(0,c.height/2); g.lineTo(c.width,c.height/2); g.stroke();
+  g.strokeStyle = ov ? 'rgba(148,163,208,0.18)' : '#2b3144'; g.beginPath(); g.moveTo(c.width/2,0); g.lineTo(c.width/2,c.height); g.moveTo(0,c.height/2); g.lineTo(c.width,c.height/2); g.stroke();
   if(editor.links.length){
     for(const l of editor.links){
       const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
       const key=editorLinkKey(l.a,l.b), sel=key===editor.selectedLinkKey;
-      drawEditorCorridor(g, editorLinkRoute(l,A,B), sel ? '#e8973f' : '#59d68f', linkWidth(l), sel);
+      drawEditorCorridor(g, autoRouteDrawPts(l, editorLinkRoute(l,A,B)), sel ? '#e8973f' : '#59d68f', linkDispWidth(l), sel);
     }
   }
   if(editor.connectFrom){
@@ -3555,8 +3688,11 @@ function drawEditor(){
   if(editor.selectedLinkKey){
     const link = editor.links.find(l=>editorLinkKey(l.a,l.b)===editor.selectedLinkKey);
     const handles = link ? linkHandles(link) : [];
+    const dpts = link ? autoRouteDrawPts(link, linkVisualRoute(link)) : [];
     for(const h of handles){
-      const p=editorWorldToCanvas(h.point.x,h.point.y);
+      let hp=h.point;
+      if(h.kind==='door' && link && linkAutoRoute(link) && dpts.length>=2) hp = h.which==='a' ? dpts[0] : dpts[dpts.length-1];
+      const p=editorWorldToCanvas(hp.x,hp.y);
       g.fillStyle=h.kind==='door' ? '#ffd36a' : '#e8973f';
       g.strokeStyle='#11141d'; g.lineWidth=2;
       g.beginPath(); g.arc(p.x,p.y,h.kind==='door'?6:5,0,Math.PI*2); g.fill(); g.stroke();
@@ -3595,11 +3731,11 @@ function drawEditor(){
   el.editorStatus.textContent = status;
   updateSceneSelection();
 }
-function toggleEditorCollapse(){
+function setPanelCollapsed(v){
   const sec = document.querySelector('.editor-sec'); if(!sec) return;
-  editor.collapsed = !editor.collapsed;
-  sec.classList.toggle('collapsed', editor.collapsed);
-  if(editor.collapsed){
+  editor.collapsed = v;
+  sec.classList.toggle('collapsed', v);
+  if(v){
     sec.style.width='44px';
     sec.style.height='44px';
     sec.style.maxHeight='44px';
@@ -3608,11 +3744,12 @@ function toggleEditorCollapse(){
     sec.style.height=editor.panelHeight ? editor.panelHeight+'px' : '';
     sec.style.maxHeight=editor.panelHeight ? 'none' : '';
   }
-  if(el.editorCollapse) el.editorCollapse.textContent = editor.collapsed ? '展开' : '折叠';
-  if(!editor.collapsed) requestAnimationFrame(drawEditor);
+  if(el.editorCollapse) el.editorCollapse.textContent = v ? '展开' : '折叠';
+  if(!v) requestAnimationFrame(drawEditor);
 }
+function toggleEditorCollapse(){ setPanelCollapsed(!editor.collapsed); }
 function toggleEditorFullscreen(){
-  const sec = document.querySelector('.editor-sec'); if(!sec) return;
+  const sec = document.querySelector('.editor-sec'); if(!sec || overlayOn()) return;
   editor.full = !editor.full;
   sec.classList.toggle('full', editor.full);
   if(el.editorFullscreen) el.editorFullscreen.textContent = editor.full ? '退出全屏' : '全屏';
@@ -3641,7 +3778,7 @@ addEventListener('resize', ()=>requestAnimationFrame(drawEditor));
 function syncEditorFromDungeon(d, keepManual=false){
   if(!d || editor.rooms.length) return;
   editor.rooms = d.rooms.map((r,i)=>({ id:i+1, x:Math.round(r.cx-d.W/2), y:Math.round(r.cy-d.H/2),
-    w:r.w, h:r.h, shape:r.shape, locked:false, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null) }));
+    w:r.w, h:r.h, shape:'rect', locked:false, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null) }));
   if(!keepManual) editor.links = d.edges.map(e=>({a:e.a+1,b:e.b+1,bends:[],width:2,generated:true}));
   editor.nextId = editor.rooms.length + 1;
 }
@@ -3652,16 +3789,34 @@ function syncEditorGeneratedRooms(d){
     if(source < 0) continue;
     let er = editor.rooms[source];
     if(!er){
-      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:r.shape, locked:false, roleHint:null };
+      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:'rect', locked:false, roleHint:null };
       editor.rooms[source] = er;
     }
     er.x = Math.round(r.cx-d.W/2);
     er.y = Math.round(r.cy-d.H/2);
-    er.w = r.w; er.h = r.h; er.shape = r.shape;
+    er.w = r.w; er.h = r.h; er.shape = 'rect';
     if(r.type===TYPE.ENTRANCE && !editor.rooms.some(q=>q!==er && q && q.roleHint==='entrance')) er.roleHint = 'entrance';
     if(r.type===TYPE.BOSS && !editor.rooms.some(q=>q!==er && q && q.roleHint==='boss')) er.roleHint = 'boss';
   }
   editor.rooms = editor.rooms.filter(Boolean);
+}
+/* trim a carved centerline (which may start/end at room centers) back to the
+   room rectangles, recovering the true door points and their wall sides */
+function clipRouteToRooms(pts, A, B){
+  const inside=(p,R)=> R && p.x>=R.cx-R.w/2-1e-6 && p.x<=R.cx+R.w/2+1e-6 && p.y>=R.cy-R.h/2-1e-6 && p.y<=R.cy+R.h/2+1e-6;
+  const trim=(arr,R)=>{
+    const out=arr.map(p=>({...p}));
+    while(out.length>2 && inside(out[1],R)) out.shift();
+    if(out.length>=2 && inside(out[0],R)){
+      const a=out[0], b=out[1];
+      if(a.x===b.x && a.y!==b.y) out[0]={x:a.x, y:b.y>a.y ? R.cy+R.h/2 : R.cy-R.h/2, side:b.y>a.y?'s':'n'};
+      else if(a.y===b.y && a.x!==b.x) out[0]={x:b.x>a.x ? R.cx+R.w/2 : R.cx-R.w/2, y:a.y, side:b.x>a.x?'e':'w'};
+    }
+    return out;
+  };
+  let out=trim(pts, A);
+  out=trim(out.slice().reverse(), B).reverse();
+  return out.filter((p,i,a)=>i===0 || p.x!==a[i-1].x || p.y!==a[i-1].y);
 }
 function syncEditorLinksFromDungeon(d){
   if(!d) return;
@@ -3677,10 +3832,17 @@ function syncEditorLinksFromDungeon(d){
     const key=editorLinkKey(ea.id, eb.id);
     if(blocked.has(key)) continue;
     const prev=old.get(key);
-    next.push(prev ? {...prev, a:ea.id, b:eb.id, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, generated:true});
+    const nl = prev ? {...prev, a:ea.id, b:eb.id, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, generated:true};
+    /* remember the carved corridor's actual centerline (clipped to the room
+       rects, in editor coords) so the preview matches the generated geometry
+       instead of re-guessing doors and elbows */
+    const cr = Array.isArray(e.route) && e.route.length>=2 ? clipRouteToRooms(e.route, A, B) : null;
+    nl.autoRoute = cr && cr.length>=2 ? cr.map(p=>({x:p.x-d.W/2, y:p.y-d.H/2, side:p.side})) : null;
+    nl.autoWidth = Number.isFinite(e.carvedWidth) ? e.carvedWidth : null;
+    next.push(nl);
     old.delete(key);
   }
-  for(const l of old.values()) if(l.manual && !blocked.has(editorLinkKey(l.a,l.b))) next.push(l);
+  for(const l of old.values()) if(l.manual && !blocked.has(editorLinkKey(l.a,l.b))){ l.autoRoute=null; l.autoWidth=null; next.push(l); }
   editor.links = next;
   if(editor.selectedLinkKey && !editor.links.some(l=>editorLinkKey(l.a,l.b)===editor.selectedLinkKey)) editor.selectedLinkKey=null;
 }
@@ -3756,6 +3918,8 @@ function initEditor(){
   if(!el.editorCanvas) return;
   if(el.editorCollapse) el.editorCollapse.addEventListener('click', toggleEditorCollapse);
   if(el.editorFullscreen) el.editorFullscreen.addEventListener('click', toggleEditorFullscreen);
+  if(el.editorExit) el.editorExit.addEventListener('click', exitEditMode);
+  if(el.editModeBtn) el.editModeBtn.addEventListener('click', enterEditMode);
   document.querySelectorAll('[data-editor-resize]').forEach(h=>h.addEventListener('pointerdown', startEditorResize));
   if(el.editorMenu){
     el.editorMenu.addEventListener('click', e=>{
@@ -3820,7 +3984,10 @@ function initEditor(){
       const l=editor.links.find(q=>editorLinkKey(q.a,q.b)===editor.selectedLinkKey);
       if(l && Array.isArray(l.bends) && l.bends.length){ e.preventDefault(); l.bends=[]; drawEditor(); forgeFromEditor(false); }
     }
-    if(e.code==='Escape') hideEditorMenu();
+    if(e.code==='Escape'){
+      if(el.editorMenu && el.editorMenu.classList.contains('on')) hideEditorMenu();
+      else if(editState.ortho) exitEditMode();
+    }
   });
 
   el.editorCanvas.addEventListener('wheel', e=>{
@@ -3937,7 +4104,7 @@ function initEditor(){
     }
     if(editor.drag.mode==='draw' && editor.drag.draft){
       const r=editor.drag.draft;
-      if(r.w>=5 && r.h>=5){ editor.rooms.push({id:editor.nextId++, ...r, shape:'rect', locked:false, roleHint:null}); editor.selectedId=editor.nextId-1; }
+      if(r.w>=5 && r.h>=5){ const nr={id:editor.nextId++, ...r, shape:'rect', locked:false, roleHint:null}; editor.rooms.push(nr); editor.selectedId=editor.nextId-1; }
     }
     editor.drag=null; editorRequestForge();
   };
@@ -3983,7 +4150,7 @@ function forge(animate, useEditorLayout=false){
     settingKey,
     paletteKey,
     editorEnabled:useEditorLayout && editor.dirty,
-    editorRooms:(useEditorLayout && editor.dirty) ? editor.rooms.map(r=>({...r})) : [],
+    editorRooms:(useEditorLayout && editor.dirty) ? editor.rooms.map(r=>({...r, shape:'rect'})) : [],
     editorLinks:(useEditorLayout && editor.dirty) ? editor.links.map(l=>({...l})) : [],
     blockedLinks:(useEditorLayout && editor.dirty) ? [...editor.blockedLinks] : [],
     secretRooms:(useEditorLayout && editor.dirty) ? [...editor.secretRooms] : []
@@ -3999,12 +4166,9 @@ function forge(animate, useEditorLayout=false){
   el.vTheme.textContent = paletteSel==='auto' ? '\u81ea\u52a8 \u00b7 '+TH.paletteLabel : TH.paletteLabel;
   el.dname.textContent = d.name;
   const st = d.stats;
-  el.dsub.innerHTML = '\u79cd\u5b50 ' + d.seed +
-    ' \u00b7 <span style="color:var(--ember)">' + TH.label + '</span>' +
-    ' \u00b7 \u7b2c ' + ((d.seed % 9) + 2) + ' \u5c42' +
-    ' \u00b7 ' + (d.valid ? '<span class="ok">\u5df2\u8fde\u901a \u2713</span>' : '<span class="bad">\u6709\u60ac\u6d6e\u533a\u57df</span>') +
-    (Array.isArray(d.disconnectedRooms) && d.disconnectedRooms.length ? ' \u00b7 \u5bc6\u5ba4\u5019\u9009 \u00d7' + d.disconnectedRooms.length : '') +
-    (st.attempts > 1 ? ' \u00b7 \u91cd\u8bd5 \u00d7' + (st.attempts-1) : '');
+  el.dsub.innerHTML = '<span style="color:var(--ember)">' + TH.label + '</span>' +
+    ' \u00b7 \u79cd\u5b50 ' + d.seed +
+    ' \u00b7 ' + (d.valid ? '<span class="ok">\u5df2\u8fde\u901a \u2713</span>' : '<span class="bad">\u6709\u60ac\u6d6e\u533a\u57df</span>');
   el.sRooms.textContent  = st.rooms;
   el.sEdges.textContent  = st.edges + ' \u00b7 ' + st.loops;
   el.sCrit.textContent   = st.critLen + ' \u6bb5';
@@ -4075,6 +4239,7 @@ function tick(){
   timer.update();
   const dt = Math.min(timer.getDelta(), 0.05);
   elapsed += dt;
+  tickEditTransition(dt);
   if(animating){
     animT += dt;
     applyReveal(animT);
@@ -4184,6 +4349,7 @@ addEventListener('keydown', e=>{
     forge(true);
   }
   else if(e.code==='KeyP'){ el.tPost.checked = !el.tPost.checked; POST.enabled = el.tPost.checked; }
+  else if(e.code==='KeyE'){ toggleEditMode(); }
   else if(e.code==='Space'){ e.preventDefault(); if(animating) finishAnim(); }
 });
 
@@ -4198,4 +4364,5 @@ addEventListener('resize', ()=>{
 /* -------- go -------- */
 forge(true);
 syncEditorFromDungeon(D);
+setPanelCollapsed(true);   /* 2D panel stays available but starts as the collapsed pill */
 tick();

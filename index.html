@@ -34,30 +34,24 @@
     <div id="panel">
       <button id="collapse" aria-label="收起面板" title="收起">–</button>
       <div class="head">
-        <div class="brand"><span>场景锻炉</span><span>程序生成核心</span></div>
+        <div class="brand"><span>场景锻炉</span></div>
         <h1 id="dname">—</h1>
         <div id="dsub">生成中…</div>
       </div>
 
-      <ul class="pipe" id="pipe" aria-label="生成流程">
-        <li>散布</li><li>分离</li><li>三角网</li><li>主路径+回环</li><li>铺装</li><li>主题</li>
-      </ul>
-
-      <div class="sec">
-        <div class="row">
-          <label style="flex:1"><span class="lab"><span>种子</span></span>
-            <div class="row">
-              <input id="seed" type="number" value="1337" aria-label="种子">
-              <button class="btn" id="dice" title="随机种子" aria-label="随机种子">⚄</button>
-            </div>
-          </label>
-        </div>
-        <button class="btn primary" id="forge" style="width:100%;margin-top:10px">生成场景</button>
+      <div class="sec hero-controls">
+        <label><span class="lab"><span>种子</span></span>
+          <div class="row">
+            <input id="seed" type="number" value="1337" aria-label="种子">
+            <button class="btn" id="dice" title="随机种子" aria-label="随机种子">⚄</button>
+          </div>
+        </label>
+        <button class="btn primary" id="forge">生成场景</button>
       </div>
 
       <div class="sec">
         <span class="lab"><span>题材</span><b id="vSetting">自动</b></span>
-        <div class="chips" id="settingChips">
+        <div class="chips compact" id="settingChips">
           <button class="chip on" data-s="auto">自动</button>
           <button class="chip" data-s="dungeon">遗迹</button>
           <button class="chip" data-s="hospital">医院</button>
@@ -66,7 +60,7 @@
 
       <div class="sec">
         <span class="lab"><span>色调</span><b id="vTheme">自动</b></span>
-        <div class="chips" id="paletteChips">
+        <div class="chips palette" id="paletteChips">
           <button class="chip on" data-p="auto">自动</button>
           <button class="chip" data-p="ancient">暖灰</button>
           <button class="chip" data-p="molten">暖橙</button>
@@ -79,18 +73,7 @@
         </div>
       </div>
 
-      <div class="sec">
-        <span class="lab"><span>场景对象</span><span style="color:#4a4f61">点击切换</span></span>
-        <div class="chips" id="objchips">
-          <button class="chip on" data-o="props" aria-pressed="true">物件</button>
-          <button class="chip on" data-o="torches" aria-pressed="true">发光点</button>
-          <button class="chip on" data-o="particles" aria-pressed="true">氛围</button>
-          <button class="chip on" data-o="liquids" aria-pressed="true">表面</button>
-          <button class="chip on" data-o="lights" aria-pressed="true">光源</button>
-        </div>
-      </div>
-
-      <div class="sec">
+      <div class="sec sliders">
         <label class="sl"><span class="lab"><span>区域数量</span><b id="vRooms">42</b></span>
           <input type="range" id="rooms" min="12" max="80" value="42" aria-label="区域数量"></label>
         <label class="sl"><span class="lab"><span>回环率</span><b id="vLoops">15%</b></span>
@@ -99,38 +82,21 @@
           <input type="range" id="decor" min="0" max="100" value="60" aria-label="装饰密度"></label>
       </div>
 
-      <div class="sec togs">
-        <label class="tog"><input type="checkbox" id="tGraph"> 结构叠加 <span class="key">G</span></label>
-        <label class="tog"><input type="checkbox" id="tHeat"> 强度热力图 <span class="key">H</span></label>
-        <label class="tog"><input type="checkbox" id="tAnim" checked> 播放生成动画 <span class="key">空格跳过</span></label>
-        <label class="tog"><input type="checkbox" id="tPost" checked> 后期特效 <span class="key">P</span></label>
+      <div class="sec display-options">
+        <label class="tog"><input type="checkbox" id="tAnim" checked> 生成动画</label>
+        <label class="tog"><input type="checkbox" id="tPost" checked> 后期特效</label>
+        <label class="tog hidden-option"><input type="checkbox" id="tGraph"> 结构叠加</label>
+        <label class="tog hidden-option"><input type="checkbox" id="tHeat"> 强度热力图</label>
       </div>
 
-      <div class="sec legend" aria-label="区域类型图例">
-        <span class="lg"><span class="dot" style="background:var(--teal)"></span>起点</span>
-        <span class="lg"><span class="dot" style="background:#8f95a3"></span>常规</span>
-        <span class="lg"><span class="dot" style="background:var(--violet)"></span>强化</span>
-        <span class="lg"><span class="dot" style="background:var(--gold)"></span>奖励</span>
-        <span class="lg"><span class="dot" style="background:var(--blue)"></span>事件</span>
-        <span class="lg"><span class="dot" style="background:var(--blood)"></span>终点</span>
-      </div>
-
-      <div class="sec stats">
-        <div class="st"><i>区域</i><b id="sRooms">—</b></div>
-        <div class="st"><i>连接·回环</i><b id="sEdges">—</b></div>
-        <div class="st"><i>关键路径</i><b id="sCrit">—</b></div>
-        <div class="st"><i>铺装格</i><b id="sTiles">—</b></div>
-        <div class="st"><i>光源</i><b id="sLights">—</b></div>
-        <div class="st"><i>生成耗时</i><b id="sMs" class="hi">—</b></div>
-        <div class="st"><i>绘制调用</i><b id="sCalls">—</b></div>
-        <div class="st"><i>三角面</i><b id="sTris">—</b></div>
-        <div class="st"><i>帧率</i><b id="sFps">—</b></div>
+      <div class="stats ui-hidden" aria-hidden="true">
+        <b id="sRooms">—</b><b id="sEdges">—</b><b id="sCrit">—</b><b id="sTiles">—</b><b id="sLights">—</b><b id="sMs">—</b><b id="sCalls">—</b><b id="sTris">—</b><b id="sFps">—</b>
       </div>
     </div>
 
     <div class="sec editor-sec">
         <input type="checkbox" id="tEditor" checked hidden>
-        <span class="lab editor-title"><span>2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button></span>
+        <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
         <div class="editor-canvas-wrap">
           <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="2D 区域编辑器"></canvas>
         </div>
@@ -156,7 +122,9 @@
       <button data-action="reset-door" data-menu="door">重置门槽点</button>
     </div>
 
-    <div id="hints"><b>拖拽</b> 平移 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
+    <div id="hints"><b>拖拽</b> 平移 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>E</b> 编辑布局 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
+
+    <button id="editModeBtn" type="button" title="进入布局编辑模式（E）">✏ 编辑布局 <span class="key">E</span></button>
 
     <script type="module" src="./src/main.js"></script>
   </body>
