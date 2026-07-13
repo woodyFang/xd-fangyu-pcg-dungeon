@@ -288,7 +288,7 @@ function makeRoomRecord(id, cx, cy, w, h, shape, locked, roleHint){
   cx = Math.round(cx); cy = Math.round(cy);
   return { id, sourceId:id, cx, cy, w, h, arch:classifyArch(w,h), shape:'rect',
     sx0:cx, sy0:cy, type:TYPE.COMBAT, depth:0, difficulty:0.2, degree:0,
-    locked:!!locked, roleHint:roleHint || null };
+    locked:!!locked, roleHint:roleHint || null, floor:0 };
 }
 function randomScatterRooms(rng, N, idStart, centerX, centerY){
   const R = Math.sqrt(Math.max(1, N)) * 4.6;
@@ -303,7 +303,7 @@ function randomScatterRooms(rng, N, idStart, centerX, centerY){
     const ang = rng.f(0, Math.PI*2), rad = R*Math.sqrt(rng.raw());
     const cx = Math.cos(ang)*rad + (centerX || 0), cy = Math.sin(ang)*rad + (centerY || 0);
     rooms.push({ id:idStart+i, sourceId:null, cx, cy, w, h, arch, shape, sx0:cx, sy0:cy,
-      type:TYPE.COMBAT, depth:0, difficulty:0.2, degree:0, locked:false, roleHint:null });
+      type:TYPE.COMBAT, depth:0, difficulty:0.2, degree:0, locked:false, roleHint:null, floor:0 });
   }
   while(large.length < Math.min(2, N)){
     const j = rng.i(0, N-1);
@@ -316,7 +316,7 @@ function randomScatterRooms(rng, N, idStart, centerX, centerY){
 function initialRoomsFromParams(rng, params){
   const editorRooms = params.editorEnabled && Array.isArray(params.editorRooms) ? params.editorRooms : [];
   if(!editorRooms.length) return randomScatterRooms(rng, params.roomCount, 0, 0, 0);
-  const rooms = editorRooms.map((r,i)=>makeRoomRecord(i, r.x, r.y, r.w, r.h, r.shape, r.locked, r.roleHint));
+  const rooms = editorRooms.map((r,i)=>{ const q=makeRoomRecord(i, r.x, r.y, r.w, r.h, r.shape, r.locked, r.roleHint); q.floor=Math.max(0,Math.round(r.floor||0)); return q; });
   const target = Math.max(params.roomCount, rooms.length);
   if(rooms.length < target){
     let cx=0, cy=0;
@@ -512,7 +512,14 @@ function tryGenerate(seed, params){
 
   const dE = distFrom(entrance);
   let maxDepth = 1; for(let i=0;i<N;i++) if(dE[i]>maxDepth) maxDepth = dE[i];
-  rooms.forEach((r,i)=>{ r.depth = Math.max(0,dE[i]); r.difficulty = Math.min(1, 0.15 + 0.85*(r.depth/maxDepth)); });
+  const floorCount = Math.max(1, Math.min(6, Math.round(params.floorCount || 1)));
+  rooms.forEach((r,i)=>{
+    r.depth = Math.max(0,dE[i]); r.difficulty = Math.min(1, 0.15 + 0.85*(r.depth/maxDepth));
+    if(!(params.editorEnabled && Array.isArray(params.editorRooms)))
+      r.floor = floorCount===1 ? 0 : Math.min(floorCount-1, Math.floor((r.depth/Math.max(1,maxDepth))*floorCount));
+    else r.floor = Math.max(0, Math.min(floorCount-1, Math.round(r.floor||0)));
+    r.elevation = r.floor * 8;
+  });
   rooms[entrance].type = TYPE.ENTRANCE; rooms[entrance].difficulty = 0;
   rooms[boss].type = TYPE.BOSS; rooms[boss].difficulty = 1;
 
@@ -612,6 +619,34 @@ function tryGenerate(seed, params){
       }
     }
   }
+
+  /* A* routing: reuse existing corridors, avoid unrelated rooms, and gently
+     prefer approaches near the two endpoint doors. */
+  const routeAStar=(start, goal, startRoomId, goalRoomId)=>{
+    const sx=Math.max(0,Math.min(W-1,Math.round(start.x))), sy=Math.max(0,Math.min(H-1,Math.round(start.y)));
+    const gx=Math.max(0,Math.min(W-1,Math.round(goal.x))), gy=Math.max(0,Math.min(H-1,Math.round(goal.y)));
+    const startIdx=idx(sx,sy), goalIdx=idx(gx,gy), total=W*H;
+    const gScore=new Float64Array(total); gScore.fill(Infinity); gScore[startIdx]=0;
+    const parent=new Int32Array(total); parent.fill(-1); const closed=new Uint8Array(total), heap=[];
+    const push=(node,score)=>{ heap.push({node,score}); let i=heap.length-1;
+      while(i>0){ const p=(i-1)>>1; if(heap[p].score<=score) break; heap[i]=heap[p]; i=p; } heap[i]={node,score}; };
+    const pop=()=>{ const first=heap[0], last=heap.pop(); if(heap.length){ let i=0; heap[0]=last;
+      while(true){ const l=i*2+1,r=l+1; let b=i; if(l<heap.length&&heap[l].score<heap[b].score)b=l; if(r<heap.length&&heap[r].score<heap[b].score)b=r; if(b===i)break; const t=heap[i];heap[i]=heap[b];heap[b]=t;i=b; } } return first; };
+    const heuristic=(x,y)=>Math.abs(x-gx)+Math.abs(y-gy); push(startIdx,heuristic(sx,sy));
+    const dirs=[[1,0],[-1,0],[0,1],[0,-1]]; let found=false, guard=0;
+    while(heap.length&&guard++<total*3){ const cur=pop().node; if(closed[cur])continue; closed[cur]=1; if(cur===goalIdx){found=true;break;}
+      const cx=cur%W,cy=Math.floor(cur/W);
+      for(const [dx,dy] of dirs){ const nx=cx+dx,ny=cy+dy; if(!inB(nx,ny))continue; const ni=idx(nx,ny); if(closed[ni])continue;
+        const rid=roomId[ni]; let step=corridor[ni]?0.28:1; if(rid>=0&&rid!==startRoomId&&rid!==goalRoomId)step+=22; else if(rid>=0)step+=1.5;
+        if(Math.abs(nx-sx)+Math.abs(ny-sy)<=4||Math.abs(nx-gx)+Math.abs(ny-gy)<=4)step=Math.max(.35,step-.45);
+        const nextG=gScore[cur]+step; if(nextG<gScore[ni]){gScore[ni]=nextG;parent[ni]=cur;push(ni,nextG+heuristic(nx,ny));}
+      }
+    }
+    if(!found)return null; const cells=[]; for(let cur=goalIdx;cur>=0;cur=parent[cur]){cells.push(cur);if(cur===startIdx)break;} if(cells[cells.length-1]!==startIdx)return null; cells.reverse();
+    const pts=[{x:sx,y:sy}]; let lastDx=0,lastDy=0;
+    for(let i=1;i<cells.length;i++){const a=cells[i-1],b=cells[i],dx=b%W-a%W,dy=Math.floor(b/W)-Math.floor(a/W);if(i===1){lastDx=dx;lastDy=dy;}else if(dx!==lastDx||dy!==lastDy){pts.push({x:a%W,y:Math.floor(a/W)});lastDx=dx;lastDy=dy;}}
+    pts.push({x:gx,y:gy}); return pts;
+  };
 
   const stamp = (x,y)=>{
     if(!inB(x,y)) return;
@@ -722,6 +757,13 @@ function tryGenerate(seed, params){
       e.carvedWidth = rw;
       continue;
     }
+    /* Automatically routed edges use the carved grid as their navigation
+       surface. Editor-authored routes remain authoritative above. */
+    e.route = routeAStar({x:e.ax,y:e.ay},{x:e.bx,y:e.by},A.id,B.id) || edgeRoutePoints(e);
+    carveRoute(e.route,w);
+    e.carvedWidth = w;
+    continue;
+    /* legacy L-route block removed */
     const dx = Math.abs(A.cx-B.cx), dy = Math.abs(A.cy-B.cy);
     const ovX = Math.min(A.cx+A.w/2, B.cx+B.w/2) - Math.max(A.cx-A.w/2, B.cx-B.w/2);
     const ovY = Math.min(A.cy+A.h/2, B.cy+B.h/2) - Math.max(A.cy-A.h/2, B.cy-B.h/2);
@@ -1266,9 +1308,9 @@ function tryGenerate(seed, params){
   return {
     valid, disconnectedRooms, params, seed, name:dungeonName(rng, TH),
     W,H, grid, roomId, corridor, doorway, bfs, maxBfs,
-    rooms, edges, entrance, boss, maxDepth,
+    rooms, edges, entrance, boss, maxDepth, floorCount,
     props, spawns, torches, pools, lakeCells, lakeMask, arches,
-    stats:{ rooms:N, edges:edges.length, loops, critLen, floorTiles:floorTotal, reach, genMs:0, attempts:1 }
+    stats:{ rooms:N, edges:edges.length, loops, critLen, floorTiles:floorTotal, reach, floors:floorCount, genMs:0, attempts:1 }
   };
 }
 
@@ -2224,7 +2266,7 @@ function buildLiquidMesh(cells, wx, wz, y){
   return new THREE.Mesh(g, liquidMat);
 }
 
-function buildScene(d){
+function buildScene(d, frameCamera=false){
   disposeLevel();
   D = d;
   const TH = themeSpec(d.params.settingKey, d.params.paletteKey);
@@ -2841,12 +2883,15 @@ function buildScene(d){
   }
   overlay.userData.wx=wx; overlay.userData.wz=wz;
 
-  /* fog + camera framing */
+  /* fog + camera framing. Rebuilding the scene must not reset the user's
+     current camera pose; only the initial scene needs an automatic frame. */
   scene.fog.density = TH.fogD;
-  camTarget.set(0,0,0);
-  const fitSpan = Math.max(W,H) * 1.18;
-  camDist = Math.min(320, Math.max(70, fitSpan / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5))));
-  updateCam();
+  if(frameCamera){
+    camTarget.set(0,0,0);
+    const fitSpan = Math.max(W,H) * 1.18;
+    camDist = Math.min(320, Math.max(70, fitSpan / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5))));
+    updateCam();
+  }
 
   const maxDelay = maxBfs*dStep + 1.2;
   animEnd = 2.3 + maxDelay + 0.8;
@@ -2922,13 +2967,34 @@ const $ = id => document.getElementById(id);
 const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
   rooms:$('rooms'), loops:$('loops'), decor:$('decor'),
   vRooms:$('vRooms'), vLoops:$('vLoops'), vDecor:$('vDecor'),
+  vFloor:$('vFloor'), floorPrev:$('floorPrev'), floorAdd:$('floorAdd'), floorNext:$('floorNext'), floorRemove:$('floorRemove'),
   tGraph:$('tGraph'), tHeat:$('tHeat'), tAnim:$('tAnim'), tPost:$('tPost'),
   tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'),
   editorMenu:$('editorMenu'), editorExit:$('editorExit'), editorTitleText:$('editorTitleText'), editModeBtn:$('editModeBtn'),
   dname:$('dname'), dsub:$('dsub'), vSetting:$('vSetting'), vTheme:$('vTheme'),
   sRooms:$('sRooms'), sEdges:$('sEdges'), sCrit:$('sCrit'),
   sTiles:$('sTiles'), sLights:$('sLights'), sMs:$('sMs'),
-  sCalls:$('sCalls'), sTris:$('sTris'), sFps:$('sFps') };
+   sCalls:$('sCalls'), sTris:$('sTris'), sFps:$('sFps') };
+
+function updateFloorUI(){
+  if(!el.vFloor) return;
+  el.vFloor.textContent = (editor.currentFloor+1) + ' / ' + editor.floorCount;
+  if(el.floorPrev) el.floorPrev.disabled = editor.currentFloor<=0;
+  if(el.floorNext) el.floorNext.disabled = editor.currentFloor>=editor.floorCount-1;
+  if(el.floorRemove) el.floorRemove.disabled = editor.floorCount<=1;
+}
+function setEditorFloor(floor){
+  editor.currentFloor=Math.max(0,Math.min(editor.floorCount-1,Math.round(floor)));
+  editor.selectedId=null; editor.selectedLinkKey=null; editor.connectFrom=null;
+  updateFloorUI(); drawEditor();
+}
+function addEditorFloor(){ editor.floorCount=Math.min(6,editor.floorCount+1); setEditorFloor(editor.floorCount-1); editor.dirty=true; }
+function removeEditorFloor(){
+  if(editor.floorCount<=1) return;
+  const removed=editor.currentFloor;
+  editor.rooms=editor.rooms.filter(r=>(r.floor||0)!==removed).map(r=>({...r, floor:(r.floor||0)>removed?(r.floor-1):(r.floor||0)}));
+  editor.floorCount--; setEditorFloor(Math.min(removed,editor.floorCount-1)); editor.dirty=true; editorRequestForge();
+}
 
 /* -------- setting + palette selection -------- */
 let settingSel = 'auto', paletteSel = 'auto';
@@ -2998,7 +3064,7 @@ function applyHeat(on){
 }
 
 /* -------- 2D layout editor -------- */
-const editor = { tool:'select', rooms:[], links:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, drag:null, scale:6, panX:0, panY:0, nextId:1, deb:null, full:false, collapsed:false, panelWidth:null, panelHeight:null, dirty:false };
+const editor = { tool:'select', rooms:[], links:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, drag:null, scale:6, panX:0, panY:0, nextId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:1, currentFloor:0 };
 function resetEditorLayoutState(){
   editor.rooms=[];
   editor.links=[];
@@ -3009,6 +3075,7 @@ function resetEditorLayoutState(){
   editor.connectFrom=null;
   editor.drag=null;
   editor.nextId=1;
+  editor.floorCount=1; editor.currentFloor=0;
   editor.dirty=false;
 }
 function forgeFromEditor(animate=false){
@@ -3367,6 +3434,7 @@ function ensureEditableRoute(l){
 function editorSnapTargetPoints(skip){
   const pts=[];
   for(const r of editor.rooms){
+    if((r.floor||0)!==editor.currentFloor) continue;
     const x0=r.x-r.w/2, x1=r.x+r.w/2, y0=r.y-r.h/2, y1=r.y+r.h/2;
     pts.push({x:r.x,y:r.y}, {x:x0,y:y0}, {x:x1,y:y0}, {x:x1,y:y1}, {x:x0,y:y1},
       {x:r.x,y:y0}, {x:r.x,y:y1}, {x:x0,y:r.y}, {x:x1,y:r.y});
@@ -3471,6 +3539,7 @@ function editorHit(p){
   const hp = 7 / editor.scale;
   for(let i=editor.rooms.length-1;i>=0;i--){
     const r=editor.rooms[i], x0=r.x-r.w/2, x1=r.x+r.w/2, y0=r.y-r.h/2, y1=r.y+r.h/2;
+    if((r.floor||0)!==editor.currentFloor) continue;
     if(p.x<x0-hp || p.x>x1+hp || p.y<y0-hp || p.y>y1+hp) continue;
     const nearL=Math.abs(p.x-x0)<=hp, nearR=Math.abs(p.x-x1)<=hp, nearT=Math.abs(p.y-y0)<=hp, nearB=Math.abs(p.y-y1)<=hp;
     if((nearL||nearR||nearT||nearB) && p.x>=x0-hp && p.x<=x1+hp && p.y>=y0-hp && p.y<=y1+hp){
@@ -3668,7 +3737,8 @@ function drawEditor(){
   g.strokeStyle = ov ? 'rgba(148,163,208,0.18)' : '#2b3144'; g.beginPath(); g.moveTo(c.width/2,0); g.lineTo(c.width/2,c.height); g.moveTo(0,c.height/2); g.lineTo(c.width,c.height/2); g.stroke();
   if(editor.links.length){
     for(const l of editor.links){
-      const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
+       const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
+       if((A.floor||0)!==editor.currentFloor || (B.floor||0)!==editor.currentFloor) continue;
       const key=editorLinkKey(l.a,l.b), sel=key===editor.selectedLinkKey;
       drawEditorCorridor(g, autoRouteDrawPts(l, editorLinkRoute(l,A,B)), sel ? '#e8973f' : '#59d68f', linkDispWidth(l), sel);
     }
@@ -3698,8 +3768,9 @@ function drawEditor(){
       g.beginPath(); g.arc(p.x,p.y,h.kind==='door'?6:5,0,Math.PI*2); g.fill(); g.stroke();
     }
   }
-  for(const r of editor.rooms){
-    const p=editorWorldToCanvas(r.x-r.w/2,r.y-r.h/2), w=r.w*editor.scale, h=r.h*editor.scale;
+   for(const r of editor.rooms){
+     if((r.floor||0)!==editor.currentFloor) continue;
+     const p=editorWorldToCanvas(r.x-r.w/2,r.y-r.h/2), w=r.w*editor.scale, h=r.h*editor.scale;
     const sel=r.id===editor.selectedId;
     const source = editor.rooms.indexOf(r);
     const floating = D && Array.isArray(D.disconnectedRooms) && D.disconnectedRooms.includes(source);
@@ -3711,7 +3782,7 @@ function drawEditor(){
     g.fillStyle = roleCol || (floating ? '#d6b2ff' : (r.locked ? '#d9a441' : '#9aa0b4'));
     g.font='16px sans-serif';
     const label = (r.roleHint==='secret'?'密 ':r.roleHint==='entrance'?'入 ':r.roleHint==='boss'?'首 ':'') + (floating?'悬':(r.locked?'锁':'动'));
-    g.fillText(label, p.x+7, p.y+19);
+     g.fillText('F'+((r.floor||0)+1)+' '+label, p.x+7, p.y+19);
     if(sel){
       g.fillStyle='#e8973f';
       for(const [hx,hy] of [[p.x,p.y],[p.x+w,p.y],[p.x,p.y+h],[p.x+w,p.y+h]]) g.fillRect(hx-3,hy-3,6,6);
@@ -3728,7 +3799,8 @@ function drawEditor(){
   if(link) status = '已选路径 · ' + (link.manual?'手动':'生成') + ' · ' + (Array.isArray(link.bends)?link.bends.length:0) + ' 个转折点';
   if(selected) status = (selected.locked?'已选锁定':'已选可动') + ' · 区域#' + (si+1);
   if(floatingCount) status = '有 ' + floatingCount + ' 个悬浮区域 · 可作为密室';
-  el.editorStatus.textContent = status;
+   el.editorStatus.textContent = 'F'+(editor.currentFloor+1)+' · ' + status;
+   updateFloorUI();
   updateSceneSelection();
 }
 function setPanelCollapsed(v){
@@ -3777,24 +3849,27 @@ function startEditorResize(e){
 addEventListener('resize', ()=>requestAnimationFrame(drawEditor));
 function syncEditorFromDungeon(d, keepManual=false){
   if(!d || editor.rooms.length) return;
+  editor.floorCount = Math.max(1, d.floorCount || 1); editor.currentFloor = Math.min(editor.currentFloor, editor.floorCount-1);
   editor.rooms = d.rooms.map((r,i)=>({ id:i+1, x:Math.round(r.cx-d.W/2), y:Math.round(r.cy-d.H/2),
-    w:r.w, h:r.h, shape:'rect', locked:false, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null) }));
+     w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:false, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null) }));
   if(!keepManual) editor.links = d.edges.map(e=>({a:e.a+1,b:e.b+1,bends:[],width:2,generated:true}));
   editor.nextId = editor.rooms.length + 1;
 }
 function syncEditorGeneratedRooms(d){
   if(!d) return;
+  editor.floorCount = Math.max(1, d.floorCount || editor.floorCount || 1);
+  editor.currentFloor = Math.min(editor.currentFloor, editor.floorCount-1);
   for(const r of d.rooms){
     const source = Number.isInteger(r.sourceId) ? r.sourceId : r.id;
     if(source < 0) continue;
     let er = editor.rooms[source];
     if(!er){
-      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:'rect', locked:false, roleHint:null };
+      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:false, roleHint:null };
       editor.rooms[source] = er;
     }
     er.x = Math.round(r.cx-d.W/2);
     er.y = Math.round(r.cy-d.H/2);
-    er.w = r.w; er.h = r.h; er.shape = 'rect';
+    er.w = r.w; er.h = r.h; er.shape = 'rect'; er.floor = r.floor||0;
     if(r.type===TYPE.ENTRANCE && !editor.rooms.some(q=>q!==er && q && q.roleHint==='entrance')) er.roleHint = 'entrance';
     if(r.type===TYPE.BOSS && !editor.rooms.some(q=>q!==er && q && q.roleHint==='boss')) er.roleHint = 'boss';
   }
@@ -3929,7 +4004,7 @@ function initEditor(){
       if(action==='add-room'){
         const p=ctx && ctx.point;
         if(p){
-          const r={id:editor.nextId++, x:editorSnap(p.x), y:editorSnap(p.y), w:12, h:9, shape:'rect', locked:false, roleHint:null};
+           const r={id:editor.nextId++, x:editorSnap(p.x), y:editorSnap(p.y), w:12, h:9, shape:'rect', floor:editor.currentFloor, locked:false, roleHint:null};
           editor.rooms.push(r);
           editor.selectedId=r.id;
           editor.selectedLinkKey=null;
@@ -3937,7 +4012,8 @@ function initEditor(){
           editorRequestForge();
         }
       }
-      else if(action==='delete') deleteSelectedEditorRoom();
+       else if(action==='delete') deleteSelectedEditorRoom();
+       else if(action==='move-floor'){ const r=editorRoom(editor.selectedId); if(r){ r.floor=editor.currentFloor; hideEditorMenu(); editorRequestForge(); } }
       else if(action==='lock'){ const r=editorRoom(editor.selectedId); if(r){ r.locked=!r.locked; hideEditorMenu(); editorRequestForge(); } }
       else if(action==='connect'){
         const r=ctx && ctx.room;
@@ -4104,7 +4180,7 @@ function initEditor(){
     }
     if(editor.drag.mode==='draw' && editor.drag.draft){
       const r=editor.drag.draft;
-      if(r.w>=5 && r.h>=5){ const nr={id:editor.nextId++, ...r, shape:'rect', locked:false, roleHint:null}; editor.rooms.push(nr); editor.selectedId=editor.nextId-1; }
+       if(r.w>=5 && r.h>=5){ const nr={id:editor.nextId++, ...r, floor:editor.currentFloor, shape:'rect', locked:false, roleHint:null}; editor.rooms.push(nr); editor.selectedId=editor.nextId-1; }
     }
     editor.drag=null; editorRequestForge();
   };
@@ -4144,13 +4220,14 @@ function forge(animate, useEditorLayout=false){
   if(useEditorLayout && editor.dirty) normalizeConnectedSecretRooms();
   const params = {
     seed,
-    roomCount:+el.rooms.value,
+     roomCount:+el.rooms.value,
+     floorCount:editor.floorCount,
     loopChance:+el.loops.value/100,
     decorDensity:+el.decor.value/100,
     settingKey,
     paletteKey,
     editorEnabled:useEditorLayout && editor.dirty,
-    editorRooms:(useEditorLayout && editor.dirty) ? editor.rooms.map(r=>({...r, shape:'rect'})) : [],
+     editorRooms:(useEditorLayout && editor.dirty) ? editor.rooms.map(r=>({...r, shape:'rect', floor:r.floor||0})) : [],
     editorLinks:(useEditorLayout && editor.dirty) ? editor.links.map(l=>({...l})) : [],
     blockedLinks:(useEditorLayout && editor.dirty) ? [...editor.blockedLinks] : [],
     secretRooms:(useEditorLayout && editor.dirty) ? [...editor.secretRooms] : []
@@ -4158,7 +4235,9 @@ function forge(animate, useEditorLayout=false){
   const d = generateDungeon(params);
   syncEditorGeneratedRooms(d);
   syncEditorLinksFromDungeon(d);
-  buildScene(d);
+  /* D is null only for the first build. Parameter changes and editor drags
+     rebuild geometry while preserving the camera pose. */
+  buildScene(d, D === null);
   applyObjectVis();
   updateRouteOverlay();
   const TH = themeSpec(settingKey, paletteKey);
@@ -4304,6 +4383,10 @@ const sliderRegen = ()=>{ clearTimeout(deb); deb = setTimeout(()=>forge(false), 
 el.rooms.addEventListener('input', ()=>{ el.vRooms.textContent = el.rooms.value; sliderRegen(); });
 el.loops.addEventListener('input', ()=>{ el.vLoops.textContent = el.loops.value + '%'; sliderRegen(); });
 el.decor.addEventListener('input', ()=>{ el.vDecor.textContent = el.decor.value + '%'; sliderRegen(); });
+el.floorPrev.addEventListener('click', ()=>setEditorFloor(editor.currentFloor-1));
+el.floorNext.addEventListener('click', ()=>setEditorFloor(editor.currentFloor+1));
+el.floorAdd.addEventListener('click', addEditorFloor);
+el.floorRemove.addEventListener('click', removeEditorFloor);
 el.seed.addEventListener('change', ()=>forge(true));
 el.dice.addEventListener('click', ()=>{ el.seed.value = 1 + Math.floor(Math.random()*999999); forge(true); });
 el.forge.addEventListener('click', ()=>forge(true));

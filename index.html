@@ -28,6 +28,13 @@
     <meta name="twitter:creator" content="@majidmanzarpour" />
 
     <link rel="stylesheet" href="./src/ui/styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./node_modules/three/build/three.module.js"
+        }
+      }
+    </script>
   </head>
   <body>
     <!-- control + telemetry panel -->
@@ -80,6 +87,15 @@
           <input type="range" id="loops" min="0" max="40" value="15" aria-label="回环概率"></label>
         <label class="sl"><span class="lab"><span>装饰密度</span><b id="vDecor">60%</b></span>
           <input type="range" id="decor" min="0" max="100" value="60" aria-label="装饰密度"></label>
+        <div class="layer-control" aria-label="楼层编辑">
+          <span class="lab"><span>楼层</span><b id="vFloor">1 / 1</b></span>
+          <div class="layer-buttons">
+            <button class="mini-btn" id="floorPrev" type="button" title="上一层">−</button>
+            <button class="mini-btn" id="floorAdd" type="button" title="添加楼层">＋ 添加</button>
+            <button class="mini-btn" id="floorNext" type="button" title="下一层">＋</button>
+            <button class="mini-btn danger" id="floorRemove" type="button" title="删除当前楼层">删除</button>
+          </div>
+        </div>
       </div>
 
       <div class="sec display-options">
@@ -94,7 +110,7 @@
       </div>
     </div>
 
-    <div class="sec editor-sec">
+    <div class="sec editor-sec collapsed">
         <input type="checkbox" id="tEditor" checked hidden>
         <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
         <div class="editor-canvas-wrap">
@@ -109,6 +125,7 @@
       <button data-action="add-room" data-menu="blank">添加区域</button>
       <button data-action="delete" data-menu="room">删除区域</button>
       <button data-action="lock" data-menu="room">锁定/解锁</button>
+      <button data-action="move-floor" data-menu="room">移动到当前楼层</button>
       <button data-action="connect" data-menu="room">连接路径到这里</button>
       <button data-action="entrance" data-menu="room">设为起点</button>
       <button data-action="boss" data-menu="room">设为终点</button>
