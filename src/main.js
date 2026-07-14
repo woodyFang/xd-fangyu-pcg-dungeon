@@ -12,6 +12,12 @@
  * the global `THREE` the original prototype pulled from a CDN.
  */
 import * as THREE from 'three';
+import {
+  FLOOR_HEIGHT,
+  assignRoomsToFloors,
+  buildMultiFloorLayout,
+  compactRoomsByFloor
+} from './generation/multifloor.js';
 
 /* ================================================================
    DUNGEON FORGE — procedural dungeon generator core + showcase
@@ -315,28 +321,54 @@ function randomScatterRooms(rng, N, idStart, centerX, centerY){
 }
 function initialRoomsFromParams(rng, params){
   const editorRooms = params.editorEnabled && Array.isArray(params.editorRooms) ? params.editorRooms : [];
+  const floorTargets = Array.isArray(params.roomCountsByFloor)
+    ? params.roomCountsByFloor.map(value=>Math.max(1,Math.round(value||1))) : null;
+  if(!editorRooms.length && floorTargets?.length){
+    const rooms=[], maxTarget=Math.max(...floorTargets), spacing=Math.sqrt(maxTarget)*12+42;
+    let id=0;
+    floorTargets.forEach((count,floor)=>{
+      const centerX=(floor-(floorTargets.length-1)/2)*spacing;
+      const generated=randomScatterRooms(rng,count,id,centerX,0);
+      generated.forEach(room=>{ room.floor=floor; });
+      rooms.push(...generated); id+=count;
+    });
+    return rooms;
+  }
   if(!editorRooms.length) return randomScatterRooms(rng, params.roomCount, 0, 0, 0);
   const rooms = editorRooms.map((r,i)=>{ const q=makeRoomRecord(i, r.x, r.y, r.w, r.h, r.shape, r.locked, r.roleHint); q.floor=Math.max(0,Math.round(r.floor||0)); return q; });
-  const target = Math.max(params.roomCount, rooms.length);
-  if(rooms.length < target){
-    let cx=0, cy=0;
-    for(const r of rooms){ cx += r.cx; cy += r.cy; }
-    cx /= Math.max(1, rooms.length); cy /= Math.max(1, rooms.length);
-    rooms.push(...randomScatterRooms(rng, target - rooms.length, rooms.length, cx, cy));
+  if(floorTargets?.length){
+    for(let floor=0;floor<floorTargets.length;floor++){
+      const existing=rooms.filter(room=>room.floor===floor), missing=Math.max(0,floorTargets[floor]-existing.length);
+      if(!missing) continue;
+      const cx=existing.length ? existing.reduce((sum,room)=>sum+room.cx,0)/existing.length : floor*24;
+      const cy=existing.length ? existing.reduce((sum,room)=>sum+room.cy,0)/existing.length : 0;
+      const added=randomScatterRooms(rng,missing,rooms.length,cx,cy);
+      added.forEach(room=>{ room.floor=floor; }); rooms.push(...added);
+    }
+  } else {
+    const target = Math.max(params.roomCount, rooms.length);
+    if(rooms.length < target){
+      let cx=0, cy=0;
+      for(const r of rooms){ cx += r.cx; cy += r.cy; }
+      cx /= Math.max(1, rooms.length); cy /= Math.max(1, rooms.length);
+      rooms.push(...randomScatterRooms(rng, target - rooms.length, rooms.length, cx, cy));
+    }
   }
   rooms.forEach((r,i)=>{ r.id=i; r.degree=0; r.type=TYPE.COMBAT; r.shape='rect'; });
   return rooms;
 }
 function generateDungeon(params){
   const t0 = performance.now();
-  let attempt = 0, seed = params.seed >>> 0, d = null;
-  while(attempt < 5){
+  let attempts = 0, seed = params.seed >>> 0, d = null;
+  const maxAttempts=params.editorEnabled ? 1 : 5;
+  while(attempts < maxAttempts){
     d = tryGenerate(seed, params);
+    attempts++;
     if(d.valid) break;
-    seed = (Math.imul(seed, 9301) + 49297) >>> 0; attempt++;
+    seed = (Math.imul(seed, 9301) + 49297) >>> 0;
   }
   d.stats.genMs = performance.now() - t0;
-  d.stats.attempts = attempt + 1;
+  d.stats.attempts = attempts;
   return d;
 }
 
@@ -349,6 +381,16 @@ function tryGenerate(seed, params){
   const rooms = initialRoomsFromParams(rng, params);
   const N = rooms.length;
   if(N < 2) return { valid:false, stats:{} };
+  const floorParam=(values,floor,fallback)=>{
+    const value=Array.isArray(values) ? Number(values[floor]) : Number.NaN;
+    return clamp01(Number.isFinite(value) ? value : fallback);
+  };
+  const loopChanceForEdge=edge=>{
+    const floorA=rooms[edge[0]].floor||0, floorB=rooms[edge[1]].floor||0;
+    const chanceA=floorParam(params.loopChancesByFloor,floorA,params.loopChance);
+    if(floorA===floorB) return chanceA;
+    return (chanceA+floorParam(params.loopChancesByFloor,floorB,params.loopChance))*0.5;
+  };
 
   /* -- 2. separate -- */
   const ROOM_GAP = 6;
@@ -357,6 +399,7 @@ function tryGenerate(seed, params){
     for(let iter=0; iter<300; iter++){
       let moved = false;
       for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
+        if((params.editorEnabled || Array.isArray(params.roomCountsByFloor)) && (rooms[i].floor||0)!==(rooms[j].floor||0)) continue;
         const ox = HW[i]+HW[j] - Math.abs(CX[i]-CX[j]);
         if(ox<=0) continue;
         const oy = HH[i]+HH[j] - Math.abs(CY[i]-CY[j]);
@@ -379,6 +422,21 @@ function tryGenerate(seed, params){
   const centers = rooms.map(r=>({x:r.cx, y:r.cy}));
   let delEdges = delaunay(centers);
   if(delEdges.length === 0){ delEdges = []; for(let i=0;i<N-1;i++) delEdges.push([i,i+1]); }
+  if(Array.isArray(params.roomCountsByFloor)){
+    delEdges=delEdges.filter(([a,b])=>Math.abs((rooms[a].floor||0)-(rooms[b].floor||0))<=1);
+    const edgeKey=(a,b)=>Math.min(a,b)+','+Math.max(a,b);
+    const keys=new Set(delEdges.map(([a,b])=>edgeKey(a,b)));
+    for(let floor=0;floor<params.roomCountsByFloor.length-1;floor++){
+      const lower=rooms.filter(room=>(room.floor||0)===floor);
+      const upper=rooms.filter(room=>(room.floor||0)===floor+1);
+      let best=null;
+      for(const a of lower) for(const b of upper){
+        const distance=Math.hypot(a.cx-b.cx,a.cy-b.cy);
+        if(!best || distance<best.distance) best={a:a.id,b:b.id,distance};
+      }
+      if(best && !keys.has(edgeKey(best.a,best.b))){ delEdges.push([best.a,best.b]); keys.add(edgeKey(best.a,best.b)); }
+    }
+  }
   const blockedPairs = new Set();
   const secretRoomIdx = new Set();
   if(params.editorEnabled && Array.isArray(params.editorRooms)){
@@ -462,7 +520,7 @@ function tryGenerate(seed, params){
     const k=Math.min(e[0],e[1])+','+Math.max(e[0],e[1]);
     if(usedEdges.has(k)) return;
     if(mstIdx.has(idx) && editorUnion(e[0], e[1])){ usedEdges.add(k); addEdge(e[0], e[1], false, false); }
-    else if(!params.editorEnabled && elen(e) < mstMean*2.2 && rng.chance(params.loopChance)){
+    else if(!params.editorEnabled && elen(e) < mstMean*2.2 && rng.chance(loopChanceForEdge(e))){
       usedEdges.add(k); addEdge(e[0], e[1], true, false);
     }
   });
@@ -493,10 +551,19 @@ function tryGenerate(seed, params){
   const gAdj = Array.from({length:N},()=>[]);
   edges.forEach((e,i)=>{ gAdj[e.a].push({b:e.b,i}); gAdj[e.b].push({b:e.a,i}); });
 
+  const hasFloorTargets=Array.isArray(params.roomCountsByFloor) && params.roomCountsByFloor.length>0;
+  const presetTopFloor=hasFloorTargets ? params.roomCountsByFloor.length-1 : 0;
   let boss = rooms.findIndex(r=>r.roleHint==='boss');
-  if(boss < 0){ boss = 0; for(let i=1;i<N;i++) if(rooms[i].w*rooms[i].h > rooms[boss].w*rooms[boss].h) boss = i; }
+  if(boss < 0){
+    const candidates=hasFloorTargets ? rooms.filter(r=>(r.floor||0)===presetTopFloor) : rooms;
+    boss=(candidates[0]||rooms[0]).id;
+    for(const room of candidates) if(room.w*room.h>rooms[boss].w*rooms[boss].h) boss=room.id;
+  }
   let entrance = rooms.findIndex((r,i)=>i!==boss && r.roleHint==='entrance');
-  if(entrance < 0) entrance = Math.min(N-1, boss===0 ? 1 : 0);
+  if(entrance < 0){
+    entrance=rooms.findIndex((r,i)=>i!==boss && (!hasFloorTargets || (r.floor||0)===0));
+    if(entrance<0) entrance=Math.min(N-1,boss===0?1:0);
+  }
 
   const distFrom = src => {
     const D = new Int32Array(N).fill(-1); D[src]=0; const q=[src];
@@ -506,19 +573,15 @@ function tryGenerate(seed, params){
   const dB = distFrom(boss);
   let bestD = dB[entrance];
   if(!rooms.some(r=>r.roleHint==='entrance')){
-    for(let i=0;i<N;i++) if(i!==boss && rooms[i].degree===1 && dB[i]>bestD){ bestD=dB[i]; entrance=i; }
-    if(bestD < 0){ for(let i=0;i<N;i++) if(i!==boss && dB[i]>bestD){ bestD=dB[i]; entrance=i; } }
+    for(let i=0;i<N;i++) if(i!==boss && (!hasFloorTargets || (rooms[i].floor||0)===0) && rooms[i].degree===1 && dB[i]>bestD){ bestD=dB[i]; entrance=i; }
+    if(bestD < 0){ for(let i=0;i<N;i++) if(i!==boss && (!hasFloorTargets || (rooms[i].floor||0)===0) && dB[i]>bestD){ bestD=dB[i]; entrance=i; } }
   }
 
   const dE = distFrom(entrance);
   let maxDepth = 1; for(let i=0;i<N;i++) if(dE[i]>maxDepth) maxDepth = dE[i];
-  const floorCount = Math.max(1, Math.min(6, Math.round(params.floorCount || 1)));
+  let floorCount = Math.max(1, Math.min(6, Math.round(params.floorCount || 1)));
   rooms.forEach((r,i)=>{
     r.depth = Math.max(0,dE[i]); r.difficulty = Math.min(1, 0.15 + 0.85*(r.depth/maxDepth));
-    if(!(params.editorEnabled && Array.isArray(params.editorRooms)))
-      r.floor = floorCount===1 ? 0 : Math.min(floorCount-1, Math.floor((r.depth/Math.max(1,maxDepth))*floorCount));
-    else r.floor = Math.max(0, Math.min(floorCount-1, Math.round(r.floor||0)));
-    r.elevation = r.floor * 8;
   });
   rooms[entrance].type = TYPE.ENTRANCE; rooms[entrance].difficulty = 0;
   rooms[boss].type = TYPE.BOSS; rooms[boss].difficulty = 1;
@@ -529,6 +592,19 @@ function tryGenerate(seed, params){
       for(const e of gAdj[a]) if(!vis[e.b]){ vis[e.b]=1; par[e.b]=a; pe[e.b]=e.i; q.push(e.b); } } }
   const critRooms = new Set(); let critLen = 0;
   for(let c=boss; c!==-1; c=par[c]){ critRooms.add(c); if(pe[c]>=0){ edges[pe[c]].isCritical=true; critLen++; } if(c===entrance) break; }
+  const floorAssignment=assignRoomsToFloors({
+    rooms,
+    parent:par,
+    entrance,
+    boss,
+    floorCount,
+    preserveExisting:(params.editorEnabled && Array.isArray(params.editorRooms)) || hasFloorTargets
+  });
+  floorCount=floorAssignment.floorCount;
+  if (!params.editorEnabled && floorCount > 1) {
+    compactRoomsByFloor({ rooms, floorCount, gap: ROOM_GAP, scale: 0.72 });
+  }
+  for(const room of rooms) room.elevation = room.floor * FLOOR_HEIGHT;
 
   const leaves = [];
   for(let i=0;i<N;i++) if(i!==entrance && i!==boss && rooms[i].degree===1) leaves.push(i);
@@ -632,7 +708,7 @@ function tryGenerate(seed, params){
       while(i>0){ const p=(i-1)>>1; if(heap[p].score<=score) break; heap[i]=heap[p]; i=p; } heap[i]={node,score}; };
     const pop=()=>{ const first=heap[0], last=heap.pop(); if(heap.length){ let i=0; heap[0]=last;
       while(true){ const l=i*2+1,r=l+1; let b=i; if(l<heap.length&&heap[l].score<heap[b].score)b=l; if(r<heap.length&&heap[r].score<heap[b].score)b=r; if(b===i)break; const t=heap[i];heap[i]=heap[b];heap[b]=t;i=b; } } return first; };
-    const heuristic=(x,y)=>Math.abs(x-gx)+Math.abs(y-gy); push(startIdx,heuristic(sx,sy));
+    const heuristic=(x,y)=>(Math.abs(x-gx)+Math.abs(y-gy))*.28; push(startIdx,heuristic(sx,sy));
     const dirs=[[1,0],[-1,0],[0,1],[0,-1]]; let found=false, guard=0;
     while(heap.length&&guard++<total*3){ const cur=pop().node; if(closed[cur])continue; closed[cur]=1; if(cur===goalIdx){found=true;break;}
       const cx=cur%W,cy=Math.floor(cur/W);
@@ -745,6 +821,9 @@ function tryGenerate(seed, params){
 
   for(const e of edges){
     const A=rooms[e.a], B=rooms[e.b];
+    /* Cross-floor edges are materialized later as explicit stair connectors.
+       Do not carve a fake planar corridor into the legacy decoration surface. */
+    if((A.floor||0)!==(B.floor||0)) continue;
     let w = e.isCritical ? 3 : 2;
     if(!e.isCritical && (rooms[e.a].type===TYPE.TREASURE || rooms[e.b].type===TYPE.TREASURE) && rng.chance(0.4)) w = 1;
     if(e.useEditorRoute){
@@ -947,6 +1026,34 @@ function tryGenerate(seed, params){
     if(inB(x+ox,y+oy) && doorway[idx(x+ox,y+oy)]) return true; return false; };
   const interior = (x,y)=>{ for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++)
     if(!inB(x+ox,y+oy) || grid[idx(x+ox,y+oy)]!==FLOOR) return false; return true; };
+  /* Preserve the owning room before the legacy 2D decoration data is split
+     into floor layers. Without this, overlapping coordinates can move a wall
+     prop onto a different floor and make it appear to float. */
+  const detailRoomId = (x,y,dx=0,dy=0)=>{
+    const candidates=[];
+    if(dx || dy) candidates.push([x+dx,y+dy]);
+    candidates.push([x,y]);
+    if(dx || dy) candidates.push([x-dx,y-dy]);
+    candidates.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
+    for(const [cx,cy] of candidates){
+      if(!inB(cx,cy)) continue;
+      const rid=roomId[idx(cx,cy)];
+      if(rid>=0) return rid;
+    }
+    return -1;
+  };
+  const decorDensityForRoomId=roomId=>{
+    const floor=roomId>=0 && rooms[roomId] ? rooms[roomId].floor||0 : 0;
+    return floorParam(params.decorDensitiesByFloor,floor,params.decorDensity);
+  };
+  const decorPlacement=(x,y,dx=0,dy=0)=>{
+    const roomId=detailRoomId(x,y,dx,dy);
+    return {roomId,floor:roomId>=0 && rooms[roomId] ? rooms[roomId].floor||0 : 0};
+  };
+  const decorDensityAt=(x,y,dx=0,dy=0)=>decorDensityForRoomId(decorPlacement(x,y,dx,dy).roomId);
+  for(const arch of arches){
+    arch.roomId=detailRoomId(Math.round(arch.x),Math.round(arch.y));
+  }
   const put = (kind,x,y,rot,scale,rid)=>{ props.push({kind,x,y,rot:rot||0,scale:scale||1,roomId:rid}); occ[idx(x,y)]=1; };
 
   for(const r of rooms){
@@ -1029,7 +1136,7 @@ function tryGenerate(seed, params){
     for(const c of torchCand){
       let ok=true;
       for(const t of torches) if(Math.max(Math.abs(t.x-c.x),Math.abs(t.y-c.y))<4){ ok=false; break; }
-      if(ok) torches.push(c);
+      if(ok) torches.push({...c, roomId:detailRoomId(c.x,c.y,c.dx,c.dy)});
     }
   }
   if(!isHospital){
@@ -1040,9 +1147,9 @@ function tryGenerate(seed, params){
         if(grid[c]!==FLOOR || occ[c] || doorway[c] || lakeMask[c]) continue;
         const rid = roomId[c];
         const diff = rid>=0 ? rooms[rid].difficulty : 0.5;
-        let p = params.decorDensity * 0.045 * (1.25 - 0.6*diff);
+        let p = decorDensityForRoomId(rid) * 0.045 * (1.25 - 0.6*diff);
         if(corridor[c]) p *= 0.45;
-        if(rng.chance(p)) props.push({kind:'debris',x,y,rot:rng.f(0,6.28),scale:rng.f(0.6,1.35),roomId:rid,v:rng.i(0,2)});
+        if(rng.chance(p)) props.push({kind:'debris',x,y,rot:rng.f(0,6.28),scale:rng.f(0.6,1.35),roomId:rid,floor:rooms[rid]?.floor||0,v:rng.i(0,2)});
       }
     }
   }
@@ -1060,11 +1167,11 @@ function tryGenerate(seed, params){
     for(let y=0;y<H;y++) for(let x=0;x<W;x++){
       if(grid[idx(x,y)]!==WALL) continue;
       const d = floorDir(x,y);
-      if(d && rng.chance(0.06 + 0.08*params.decorDensity))
-        props.push({kind:'icicle',x,y,dx:d[0],dy:d[1],rot:rng.f(0,6.28),scale:rng.f(0.7,1.3)});
+      if(d && rng.chance(0.06 + 0.08*decorDensityAt(x,y,d[0],d[1])))
+        props.push({kind:'icicle',x,y,dx:d[0],dy:d[1],...decorPlacement(x,y,d[0],d[1]),rot:rng.f(0,6.28),scale:rng.f(0.7,1.3)});
     }
     for(const lc of lakeCells)
-      if(rng.chance(0.05)) props.push({kind:'shardIce',x:lc.x,y:lc.y,rot:rng.f(0,6.28),scale:rng.f(0.6,1.2)});
+      if(rng.chance(0.05)) props.push({kind:'shardIce',x:lc.x,y:lc.y,roomId:detailRoomId(lc.x,lc.y),rot:rng.f(0,6.28),scale:rng.f(0.6,1.2)});
   }
   if(!isHospital && TH.roots){
     const sites=[];
@@ -1083,13 +1190,13 @@ function tryGenerate(seed, params){
     }
     const mossMask = new Uint8Array(W*H);
     for(const b of breaches){
-      props.push({kind:'roots',x:b.x,y:b.y,dx:b.dx,dy:b.dy,rot:0,scale:rng.f(0.9,1.2)});
+      props.push({kind:'roots',x:b.x,y:b.y,dx:b.dx,dy:b.dy,roomId:detailRoomId(b.x,b.y,b.dx,b.dy),rot:0,scale:rng.f(0.9,1.2)});
       for(let oy=-2;oy<=2;oy++) for(let ox=-2;ox<=2;ox++){
         const nx=b.x+ox, ny=b.y+oy;
         if(!inB(nx,ny)) continue;
         const c=idx(nx,ny);
         if(grid[c]===FLOOR && !mossMask[c] && rng.chance(0.75)){
-          mossMask[c]=1; props.push({kind:'moss',x:nx,y:ny,rot:rng.f(0,6.28),scale:rng.f(0.7,1.4)});
+          mossMask[c]=1; props.push({kind:'moss',x:nx,y:ny,roomId:detailRoomId(nx,ny),rot:rng.f(0,6.28),scale:rng.f(0.7,1.4)});
         }
       }
     }
@@ -1099,8 +1206,8 @@ function tryGenerate(seed, params){
       let nw=0;
       if(x<W-1 && grid[c+1]===WALL) nw++; if(x>0 && grid[c-1]===WALL) nw++;
       if(y<H-1 && grid[c+W]===WALL) nw++; if(y>0 && grid[c-W]===WALL) nw++;
-      if(nw>0 && rng.chance(0.12*params.decorDensity)){
-        mossMask[c]=1; props.push({kind:'moss',x,y,rot:rng.f(0,6.28),scale:rng.f(0.6,1.3)});
+      if(nw>0 && rng.chance(0.12*decorDensityAt(x,y))){
+        mossMask[c]=1; props.push({kind:'moss',x,y,...decorPlacement(x,y),rot:rng.f(0,6.28),scale:rng.f(0.6,1.3)});
       }
     }
   }
@@ -1227,27 +1334,31 @@ function tryGenerate(seed, params){
       if(!d) continue;
       const fc = idx(x+d[0], y+d[1]);
       if(roomId[fc] < 0 || doorway[fc]) continue;
+      const density=decorDensityForRoomId(roomId[fc]);
+      const placement=decorPlacement(x,y,d[0],d[1]);
       let close=false;
       for(const s of signs) if(Math.max(Math.abs(s.x-x),Math.abs(s.y-y))<6){ close=true; break; }
-      if(!close && rng.chance(0.18 + 0.14*params.decorDensity)){
-        signs.push({x,y}); props.push({kind:'wallLight',x,y,dx:d[0],dy:d[1],rot:0,scale:rng.f(0.85,1.05)});
-      } else if(!close && rng.chance(0.16 + 0.16*params.decorDensity)){
-        signs.push({x,y}); props.push({kind:'wallChart',x,y,dx:d[0],dy:d[1],rot:0,scale:rng.f(0.85,1.05)});
-      } else if(!close && rng.chance(0.12 + 0.12*params.decorDensity)){
-        signs.push({x,y}); props.push({kind:'noticeBoard',x,y,dx:d[0],dy:d[1],rot:0,scale:rng.f(0.82,1.0)});
-      } else if(!close && rng.chance(0.08 + 0.08*params.decorDensity)){
-        signs.push({x,y}); props.push({kind:'clock',x,y,dx:d[0],dy:d[1],rot:0,scale:rng.f(0.75,0.9)});
-      } else if(!close && rng.chance(0.1 + 0.1*params.decorDensity)){
-        signs.push({x,y}); props.push({kind:'hospitalSign',x,y,dx:d[0],dy:d[1],rot:0,scale:0.9});
+      if(!close && rng.chance(0.18 + 0.14*density)){
+        signs.push({x,y}); props.push({kind:'wallLight',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.85,1.05)});
+      } else if(!close && rng.chance(0.16 + 0.16*density)){
+        signs.push({x,y}); props.push({kind:'wallChart',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.85,1.05)});
+      } else if(!close && rng.chance(0.12 + 0.12*density)){
+        signs.push({x,y}); props.push({kind:'noticeBoard',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.82,1.0)});
+      } else if(!close && rng.chance(0.08 + 0.08*density)){
+        signs.push({x,y}); props.push({kind:'clock',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.75,0.9)});
+      } else if(!close && rng.chance(0.1 + 0.1*density)){
+        signs.push({x,y}); props.push({kind:'hospitalSign',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:0.9});
       }
     }
     for(let y=0;y<H;y++) for(let x=0;x<W;x++){
       const c=idx(x,y);
       if(grid[c]!==FLOOR || lakeMask[c] || doorway[c]) continue;
-      if(corridor[c] && rng.chance(0.025 + 0.035*params.decorDensity))
-        props.push({kind:'floorStripe',x,y,rot:rng.chance(0.5)?0:Math.PI/2,scale:rng.f(0.85,1.08),roomId:roomId[c]});
-      else if(corridor[c] && rng.chance(0.008 + 0.018*params.decorDensity))
-        props.push({kind:'floorArrow',x,y,rot:rng.i(0,3)*Math.PI/2,scale:rng.f(0.85,1.05),roomId:roomId[c]});
+      const density=decorDensityAt(x,y);
+      const placement=decorPlacement(x,y);
+      if(corridor[c] && rng.chance(0.025 + 0.035*density))
+        props.push({kind:'floorStripe',x,y,rot:rng.chance(0.5)?0:Math.PI/2,scale:rng.f(0.85,1.08),...placement});
+      else if(corridor[c] && rng.chance(0.008 + 0.018*density))
+        props.push({kind:'floorArrow',x,y,rot:rng.i(0,3)*Math.PI/2,scale:rng.f(0.85,1.05),...placement});
     }
   }
   if(!isHospital && TH.bones){
@@ -1255,8 +1366,8 @@ function tryGenerate(seed, params){
       const c=idx(x,y);
       if(grid[c]!==FLOOR || occ[c] || doorway[c] || corridor[c]) continue;
       const rid = roomId[c];
-      if(rid>=0 && rooms[rid].depth>1 && rng.chance(0.018 + 0.02*params.decorDensity))
-        props.push({kind:'bones',x,y,rot:rng.f(0,6.28),scale:rng.f(0.8,1.2),roomId:rid});
+      if(rid>=0 && rooms[rid].depth>1 && rng.chance(0.018 + 0.02*decorDensityForRoomId(rid)))
+        props.push({kind:'bones',x,y,rot:rng.f(0,6.28),scale:rng.f(0.8,1.2),roomId:rid,floor:rooms[rid].floor||0});
     }
   }
   /* liquid veins: crack decals anchored to pool edges so they read as heat/
@@ -1270,7 +1381,7 @@ function tryGenerate(seed, params){
           const nx=p.x+dx, ny=p.y+dy;
           if(!inB(nx,ny) || grid[idx(nx,ny)]!==FLOOR) continue;
           if(rng.chance(pv))
-            props.push({kind:'crack',x:nx,y:ny,dx,dy,rot:rng.f(0,6.28),scale:rng.f(0.9,1.5)});
+            props.push({kind:'crack',x:nx,y:ny,dx,dy,roomId:detailRoomId(nx,ny),rot:rng.f(0,6.28),scale:rng.f(0.9,1.5)});
         }
     }
     if(!isHospital && TH.lakes){
@@ -1281,7 +1392,7 @@ function tryGenerate(seed, params){
           const c2 = idx(nx,ny);
           if(grid[c2]!==FLOOR || lakeMask[c2]) continue;
           if(rng.chance(0.3))
-            props.push({kind:'crack',x:nx,y:ny,dx,dy,rot:rng.f(0,6.28),scale:rng.f(0.7,1.2),ice:1});
+            props.push({kind:'crack',x:nx,y:ny,dx,dy,roomId:detailRoomId(nx,ny),rot:rng.f(0,6.28),scale:rng.f(0.7,1.2),ice:1});
         }
     }
   }
@@ -1300,17 +1411,51 @@ function tryGenerate(seed, params){
       if(placed.length >= (r.type===TYPE.BOSS?4:2)) break;
       let close=false;
       for(const p of placed) if(Math.max(Math.abs(p.x-s.x),Math.abs(p.y-s.y))<4){ close=true; break; }
-      if(!close){ placed.push(s); props.push({kind:'banner',x:s.x,y:s.y,dx:s.dx,dy:s.dy,rot:0,scale:1}); }
+      if(!close){ placed.push(s); props.push({kind:'banner',x:s.x,y:s.y,dx:s.dx,dy:s.dy,
+        roomId:detailRoomId(s.x,s.y,s.dx,s.dy),rot:0,scale:1}); }
     }
   }
 
-  const loops = edges.filter(e=>e.isLoop).length;
+  const multi = buildMultiFloorLayout({
+    W,
+    H,
+    floorCount,
+    rooms,
+    edges,
+    entrance,
+    tiles:{VOID,FLOOR,WALL,POOL},
+    legacy:{props,spawns,torches,pools,lakeCells,arches}
+  });
+  const baseLayer = multi.layers[0];
+  const generatedRoomCounts=Array.from({length:floorCount},(_,floor)=>rooms.filter(room=>room.floor===floor).length);
+  const targetRoomCounts=Array.from({length:floorCount},(_,floor)=>params.roomCountsByFloor?.[floor] ?? generatedRoomCounts[floor]);
+  const targetLoopChances=Array.from({length:floorCount},(_,floor)=>floorParam(params.loopChancesByFloor,floor,params.loopChance));
+  const targetDecorDensities=Array.from({length:floorCount},(_,floor)=>floorParam(params.decorDensitiesByFloor,floor,params.decorDensity));
+  multi.layers.forEach(layer=>{
+    layer.targetRoomCount=targetRoomCounts[layer.floor];
+    layer.generatedRoomCount=generatedRoomCounts[layer.floor];
+    layer.loopChance=targetLoopChances[layer.floor];
+    layer.decorDensity=targetDecorDensities[layer.floor];
+  });
+  const loops = multi.edges.filter(e=>e.isLoop).length;
+  const totalFloorTiles = multi.layers.reduce((sum,layer)=>{
+    let count=0;
+    for(const tile of layer.grid) if(tile===FLOOR) count++;
+    return sum+count;
+  },0);
   return {
-    valid, disconnectedRooms, params, seed, name:dungeonName(rng, TH),
-    W,H, grid, roomId, corridor, doorway, bfs, maxBfs,
-    rooms, edges, entrance, boss, maxDepth, floorCount,
-    props, spawns, torches, pools, lakeCells, lakeMask, arches,
-    stats:{ rooms:N, edges:edges.length, loops, critLen, floorTiles:floorTotal, reach, floors:floorCount, genMs:0, attempts:1 }
+    valid:multi.valid, disconnectedRooms, params, seed, name:dungeonName(rng, TH),
+    W,H,
+    grid:baseLayer.grid, roomId:baseLayer.roomId, corridor:baseLayer.corridor,
+    doorway:baseLayer.doorway, bfs:baseLayer.bfs, maxBfs:baseLayer.maxBfs,
+    rooms, edges:multi.edges, connectors:multi.connectors, layers:multi.layers, bfs3:multi.bfs3,
+    entrance, boss, maxDepth, floorCount, floorHeight:FLOOR_HEIGHT,
+    roomCountsByFloor:targetRoomCounts, generatedRoomCountsByFloor:generatedRoomCounts,
+    loopChancesByFloor:targetLoopChances, decorDensitiesByFloor:targetDecorDensities,
+    props:baseLayer.props, spawns:baseLayer.spawns, torches:baseLayer.torches,
+    pools:baseLayer.pools, lakeCells:baseLayer.lakeCells, lakeMask:baseLayer.lakeMask, arches:baseLayer.arches,
+    generationErrors:multi.errors,
+    stats:{ rooms:N, edges:multi.edges.length, loops, critLen, floorTiles:totalFloorTiles, reach:multi.reach, floors:floorCount, genMs:0, attempts:1 }
   };
 }
 
@@ -1335,9 +1480,12 @@ const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(canvasBg, 0.002);
 
 const CAMERA_FOV = 45;
+const CAMERA_DEFAULT_YAW = Math.PI/4;
+const CAMERA_DEFAULT_PITCH = 0.64;
+const CAMERA_PITCH_LIMIT = 1.5;
 let aspect = innerWidth/innerHeight;
 const cam = new THREE.PerspectiveCamera(CAMERA_FOV, aspect, 0.1, 1000);
-let yaw = Math.PI/4, pitch = 0.64, camDist = 170;
+let yaw = CAMERA_DEFAULT_YAW, pitch = CAMERA_DEFAULT_PITCH, camDist = 170;
 const camTarget = new THREE.Vector3(0,0,0);
 function updateCam(){
   const cp=Math.cos(pitch), sp=Math.sin(pitch);
@@ -2208,6 +2356,8 @@ function writeInstances(mesh, t){
 /* -------- scene state -------- */
 let D = null;
 let group = null;
+let levelRoot = null;
+let renderedFloorStates = [];
 let meshes = {};
 let overlay = null;
 let roomSelection = null;
@@ -2217,17 +2367,23 @@ let floorColorsBase = null, floorColorsHeat = null;
 let animT = Infinity, animEnd = 0, animating = false;
 let fx = { liquids:[], shafts:[], spinners:[], parts:null };
 let levelGeos = [];
+let levelMats = [];
+let floorViewMode = 'neighbors';
 const lerpC = (a,b,t)=> _c.set(a).lerp(new THREE.Color(b), t).getHex();
 
 function disposeLevel(){
-  if(group){ scene.remove(group);
-    group.traverse(o=>{
+  const root=levelRoot || group;
+  if(root){ scene.remove(root);
+    root.traverse(o=>{
       if(o.isInstancedMesh) o.dispose();
       if(o.isLine || o.isPoints){ o.geometry.dispose(); if(o.material && o.material.dispose && o.material!==partMat) o.material.dispose(); }
     });
   }
   for(const g of levelGeos) g.dispose();
+  for(const m of levelMats) m.dispose();
   levelGeos = [];
+  levelMats = [];
+  levelRoot = null; renderedFloorStates = [];
   group = null; meshes = {}; overlay = null; roomSelection = null; routeOverlay = null;
   lights = [];
   fx = { liquids:[], shafts:[], spinners:[], parts:null };
@@ -2266,16 +2422,111 @@ function buildLiquidMesh(cells, wx, wz, y){
   return new THREE.Mesh(g, liquidMat);
 }
 
-function buildScene(d, frameCamera=false){
-  disposeLevel();
-  D = d;
+function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShells=true){
+  if(!Array.isArray(dungeon.layers) || dungeon.layers.length<=1) return;
+  const floorHeight=dungeon.floorHeight || FLOOR_HEIGHT;
+  const floorGeo=new THREE.BoxGeometry(.96,.12,.96);
+  const wallGeo=new THREE.BoxGeometry(.96,1,.96);
+  levelGeos.push(floorGeo,wallGeo);
+  const solidContext=floorViewMode==='all' || floorViewMode==='explode';
+  const ghostMat=new THREE.MeshStandardMaterial({
+    color:TH.floor,roughness:.9,metalness:0,
+    transparent:!solidContext,opacity:solidContext?1:.2,depthWrite:solidContext
+  });
+  const ghostWallMat=new THREE.MeshStandardMaterial({
+    color:TH.wall,roughness:.92,metalness:0,
+    transparent:!solidContext,opacity:solidContext?1:.14,depthWrite:solidContext
+  });
+  const stairMat=new THREE.MeshStandardMaterial({color:TH.cap,roughness:.82,metalness:.03});
+  levelMats.push(ghostMat,ghostWallMat,stairMat);
+  const exploded=floorViewMode==='explode';
+  const spacing=exploded?2.2:1;
+  const visibleFloor=floor=>floorViewMode==='all' || exploded || (floorViewMode==='neighbors' && Math.abs(floor-activeFloor)<=1);
+  if(showShells) for(const layer of dungeon.layers){
+    if(layer.floor===activeFloor || !visibleFloor(layer.floor)) continue;
+    let floorCount=0, wallCount=0;
+    for(let c=0;c<layer.grid.length;c++){
+      if(layer.grid[c]===FLOOR && !layer.stairMask[c] && !layer.slabOpening?.[c]) floorCount++;
+      else if(layer.grid[c]===WALL) wallCount++;
+    }
+    const fg=new THREE.Group();
+    fg.position.y=(layer.floor-activeFloor)*floorHeight*spacing;
+    root.add(fg);
+    const fm=new THREE.InstancedMesh(floorGeo,ghostMat,Math.max(1,floorCount)); fm.count=floorCount;
+    const wm=new THREE.InstancedMesh(wallGeo,ghostWallMat,Math.max(1,wallCount)); wm.count=wallCount;
+    let fi=0,wi=0;
+    for(let c=0;c<layer.grid.length;c++){
+      const x=c%dungeon.W, y=Math.floor(c/dungeon.W);
+      if(layer.grid[c]===FLOOR && !layer.stairMask[c] && !layer.slabOpening?.[c]){
+        _p.set(wx(x),-.08,wz(y)); _q.identity(); _s.set(1,1,1); _m.compose(_p,_q,_s); fm.setMatrixAt(fi++,_m);
+      } else if(layer.grid[c]===WALL){
+        _p.set(wx(x),.6,wz(y)); _q.identity(); _s.set(1,1.2,1); _m.compose(_p,_q,_s); wm.setMatrixAt(wi++,_m);
+      }
+    }
+    fm.receiveShadow=true; wm.receiveShadow=true;
+    fm.castShadow=solidContext; wm.castShadow=solidContext;
+    fg.add(fm,wm);
+  }
+  for(const connector of dungeon.connectors || []){
+    const touchesActive=connector.fromFloor===activeFloor || connector.toFloor===activeFloor;
+    if(floorViewMode==='current' ? !touchesActive : (!visibleFloor(connector.fromFloor) && !visibleFloor(connector.toFloor))) continue;
+    const steps=connector.stepCount || Math.max(8,Math.round(floorHeight/.25));
+    const alongX=Math.abs(connector.upper.x-connector.lower.x)>Math.abs(connector.upper.y-connector.lower.y);
+    const run=connector.length || Math.max(1,Math.hypot(connector.upper.x-connector.lower.x,connector.upper.y-connector.lower.y));
+    const treadDepth=connector.treadDepth || run/steps;
+    const stepGeo=new THREE.BoxGeometry(alongX ? treadDepth : connector.width, 1, alongX ? connector.width : treadDepth);
+    const landingDepth=connector.landingDepth || 2;
+    const landingGeo=new THREE.BoxGeometry(alongX ? landingDepth+1 : connector.width, .16, alongX ? connector.width : landingDepth+1);
+    const rimGeo=new THREE.BoxGeometry(alongX ? run : .14, .56, alongX ? .14 : run);
+    levelGeos.push(stepGeo,landingGeo,rimGeo);
+    const sm=new THREE.InstancedMesh(stepGeo,stairMat,steps);
+    const dx=(connector.upper.x-connector.lower.x)/run, dz=(connector.upper.y-connector.lower.y)/run;
+    const lowerY=(connector.fromFloor-activeFloor)*floorHeight*spacing;
+    const totalRise=(connector.rise || floorHeight)*spacing;
+    for(let i=0;i<steps;i++){
+      const along=(i+.5)*treadDepth;
+      const x=connector.lower.x+dx*along, z=connector.lower.y+dz*along;
+      const stepTop=totalRise*(i+1)/steps;
+      _p.set(wx(x),lowerY+stepTop/2,wz(z)); _q.identity(); _s.set(1,stepTop,1); _m.compose(_p,_q,_s); sm.setMatrixAt(i,_m);
+    }
+    sm.castShadow=true; sm.receiveShadow=true; root.add(sm);
+    const landings=new THREE.InstancedMesh(landingGeo,stairMat,2);
+    _q.identity(); _s.set(1,1,1);
+    _p.set(wx(connector.lower.x-dx*landingDepth/2),lowerY-.01,wz(connector.lower.y-dz*landingDepth/2)); _m.compose(_p,_q,_s); landings.setMatrixAt(0,_m);
+    _p.set(wx(connector.upper.x+dx*landingDepth/2),lowerY+totalRise-.01,wz(connector.upper.y+dz*landingDepth/2)); _m.compose(_p,_q,_s); landings.setMatrixAt(1,_m);
+    landings.castShadow=true; landings.receiveShadow=true; root.add(landings);
+    const rims=new THREE.InstancedMesh(rimGeo,stairMat,2);
+    const sideX=-dz*(connector.width/2+.12), sideZ=dx*(connector.width/2+.12);
+    const midX=(connector.lower.x+connector.upper.x)/2, midZ=(connector.lower.y+connector.upper.y)/2;
+    _p.set(wx(midX+sideX),lowerY+totalRise+.28,wz(midZ+sideZ)); _m.compose(_p,_q,_s); rims.setMatrixAt(0,_m);
+    _p.set(wx(midX-sideX),lowerY+totalRise+.28,wz(midZ-sideZ)); _m.compose(_p,_q,_s); rims.setMatrixAt(1,_m);
+    rims.castShadow=true; root.add(rims);
+  }
+}
+
+function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFloor=false,includeContext=false,showContextShells=true,staticLayer=false,spacing=1}={}){
+  meshes={}; overlay=null; lights=[]; floorColorsBase=null; floorColorsHeat=null;
+  fx={ liquids:[], shafts:[], spinners:[], parts:null };
+  const activeLayer=Array.isArray(sourceDungeon.layers) ? sourceDungeon.layers[activeFloor] : null;
+  const d=activeLayer ? {
+    ...sourceDungeon,
+    grid:activeLayer.grid, roomId:activeLayer.roomId, corridor:activeLayer.corridor,
+    doorway:activeLayer.doorway, stairMask:activeLayer.stairMask,
+    stairClearance:activeLayer.stairClearance, stairLanding:activeLayer.stairLanding, slabOpening:activeLayer.slabOpening,
+    bfs:activeLayer.bfs, maxBfs:activeLayer.maxBfs, lakeMask:activeLayer.lakeMask,
+    props:activeLayer.props, spawns:activeLayer.spawns, torches:activeLayer.torches,
+    pools:activeLayer.pools, lakeCells:activeLayer.lakeCells, arches:activeLayer.arches,
+    edges:sourceDungeon.edges.filter(e=>e.kind==='corridor' && e.floor===activeFloor)
+  } : sourceDungeon;
   const TH = themeSpec(d.params.settingKey, d.params.paletteKey);
   const accC = parseInt(TH.accent.slice(1),16);
   applyThemeEnv(TH);
-  group = new THREE.Group(); scene.add(group);
+  group = new THREE.Group();
+  group.position.y=activeFloor*(sourceDungeon.floorHeight || FLOOR_HEIGHT)*spacing;
+  levelRoot.add(group);
   const W=d.W, H=d.H, grid=d.grid, roomId=d.roomId, corridor=d.corridor,
         doorway=d.doorway, bfs=d.bfs, maxBfs=d.maxBfs, rooms=d.rooms,
-        lakeMask=d.lakeMask;
+        lakeMask=d.lakeMask, stairMask=d.stairMask || new Uint8Array(W*H), slabOpening=d.slabOpening || new Uint8Array(W*H);
   const idx=(x,y)=>y*W+x, wx=x=>x-W/2+0.5, wz=y=>y-H/2+0.5;
   const cellRng = makeRng(d.seed ^ 0x9e3779b9);
   const dStep = 0.016;
@@ -2294,7 +2545,7 @@ function buildScene(d, frameCamera=false){
   const base = new THREE.Color(), tint = new THREE.Color(),
         heatA = new THREE.Color(0x2f4bb0), heatB = new THREE.Color(0xe8502f);
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
-    const c=idx(x,y); if(grid[c]!==FLOOR || lakeMask[c]) continue;
+    const c=idx(x,y); if(grid[c]!==FLOOR || lakeMask[c] || stairMask[c] || slabOpening[c]) continue;
     let walls8=0;
     for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
       if(!ox&&!oy) continue;
@@ -2745,7 +2996,7 @@ function buildScene(d, frameCamera=false){
     group.add(m); fx.spinners.push({m, spd:-0.16});
   }
   if(TH.shafts){
-    const big = rooms.filter(r=>r.type===TYPE.COMBAT && !r.lake).sort((a,b)=>b.w*b.h-a.w*a.h).slice(0,2);
+    const big = rooms.filter(r=>(r.floor||0)===activeFloor && r.type===TYPE.COMBAT && !r.lake).sort((a,b)=>b.w*b.h-a.w*a.h).slice(0,2);
     for(const r of big) shaftAt.push([wx(r.cx), wz(r.cy), 1.3]);
   }
   for(const s of shaftAt){
@@ -2758,7 +3009,7 @@ function buildScene(d, frameCamera=false){
   /* ambient particles — emitted from sources that make physical sense:
      embers off lava + flames, wisps over graves/candles/miasma, spores off
      moss/roots/water, dust inside light shafts, snow as weather everywhere */
-  { const spec = TH.particles;
+  if(!staticLayer){ const spec = TH.particles;
     const pts = [];
     const pp = (x,z,y)=>pts.push({x,z,y});
     if(spec.kind===1){
@@ -2816,38 +3067,42 @@ function buildScene(d, frameCamera=false){
   dirL.shadow.camera.updateProjectionMatrix();
 
   /* lights: farthest-point sample of torches + key lights */
-  const budget = 12;
-  const keys = [];
-  keys.push({x:rooms[d.entrance].cx, y:rooms[d.entrance].cy, col:0x3fd0bb, i:1.0, dist:13});
-  keys.push({x:rooms[d.boss].cx, y:rooms[d.boss].cy, col:0xff4030, i:1.7, dist:17, ry:2.2});
-  const shr = rooms.filter(r=>r.type===TYPE.SHRINE);
-  if(shr.length) keys.push({x:shr[0].cx, y:shr[0].cy, col:0x6f9dff, i:1.0, dist:12});
-  const tb = Math.max(4, budget - keys.length);
-  const chosen = [];
-  if(d.torches.length){
-    chosen.push(d.torches[0]);
-    while(chosen.length < Math.min(tb, d.torches.length)){
-      let best=null, bd=-1;
-      for(const t of d.torches){
-        let dm=1e9; for(const c of chosen){ const q=(t.x-c.x)*(t.x-c.x)+(t.y-c.y)*(t.y-c.y); if(q<dm) dm=q; }
-        if(dm>bd){ bd=dm; best=t; }
+  if(!staticLayer){
+    const budget = 12;
+    const keys = [];
+    const entranceRoom=rooms[d.entrance], bossRoom=rooms[d.boss];
+    if((entranceRoom?.floor||0)===activeFloor) keys.push({x:entranceRoom.cx, y:entranceRoom.cy, col:0x3fd0bb, i:1.0, dist:13});
+    if((bossRoom?.floor||0)===activeFloor) keys.push({x:bossRoom.cx, y:bossRoom.cy, col:0xff4030, i:1.7, dist:17, ry:2.2});
+    const shr = rooms.filter(r=>(r.floor||0)===activeFloor && r.type===TYPE.SHRINE);
+    if(shr.length) keys.push({x:shr[0].cx, y:shr[0].cy, col:0x6f9dff, i:1.0, dist:12});
+    const tb = Math.max(4, budget - keys.length);
+    const chosen = [];
+    if(d.torches.length){
+      chosen.push(d.torches[0]);
+      while(chosen.length < Math.min(tb, d.torches.length)){
+        let best=null, bd=-1;
+        for(const t of d.torches){
+          let dm=1e9; for(const c of chosen){ const q=(t.x-c.x)*(t.x-c.x)+(t.y-c.y)*(t.y-c.y); if(q<dm) dm=q; }
+          if(dm>bd){ bd=dm; best=t; }
+        }
+        chosen.push(best);
       }
-      chosen.push(best);
     }
-  }
-  let li=0;
-  for(const k of keys){
-    const L = new THREE.PointLight(k.col, k.i, k.dist, 2);
-    L.position.set(wx(k.x), k.ry||1.6, wz(k.y));
-    L.userData={base:k.i, ph:li*2.1, ramp:1}; group.add(L); lights.push(L); li++;
-  }
-  for(const t of chosen){
-    const L = new THREE.PointLight(TH.torchLight[0], TH.torchLight[1], TH.torchLight[2], 2);
-    L.position.set(wx(t.x)+t.dx*0.6, 1.7, wz(t.y)+t.dy*0.6);
-    L.userData={base:TH.torchLight[1], ph:li*1.7, ramp:1}; group.add(L); lights.push(L); li++;
+    let li=0;
+    for(const k of keys){
+      const L = new THREE.PointLight(k.col, k.i, k.dist, 2);
+      L.position.set(wx(k.x), k.ry||1.6, wz(k.y));
+      L.userData={base:k.i, ph:li*2.1, ramp:1}; group.add(L); lights.push(L); li++;
+    }
+    for(const t of chosen){
+      const L = new THREE.PointLight(TH.torchLight[0], TH.torchLight[1], TH.torchLight[2], 2);
+      L.position.set(wx(t.x)+t.dx*0.6, 1.7, wz(t.y)+t.dy*0.6);
+      L.userData={base:TH.torchLight[1], ph:li*1.7, ramp:1}; group.add(L); lights.push(L); li++;
+    }
   }
 
   /* graph overlay */
+  if(!staticLayer){
   overlay = new THREE.Group(); group.add(overlay);
   const mkLines = (pairs, color, y, op)=>{
     const pos = new Float32Array(Math.max(pairs.length,1)*6);
@@ -2882,19 +3137,49 @@ function buildScene(d, frameCamera=false){
     const rects=new THREE.LineSegments(g,m); rects.renderOrder=7; overlay.add(rects); overlay.userData.rects=rects;
   }
   overlay.userData.wx=wx; overlay.userData.wz=wz;
+  }
+
+  if(includeContext) buildSimpleFloorContext(group,sourceDungeon,activeFloor,TH,wx,wz,showContextShells);
 
   /* fog + camera framing. Rebuilding the scene must not reset the user's
      current camera pose; only the initial scene needs an automatic frame. */
   scene.fog.density = TH.fogD;
+  const activeWorldY=activeFloor*(sourceDungeon.floorHeight || FLOOR_HEIGHT)*spacing;
+  if(frameCamera || focusFloor){
+    if(focusFloor) camTarget.y=activeWorldY;
+  }
   if(frameCamera){
-    camTarget.set(0,0,0);
+    camTarget.set(0,activeWorldY,0);
     const fitSpan = Math.max(W,H) * 1.18;
     camDist = Math.min(320, Math.max(70, fitSpan / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5))));
     updateCam();
-  }
+  } else if(focusFloor){ updateCam(); }
 
   const maxDelay = maxBfs*dStep + 1.2;
   animEnd = 2.3 + maxDelay + 0.8;
+  return {floor:activeFloor,group,meshes,fx,lights,floorColorsBase,floorColorsHeat,staticLayer};
+}
+
+function buildScene(sourceDungeon, frameCamera=false, focusFloor=false){
+  disposeLevel();
+  D=sourceDungeon;
+  levelRoot=new THREE.Group();
+  scene.add(levelRoot);
+  const activeFloor=Math.max(0,Math.min((sourceDungeon.floorCount||1)-1,editor.currentFloor||0));
+  const fullFloorArt=Array.isArray(sourceDungeon.layers) && sourceDungeon.layers.length>1
+    && (floorViewMode==='all' || floorViewMode==='explode');
+  const spacing=floorViewMode==='explode'?2.2:1;
+  renderedFloorStates=[];
+  if(fullFloorArt){
+    for(const layer of sourceDungeon.layers){
+      if(layer.floor===activeFloor) continue;
+      renderedFloorStates.push(buildSceneLayer(sourceDungeon,layer.floor,{staticLayer:true,spacing}));
+    }
+  }
+  const activeState=buildSceneLayer(sourceDungeon,activeFloor,{
+    frameCamera,focusFloor,includeContext:true,showContextShells:!fullFloorArt,staticLayer:false,spacing
+  });
+  renderedFloorStates.push(activeState);
 }
 
 function updateRects(t){
@@ -2967,7 +3252,8 @@ const $ = id => document.getElementById(id);
 const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
   rooms:$('rooms'), loops:$('loops'), decor:$('decor'),
   vRooms:$('vRooms'), vLoops:$('vLoops'), vDecor:$('vDecor'),
-  vFloor:$('vFloor'), floorPrev:$('floorPrev'), floorAdd:$('floorAdd'), floorNext:$('floorNext'), floorRemove:$('floorRemove'),
+  vFloor:$('vFloor'), vFloorPrev:$('vFloorPrev'), vFloorNext:$('vFloorNext'), vFloorTotal:$('vFloorTotal'),
+  floorPrev:$('floorPrev'), floorAddNext:$('floorAddNext'), floorAdd:$('floorAdd'), floorNext:$('floorNext'), floorRemove:$('floorRemove'),
   tGraph:$('tGraph'), tHeat:$('tHeat'), tAnim:$('tAnim'), tPost:$('tPost'),
   tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'),
   editorMenu:$('editorMenu'), editorExit:$('editorExit'), editorTitleText:$('editorTitleText'), editModeBtn:$('editModeBtn'),
@@ -2978,22 +3264,123 @@ const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
 
 function updateFloorUI(){
   if(!el.vFloor) return;
-  el.vFloor.textContent = (editor.currentFloor+1) + ' / ' + editor.floorCount;
+  normalizeFloorRoomCounts(editor.floorCount);
+  normalizeFloorTuning(editor.floorCount);
+  el.vFloor.textContent = '第 ' + (editor.currentFloor+1) + ' 层';
+  if(el.vFloorPrev) el.vFloorPrev.textContent = editor.currentFloor>0 ? '第 '+editor.currentFloor+' 层 · '+roomCountsByFloor[editor.currentFloor-1]+' 区' : '无';
+  if(el.vFloorNext) el.vFloorNext.textContent = editor.currentFloor<editor.floorCount-1 ? '第 '+(editor.currentFloor+2)+' 层 · '+roomCountsByFloor[editor.currentFloor+1]+' 区' : '无';
+  if(el.vFloorTotal) el.vFloorTotal.textContent = '共 '+editor.floorCount+' 层 · '+roomCountsByFloor.reduce((sum,value)=>sum+value,0)+' 区';
   if(el.floorPrev) el.floorPrev.disabled = editor.currentFloor<=0;
   if(el.floorNext) el.floorNext.disabled = editor.currentFloor>=editor.floorCount-1;
+  if(el.floorAddNext) el.floorAddNext.disabled = editor.floorCount>=6;
+  if(el.floorAdd) el.floorAdd.disabled = editor.floorCount>=6;
   if(el.floorRemove) el.floorRemove.disabled = editor.floorCount<=1;
+  const roomCount=roomCountsByFloor[editor.currentFloor] ?? DEFAULT_ROOMS_PER_FLOOR;
+  const loopRate=loopRatesByFloor[editor.currentFloor] ?? DEFAULT_LOOP_RATE;
+  const decorDensity=decorDensitiesByFloor[editor.currentFloor] ?? DEFAULT_DECOR_DENSITY;
+  if(el.rooms) el.rooms.value=String(roomCount);
+  if(el.vRooms) el.vRooms.textContent=String(roomCount);
+  if(el.loops) el.loops.value=String(loopRate);
+  if(el.vLoops) el.vLoops.textContent=loopRate+'%';
+  if(el.decor) el.decor.value=String(decorDensity);
+  if(el.vDecor) el.vDecor.textContent=decorDensity+'%';
 }
 function setEditorFloor(floor){
   editor.currentFloor=Math.max(0,Math.min(editor.floorCount-1,Math.round(floor)));
-  editor.selectedId=null; editor.selectedLinkKey=null; editor.connectFrom=null;
-  updateFloorUI(); drawEditor();
+  editor.selectedId=null; editor.selectedLinkKey=null;
+  updateFloorUI();
+  if(D && Array.isArray(D.layers)){
+    buildScene(D,false,true);
+    applyObjectVis();
+    applyHeat(el.tHeat.checked);
+    settleAll();
+    setOverlayStatic();
+    updateRouteOverlay();
+  }
+  drawEditor();
 }
-function addEditorFloor(){ editor.floorCount=Math.min(6,editor.floorCount+1); setEditorFloor(editor.floorCount-1); editor.dirty=true; }
+function addEditorFloorAfterCurrent(){
+  if(editor.floorCount>=6) return;
+  normalizeFloorRoomCounts(editor.floorCount);
+  normalizeFloorTuning(editor.floorCount);
+  const inserted=editor.currentFloor+1;
+  const inherited=roomCountsByFloor[editor.currentFloor] ?? DEFAULT_ROOMS_PER_FLOOR;
+  roomCountsByFloor.splice(inserted,0,inherited);
+  loopRatesByFloor.splice(inserted,0,loopRatesByFloor[editor.currentFloor] ?? DEFAULT_LOOP_RATE);
+  decorDensitiesByFloor.splice(inserted,0,decorDensitiesByFloor[editor.currentFloor] ?? DEFAULT_DECOR_DENSITY);
+  if(editor.dirty || editState.ortho){
+    const floorByRoomId=new Map(editor.rooms.map(room=>[room.id,room.floor||0]));
+    editor.links=editor.links.filter(link=>{
+      const a=floorByRoomId.get(link.a), b=floorByRoomId.get(link.b);
+      if(!Number.isInteger(a) || !Number.isInteger(b)) return true;
+      return !(Math.min(a,b)<inserted && Math.max(a,b)>=inserted);
+    });
+    editor.rooms=editor.rooms.map(room=>{
+      const floor=room.floor||0;
+      return floor>=inserted ? {...room,floor:floor+1} : room;
+    });
+    editor.floorCount++;
+    requestedFloorCount=editor.floorCount;
+    editor.dirty=true;
+    setEditorFloor(inserted);
+    editorRequestForge();
+    return;
+  }
+  requestedFloorCount=Math.min(6,requestedFloorCount+1);
+  editor.floorCount=requestedFloorCount;
+  forge(true,false);
+  setEditorFloor(Math.min(inserted,editor.floorCount-1));
+}
+function addEditorFloor(){
+  if(editor.floorCount>=6) return;
+  normalizeFloorRoomCounts(editor.floorCount);
+  normalizeFloorTuning(editor.floorCount);
+  roomCountsByFloor.push(roomCountsByFloor[editor.floorCount-1] ?? DEFAULT_ROOMS_PER_FLOOR);
+  loopRatesByFloor.push(loopRatesByFloor[editor.floorCount-1] ?? DEFAULT_LOOP_RATE);
+  decorDensitiesByFloor.push(decorDensitiesByFloor[editor.floorCount-1] ?? DEFAULT_DECOR_DENSITY);
+  if(editor.dirty || editState.ortho){
+    editor.floorCount++;
+    editor.dirty=true;
+    setEditorFloor(editor.floorCount-1);
+    editorRequestForge();
+    return;
+  }
+  requestedFloorCount=Math.min(6,requestedFloorCount+1);
+  editor.floorCount=requestedFloorCount;
+  forge(true,false);
+  setEditorFloor(Math.min(requestedFloorCount-1,editor.floorCount-1));
+}
 function removeEditorFloor(){
   if(editor.floorCount<=1) return;
+  normalizeFloorTuning(editor.floorCount);
   const removed=editor.currentFloor;
-  editor.rooms=editor.rooms.filter(r=>(r.floor||0)!==removed).map(r=>({...r, floor:(r.floor||0)>removed?(r.floor-1):(r.floor||0)}));
-  editor.floorCount--; setEditorFloor(Math.min(removed,editor.floorCount-1)); editor.dirty=true; editorRequestForge();
+  if(!editor.dirty && !editState.ortho){
+    roomCountsByFloor.splice(removed,1);
+    loopRatesByFloor.splice(removed,1);
+    decorDensitiesByFloor.splice(removed,1);
+    requestedFloorCount=Math.max(1,requestedFloorCount-1);
+    editor.floorCount=requestedFloorCount;
+    forge(true,false);
+    setEditorFloor(Math.min(removed,editor.floorCount-1));
+    return;
+  }
+  const roomsOnFloor=editor.rooms.filter(r=>(r.floor||0)===removed);
+  if(roomsOnFloor.length && !confirm('当前楼层有 '+roomsOnFloor.length+' 个区域。删除楼层后会把它们迁移到相邻楼层，是否继续？')) return;
+  const target=removed>0 ? removed-1 : 1;
+  roomCountsByFloor.splice(removed,1);
+  loopRatesByFloor.splice(removed,1);
+  decorDensitiesByFloor.splice(removed,1);
+  editor.rooms=editor.rooms.map(r=>{
+    let floor=r.floor||0;
+    if(floor===removed) floor=target;
+    if(floor>removed) floor--;
+    return {...r,floor};
+  });
+  editor.floorCount--;
+  requestedFloorCount=editor.floorCount;
+  setEditorFloor(Math.min(removed,editor.floorCount-1));
+  editor.dirty=true;
+  editorRequestForge();
 }
 
 /* -------- setting + palette selection -------- */
@@ -3039,14 +3426,17 @@ const OBJ_MESHES = {
 /* Apply current toggle state to the live scene. Called after every forge (which
    rebuilds meshes/fx/lights) and whenever a chip is clicked. */
 function applyObjectVis(){
-  for(const cat in OBJ_MESHES)
-    for(const k of OBJ_MESHES[cat])
-      if(meshes[k]) meshes[k].visible = objVis[cat];
-  if(fx.parts) fx.parts.visible = objVis.particles;
-  for(const m of fx.shafts) m.visible = objVis.particles;
-  for(const m of fx.liquids) m.visible = objVis.liquids;
-  for(const sp of fx.spinners) sp.m.visible = objVis.props;
-  for(const L of lights) L.visible = objVis.lights;
+  const states=renderedFloorStates.length ? renderedFloorStates : [{meshes,fx,lights}];
+  for(const state of states){
+    for(const cat in OBJ_MESHES)
+      for(const k of OBJ_MESHES[cat])
+        if(state.meshes[k]) state.meshes[k].visible = objVis[cat];
+    if(state.fx.parts) state.fx.parts.visible = objVis.particles;
+    for(const m of state.fx.shafts) m.visible = objVis.particles;
+    for(const m of state.fx.liquids) m.visible = objVis.liquids;
+    for(const sp of state.fx.spinners) sp.m.visible = objVis.props;
+    for(const L of state.lights) L.visible = objVis.lights;
+  }
 }
 
 const prefersReduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -3057,14 +3447,70 @@ if(innerWidth < 640){
 }
 
 function applyHeat(on){
-  if(!meshes.floor) return;
-  const src = on ? floorColorsHeat : floorColorsBase;
-  for(let i=0;i<src.length;i++) meshes.floor.setColorAt(i, _c.set(src[i]));
-  if(meshes.floor.instanceColor) meshes.floor.instanceColor.needsUpdate = true;
+  const states=renderedFloorStates.length ? renderedFloorStates : [{meshes,floorColorsBase,floorColorsHeat}];
+  for(const state of states){
+    if(!state.meshes.floor) continue;
+    const src=on ? state.floorColorsHeat : state.floorColorsBase;
+    if(!src) continue;
+    for(let i=0;i<src.length;i++) state.meshes.floor.setColorAt(i,_c.set(src[i]));
+    if(state.meshes.floor.instanceColor) state.meshes.floor.instanceColor.needsUpdate=true;
+  }
 }
 
 /* -------- 2D layout editor -------- */
-const editor = { tool:'select', rooms:[], links:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, drag:null, scale:6, panX:0, panY:0, nextId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:1, currentFloor:0 };
+const DEFAULT_ROOMS_PER_FLOOR=21;
+const DEFAULT_LOOP_RATE=15;
+const DEFAULT_DECOR_DENSITY=60;
+let requestedFloorCount=2;
+let roomCountsByFloor=[DEFAULT_ROOMS_PER_FLOOR,DEFAULT_ROOMS_PER_FLOOR];
+let loopRatesByFloor=[DEFAULT_LOOP_RATE,DEFAULT_LOOP_RATE];
+let decorDensitiesByFloor=[DEFAULT_DECOR_DENSITY,DEFAULT_DECOR_DENSITY];
+let lastValidEditorState=null;
+const editor = { tool:'select', rooms:[], links:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, drag:null, scale:6, panX:0, panY:0, nextId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:2, currentFloor:0 };
+function normalizeFloorRoomCounts(count){
+  const wanted=Math.max(1,Math.min(6,Math.round(count||1)));
+  roomCountsByFloor=roomCountsByFloor.slice(0,wanted).map(value=>Math.max(6,Math.min(50,Math.round(value||DEFAULT_ROOMS_PER_FLOOR))));
+  while(roomCountsByFloor.length<wanted) roomCountsByFloor.push(roomCountsByFloor[roomCountsByFloor.length-1] ?? DEFAULT_ROOMS_PER_FLOOR);
+  return roomCountsByFloor;
+}
+function normalizeFloorTuning(count){
+  const wanted=Math.max(1,Math.min(6,Math.round(count||1)));
+  const normalize=(values,fallback,max)=>{
+    const result=(Array.isArray(values)?values:[]).slice(0,wanted).map(value=>{
+      const number=Number(value);
+      return Math.max(0,Math.min(max,Math.round(Number.isFinite(number)?number:fallback)));
+    });
+    while(result.length<wanted) result.push(result[result.length-1] ?? fallback);
+    return result;
+  };
+  loopRatesByFloor=normalize(loopRatesByFloor,DEFAULT_LOOP_RATE,40);
+  decorDensitiesByFloor=normalize(decorDensitiesByFloor,DEFAULT_DECOR_DENSITY,100);
+}
+function captureEditorState(){
+  return {
+    rooms:editor.rooms.map(r=>({...r})),
+    links:editor.links.map(l=>({...l,bends:(l.bends||[]).map(p=>({...p})),autoRoute:Array.isArray(l.autoRoute)?l.autoRoute.map(p=>({...p})):null})),
+    blockedLinks:[...editor.blockedLinks], secretRooms:[...editor.secretRooms],
+    floorCount:editor.floorCount, currentFloor:editor.currentFloor,
+    roomCountsByFloor:[...roomCountsByFloor], loopRatesByFloor:[...loopRatesByFloor], decorDensitiesByFloor:[...decorDensitiesByFloor],
+    nextId:editor.nextId, dirty:editor.dirty
+  };
+}
+function restoreEditorState(state){
+  if(!state) return;
+  editor.rooms=state.rooms.map(r=>({...r}));
+  editor.links=state.links.map(l=>({...l,bends:(l.bends||[]).map(p=>({...p})),autoRoute:Array.isArray(l.autoRoute)?l.autoRoute.map(p=>({...p})):null}));
+  editor.blockedLinks=[...state.blockedLinks]; editor.secretRooms=[...state.secretRooms];
+  editor.floorCount=state.floorCount; editor.currentFloor=Math.min(state.currentFloor,state.floorCount-1);
+  requestedFloorCount=state.floorCount;
+  roomCountsByFloor=Array.isArray(state.roomCountsByFloor)?[...state.roomCountsByFloor]:Array.from({length:state.floorCount},()=>DEFAULT_ROOMS_PER_FLOOR);
+  loopRatesByFloor=Array.isArray(state.loopRatesByFloor)?[...state.loopRatesByFloor]:Array.from({length:state.floorCount},()=>DEFAULT_LOOP_RATE);
+  decorDensitiesByFloor=Array.isArray(state.decorDensitiesByFloor)?[...state.decorDensitiesByFloor]:Array.from({length:state.floorCount},()=>DEFAULT_DECOR_DENSITY);
+  normalizeFloorRoomCounts(state.floorCount);
+  normalizeFloorTuning(state.floorCount);
+  editor.nextId=state.nextId; editor.dirty=state.dirty;
+  editor.selectedId=null; editor.selectedLinkKey=null; editor.connectFrom=null; editor.drag=null;
+}
 function resetEditorLayoutState(){
   editor.rooms=[];
   editor.links=[];
@@ -3075,7 +3521,9 @@ function resetEditorLayoutState(){
   editor.connectFrom=null;
   editor.drag=null;
   editor.nextId=1;
-  editor.floorCount=1; editor.currentFloor=0;
+  editor.floorCount=requestedFloorCount; editor.currentFloor=0;
+  normalizeFloorRoomCounts(requestedFloorCount);
+  normalizeFloorTuning(requestedFloorCount);
   editor.dirty=false;
 }
 function forgeFromEditor(animate=false){
@@ -3101,10 +3549,11 @@ const normYaw = a => { a %= Math.PI*2; if(a > Math.PI) a -= Math.PI*2; if(a < -M
 function syncEditCam(){
   const c = el.editorCanvas; if(!c || !c.width) return;
   const s = editor.scale, cx = -editor.panX / s, cz = -editor.panY / s;
+  const floorY=editor.currentFloor*(D?.floorHeight || FLOOR_HEIGHT);
   editCam.left = -(c.width / 2) / s;  editCam.right  = (c.width / 2) / s;
   editCam.top  =  (c.height / 2) / s; editCam.bottom = -(c.height / 2) / s;
-  editCam.position.set(cx, 60, cz);
-  editCam.lookAt(cx, 0, cz);
+  editCam.position.set(cx, floorY+60, cz);
+  editCam.lookAt(cx, floorY, cz);
   editCam.updateProjectionMatrix();
 }
 function enterEditMode(){
@@ -3112,7 +3561,7 @@ function enterEditMode(){
   const sec = document.querySelector('.editor-sec'); if(!sec || !editorCtx) return;
   hideEditorMenu();
   if(editor.full){ editor.full=false; sec.classList.remove('full'); if(el.editorFullscreen) el.editorFullscreen.textContent='全屏'; }
-  editState.saved = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, tz:camTarget.z };
+  editState.saved = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, ty:camTarget.y, tz:camTarget.z };
   /* frame the overlay on what the user is currently looking at */
   editor.scale = Math.max(2.5, Math.min(16, innerHeight / (2 * camDist * halfFovTan())));
   editor.panX = -camTarget.x * editor.scale;
@@ -3124,8 +3573,8 @@ function enterEditMode(){
   if(el.editorTitleText) el.editorTitleText.textContent = '布局编辑';
   if(el.editModeBtn) el.editModeBtn.classList.add('hidden');
   editState.phase = 'in'; editState.t = 0;
-  editState.from = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, tz:camTarget.z };
-  editState.to   = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(editor.scale), tx:camTarget.x, tz:camTarget.z };
+  editState.from = { yaw:normYaw(yaw), pitch, dist:camDist, tx:camTarget.x, ty:camTarget.y, tz:camTarget.z };
+  editState.to   = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(editor.scale), tx:camTarget.x, ty:camTarget.y, tz:camTarget.z };
   drawEditor();
 }
 function exitEditMode(){
@@ -3139,10 +3588,10 @@ function exitEditMode(){
   setPanelCollapsed(true);
   /* fly back to the saved orbit pose, but stay over the spot being edited */
   const s = editor.scale, cx = -editor.panX / s, cz = -editor.panY / s;
-  const saved = editState.saved || { yaw:Math.PI/4, pitch:0.64, dist:170 };
+  const saved = editState.saved || { yaw:Math.PI/4, pitch:0.64, dist:170, ty:camTarget.y };
   editState.phase = 'out'; editState.t = 0;
-  editState.from = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(s), tx:cx, tz:cz };
-  editState.to   = { yaw:saved.yaw, pitch:Math.min(1.15, Math.max(0.32, saved.pitch)), dist:saved.dist, tx:cx, tz:cz };
+  editState.from = { yaw:0, pitch:EDIT_PITCH, dist:distForScale(s), tx:cx, ty:camTarget.y, tz:cz };
+  editState.to   = { yaw:saved.yaw, pitch:Math.min(CAMERA_PITCH_LIMIT, Math.max(-CAMERA_PITCH_LIMIT, saved.pitch)), dist:saved.dist, tx:cx, ty:saved.ty, tz:cz };
 }
 function toggleEditMode(){ if(editState.ortho) exitEditMode(); else if(!editState.phase) enterEditMode(); }
 function tickEditTransition(dt){
@@ -3153,7 +3602,7 @@ function tickEditTransition(dt){
   yaw = f.yaw + (t.yaw - f.yaw) * ease;
   pitch = f.pitch + (t.pitch - f.pitch) * ease;
   camDist = f.dist + (t.dist - f.dist) * ease;
-  camTarget.set(f.tx + (t.tx - f.tx) * ease, 0, f.tz + (t.tz - f.tz) * ease);
+  camTarget.set(f.tx + (t.tx - f.tx) * ease, f.ty + (t.ty - f.ty) * ease, f.tz + (t.tz - f.tz) * ease);
   updateCam();
   if(k >= 1){
     const wasIn = editState.phase === 'in';
@@ -3367,6 +3816,8 @@ function linkDoorPoint(l, which){
 }
 function linkHandles(l){
   const pts=[];
+  const floorA=editorRoom(l.a)?.floor||0, floorB=editorRoom(l.b)?.floor||0;
+  if(floorA!==floorB) return pts;
   const da=linkDoorPoint(l,'a'), db=linkDoorPoint(l,'b');
   if(da) pts.push({kind:'door', which:'a', link:l, point:da});
   if(db) pts.push({kind:'door', which:'b', link:l, point:db});
@@ -3391,6 +3842,7 @@ function editorLinkHandleAt(p){
 
 function linkVisualRoute(l){
   const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) return [];
+  if((A.floor||0)!==(B.floor||0)) return [];
   const da=linkDoorPoint(l,'a'), db=linkDoorPoint(l,'b');
   if(!da || !db) return [];
   if(Array.isArray(l.bends) && l.bends.length) return [da, ...l.bends.map(p=>({x:p.x,y:p.y})), db];
@@ -3414,6 +3866,16 @@ function hitRouteSegment(p, pts, tol){
 function editorLinkAt(p){
   let best=null;
   for(const l of editor.links){
+    const A=editorRoom(l.a), B=editorRoom(l.b);
+    if(!A || !B) continue;
+    const af=A.floor||0, bf=B.floor||0;
+    if(af!==bf){
+      if((af!==editor.currentFloor && bf!==editor.currentFloor) || !l.stair) continue;
+      const hit=hitRouteSegment(p,[l.stair.lower,l.stair.upper],Math.max(l.stair.width/2,8/editor.scale));
+      if(hit && (!best || hit.d<best.hit.d)) best={link:l,hit,stair:true};
+      continue;
+    }
+    if(af!==editor.currentFloor) continue;
     /* +1 covers the visual centering offset of auto routes (drawn line sits
        up to one cell off the data polyline for width-2 corridors) */
     const tol = Math.max(linkDispWidth(l)/2 + (linkAutoRoute(l) ? 1 : 0), 8/editor.scale);
@@ -3507,6 +3969,10 @@ function moveLinkRouteSegment(l, seg, startPts, delta){
 }
 function toggleEditorLink(a,b){
   if(!a || !b || a===b) return;
+  const A=editorRoom(a), B=editorRoom(b);
+  if(!A || !B) return;
+  const floorDiff=Math.abs((A.floor||0)-(B.floor||0));
+  if(floorDiff>1){ alert('只能连接同层或相邻楼层。请先添加中间楼层连接。'); return; }
   const k=editorLinkKey(a,b), i=editor.links.findIndex(l=>editorLinkKey(l.a,l.b)===k);
   unblockEditorLink(a,b);
   if(i>=0){
@@ -3514,7 +3980,7 @@ function toggleEditorLink(a,b){
     if(removed) blockEditorLink(a,b);
     markDisconnectedRoomsAsSecret();
   } else {
-    editor.links.push({a,b,bends:[],width:2,manual:true});
+    editor.links.push({a,b,bends:[],width:2,manual:true,kind:floorDiff===1?'stairs':'corridor'});
     normalizeConnectedSecretRooms();
   }
 }
@@ -3570,6 +4036,7 @@ function hitRoomAtWorld(x, z){
   if(!D) return null;
   let best = null, bestArea = Infinity;
   for(const r of D.rooms){
+    if((r.floor||0)!==editor.currentFloor) continue;
     const cx = r.cx-D.W/2+0.5, cy = r.cy-D.H/2+0.5;
     if(!roomShapeContains({...r, cx, cy}, x, z)) continue;
     const area = r.w*r.h;
@@ -3587,7 +4054,8 @@ function selectRoomFromScene(clientX, clientY){
   const ray = new THREE.Raycaster();
   ray.setFromCamera(ndc, cam);
   const hit = new THREE.Vector3();
-  if(!ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0), 0), hit)) return false;
+  const floorY=editor.currentFloor*(D.floorHeight || FLOOR_HEIGHT);
+  if(!ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0), -floorY), hit)) return false;
   const room = hitRoomAtWorld(hit.x, hit.z);
   if(!room) return false;
   let idx = Number.isInteger(room.sourceId) ? room.sourceId : D.rooms.indexOf(room);
@@ -3672,9 +4140,10 @@ function updateRouteOverlay(){
     const ghost = new THREE.Mesh(g.clone(), new THREE.MeshBasicMaterial({color, transparent:true, opacity:Math.min(0.16, opacity*0.28), depthTest:false, depthWrite:false, side:THREE.DoubleSide}));
     ghost.renderOrder = 11; routeOverlay.add(ghost);
   };
-  mk(D.edges.filter(e=>!e.isCritical && !e.isManual), 0x78d7ff, 0.85, 0.32, 2.0);
-  mk(D.edges.filter(e=>e.isManual), 0x59d68f, 0.92, 0.62, 2.2);
-  mk(D.edges.filter(e=>e.isCritical), 0xffd36a, 1.00, 0.72, 2.4);
+  const activeEdges=D.edges.filter(e=>e.kind==='corridor' && e.floor===editor.currentFloor);
+  mk(activeEdges.filter(e=>!e.isCritical && !e.isManual), 0x78d7ff, 0.85, 0.32, 2.0);
+  mk(activeEdges.filter(e=>e.isManual), 0x59d68f, 0.92, 0.62, 2.2);
+  mk(activeEdges.filter(e=>e.isCritical), 0xffd36a, 1.00, 0.72, 2.4);
 }
 function updateSceneSelection(){
   if(roomSelection){
@@ -3719,6 +4188,31 @@ function drawEditorCorridor(g, pts, color, width, selected=false){
   g.stroke();
   g.restore();
 }
+function drawEditorStair(g, stair, selected=false){
+  if(!stair || (stair.fromFloor!==editor.currentFloor && stair.toFloor!==editor.currentFloor)) return;
+  const a=stair.lower, b=stair.upper, dx=b.x-a.x, dy=b.y-a.y, len=Math.max(1,Math.hypot(dx,dy));
+  const px=-dy/len*(stair.width||2)/2, py=dx/len*(stair.width||2)/2;
+  const corners=[{x:a.x+px,y:a.y+py},{x:b.x+px,y:b.y+py},{x:b.x-px,y:b.y-py},{x:a.x-px,y:a.y-py}].map(p=>editorWorldToCanvas(p.x,p.y));
+  const lower=stair.fromFloor===editor.currentFloor;
+  g.save();
+  g.fillStyle=lower?'rgba(232,151,63,.24)':'rgba(155,108,240,.20)';
+  g.strokeStyle=selected?'#ffd36a':(lower?'#e8973f':'#b58cff');
+  g.lineWidth=selected?2.5:1.6;
+  if(!lower) g.setLineDash([6,4]);
+  g.beginPath(); corners.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y)); g.closePath(); g.fill(); g.stroke();
+  g.setLineDash([]);
+  const steps=Math.min(12,stair.stepCount||12);
+  for(let i=1;i<steps;i++){
+    const t=i/steps, cx=a.x+dx*t, cy=a.y+dy*t;
+    const p0=editorWorldToCanvas(cx+px,cy+py), p1=editorWorldToCanvas(cx-px,cy-py);
+    g.globalAlpha=.45; g.beginPath(); g.moveTo(p0.x,p0.y); g.lineTo(p1.x,p1.y); g.stroke();
+  }
+  g.globalAlpha=1;
+  const anchor=editorWorldToCanvas(lower?a.x:b.x,lower?a.y:b.y);
+  g.fillStyle=lower?'#ffd39a':'#d0b6ff'; g.font='12px sans-serif';
+  g.fillText(lower?'上楼 → F'+(stair.toFloor+1):'下楼 → F'+(stair.fromFloor+1),anchor.x+9,anchor.y-8);
+  g.restore();
+}
 function editorLinkRoute(l,A,B){
   if(l && (l.a || l.b)) return linkVisualRoute(l);
   return defaultLinkRoute(A,B);
@@ -3735,7 +4229,30 @@ function drawEditor(){
   for(let x=ox; x<c.width; x+=step){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,c.height); g.stroke(); }
   for(let y=oy; y<c.height; y+=step){ g.beginPath(); g.moveTo(0,y); g.lineTo(c.width,y); g.stroke(); }
   g.strokeStyle = ov ? 'rgba(148,163,208,0.18)' : '#2b3144'; g.beginPath(); g.moveTo(c.width/2,0); g.lineTo(c.width/2,c.height); g.moveTo(0,c.height/2); g.lineTo(c.width,c.height/2); g.stroke();
+  for(const r of editor.rooms){
+    const delta=(r.floor||0)-editor.currentFloor;
+    if(Math.abs(delta)!==1) continue;
+    const p=editorWorldToCanvas(r.x-r.w/2,r.y-r.h/2), w=r.w*editor.scale, h=r.h*editor.scale;
+    g.save(); g.setLineDash([5,4]);
+    g.fillStyle=delta>0?'rgba(90,143,232,.055)':'rgba(155,108,240,.055)';
+    g.strokeStyle=delta>0?'rgba(90,143,232,.28)':'rgba(155,108,240,.28)';
+    g.fillRect(p.x,p.y,w,h); g.strokeRect(p.x,p.y,w,h); g.restore();
+  }
   if(editor.links.length){
+    for(const l of editor.links){
+      const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
+      const af=A.floor||0, bf=B.floor||0;
+      if(af===bf || (af!==editor.currentFloor && bf!==editor.currentFloor)) continue;
+      const here=af===editor.currentFloor?A:B, other=here===A?B:A;
+      const key=editorLinkKey(l.a,l.b);
+      if(l.stair) drawEditorStair(g,l.stair,key===editor.selectedLinkKey);
+      const door=editorDoorPoint(here,other), p=editorWorldToCanvas(door.x,door.y);
+      const up=(other.floor||0)>editor.currentFloor;
+      g.fillStyle=up?'#5a8fe8':'#9b6cf0'; g.strokeStyle='#10131c'; g.lineWidth=2;
+      g.beginPath(); g.arc(p.x,p.y,7,0,Math.PI*2); g.fill(); g.stroke();
+      g.fillStyle=up?'#9fc4ff':'#d0b6ff'; g.font='12px sans-serif';
+      g.fillText((up?'↑ ':'↓ ')+'F'+((other.floor||0)+1),p.x+10,p.y+4);
+    }
     for(const l of editor.links){
        const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
        if((A.floor||0)!==editor.currentFloor || (B.floor||0)!==editor.currentFloor) continue;
@@ -3745,12 +4262,13 @@ function drawEditor(){
   }
   if(editor.connectFrom){
     const A=editorRoom(editor.connectFrom);
-    if(A){ const a=editorWorldToCanvas(A.x,A.y); g.fillStyle='#59d68f'; g.beginPath(); g.arc(a.x,a.y,7,0,Math.PI*2); g.fill(); }
+    if(A && (A.floor||0)===editor.currentFloor){ const a=editorWorldToCanvas(A.x,A.y); g.fillStyle='#59d68f'; g.beginPath(); g.arc(a.x,a.y,7,0,Math.PI*2); g.fill(); }
+    else if(A){ g.fillStyle='#59d68f'; g.font='13px sans-serif'; g.fillText('连接自 F'+((A.floor||0)+1),14,22); }
   }
   if(D){
     const crit = criticalRoomIds();
     for(const r of D.rooms){
-      if(!crit.has(r.id)) continue;
+      if(!crit.has(r.id) || (r.floor||0)!==editor.currentFloor) continue;
       const p=editorWorldToCanvas(r.cx-D.W/2, r.cy-D.H/2);
       g.fillStyle='rgba(255,211,106,0.8)'; g.beginPath(); g.arc(p.x,p.y,3.5,0,Math.PI*2); g.fill();
     }
@@ -3857,7 +4375,12 @@ function syncEditorFromDungeon(d, keepManual=false){
 }
 function syncEditorGeneratedRooms(d){
   if(!d) return;
+  if(Array.isArray(d.roomCountsByFloor)) roomCountsByFloor=[...d.roomCountsByFloor];
+  if(Array.isArray(d.loopChancesByFloor)) loopRatesByFloor=d.loopChancesByFloor.map(value=>Math.round(value*100));
+  if(Array.isArray(d.decorDensitiesByFloor)) decorDensitiesByFloor=d.decorDensitiesByFloor.map(value=>Math.round(value*100));
   editor.floorCount = Math.max(1, d.floorCount || editor.floorCount || 1);
+  normalizeFloorRoomCounts(editor.floorCount);
+  normalizeFloorTuning(editor.floorCount);
   editor.currentFloor = Math.min(editor.currentFloor, editor.floorCount-1);
   for(const r of d.rooms){
     const source = Number.isInteger(r.sourceId) ? r.sourceId : r.id;
@@ -3907,7 +4430,18 @@ function syncEditorLinksFromDungeon(d){
     const key=editorLinkKey(ea.id, eb.id);
     if(blocked.has(key)) continue;
     const prev=old.get(key);
-    const nl = prev ? {...prev, a:ea.id, b:eb.id, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, generated:true};
+    const nl = prev ? {...prev, a:ea.id, b:eb.id, kind:e.kind, connectorId:e.connectorId, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, kind:e.kind, connectorId:e.connectorId, generated:true};
+    const connector=e.kind==='stairs' ? d.connectors?.find(c=>c.id===e.connectorId) : null;
+    nl.stair=connector ? {
+      fromFloor:connector.fromFloor, toFloor:connector.toFloor,
+      lower:{x:connector.lower.x-d.W/2,y:connector.lower.y-d.H/2},
+      upper:{x:connector.upper.x-d.W/2,y:connector.upper.y-d.H/2},
+      lowerApproach:{x:connector.lowerApproach.x-d.W/2,y:connector.lowerApproach.y-d.H/2},
+      upperApproach:{x:connector.upperApproach.x-d.W/2,y:connector.upperApproach.y-d.H/2},
+      direction:connector.direction, directionVector:{...connector.directionVector},
+      width:connector.width, length:connector.length, stepCount:connector.stepCount,
+      landingDepth:connector.landingDepth
+    } : null;
     /* remember the carved corridor's actual centerline (clipped to the room
        rects, in editor coords) so the preview matches the generated geometry
        instead of re-guessing doors and elbows */
@@ -3927,6 +4461,31 @@ function deleteSelectedEditorRoom(){
   editor.rooms=editor.rooms.filter(r=>r.id!==editor.selectedId);
   editor.selectedId=null; editor.connectFrom=null; editor.selectedLinkKey=null;
   hideEditorMenu(); editorRequestForge();
+  return true;
+}
+function moveEditorRoomFloor(room,delta){
+  if(!room) return false;
+  const target=Math.max(0,Math.min(editor.floorCount-1,(room.floor||0)+delta));
+  if(target===(room.floor||0)) return false;
+  for(const link of editor.links){
+    if(link.a!==room.id && link.b!==room.id) continue;
+    const other=editorRoom(link.a===room.id?link.b:link.a);
+    if(other && Math.abs((other.floor||0)-target)>1){
+      alert('移动后会产生跨越两层以上的连接。请先删除该连接或添加中间楼梯。');
+      return false;
+    }
+  }
+  room.floor=target;
+  for(const link of editor.links){
+    if(link.a!==room.id && link.b!==room.id) continue;
+    const other=editorRoom(link.a===room.id?link.b:link.a);
+    link.kind=other && (other.floor||0)!==target ? 'stairs' : 'corridor';
+    link.bends=[];
+    link.autoRoute=null;
+  }
+  editor.currentFloor=target;
+  hideEditorMenu();
+  editorRequestForge();
   return true;
 }
 function hideEditorMenu(){ if(el.editorMenu){ el.editorMenu.classList.remove('on'); el.editorMenu._ctx=null; } }
@@ -4013,7 +4572,8 @@ function initEditor(){
         }
       }
        else if(action==='delete') deleteSelectedEditorRoom();
-       else if(action==='move-floor'){ const r=editorRoom(editor.selectedId); if(r){ r.floor=editor.currentFloor; hideEditorMenu(); editorRequestForge(); } }
+       else if(action==='move-floor-up') moveEditorRoomFloor(editorRoom(editor.selectedId),1);
+       else if(action==='move-floor-down') moveEditorRoomFloor(editorRoom(editor.selectedId),-1);
       else if(action==='lock'){ const r=editorRoom(editor.selectedId); if(r){ r.locked=!r.locked; hideEditorMenu(); editorRequestForge(); } }
       else if(action==='connect'){
         const r=ctx && ctx.room;
@@ -4109,6 +4669,7 @@ function initEditor(){
     if(routeHit){
       const l=routeHit.link, key=editorLinkKey(l.a,l.b);
       editor.selectedId=null; editor.selectedLinkKey=key;
+      if(routeHit.stair){ editor.drag=null; drawEditor(); return; }
       const pts=ensureEditableRoute(l).map(q=>({x:q.x,y:q.y,side:q.side}));
       editor.drag={mode:'routeSegment', link:l, seg:routeHit.hit.seg, start:p, routeStart:pts};
       drawEditor();
@@ -4218,12 +4779,20 @@ function forge(animate, useEditorLayout=false){
   const settingKey = resolveSetting(seed);
   const paletteKey = resolvePalette(seed, settingKey);
   if(useEditorLayout && editor.dirty) normalizeConnectedSecretRooms();
+  const targetFloorCount=useEditorLayout ? editor.floorCount : requestedFloorCount;
+  const floorRoomCounts=[...normalizeFloorRoomCounts(targetFloorCount)];
+  normalizeFloorTuning(targetFloorCount);
+  const floorLoopChances=loopRatesByFloor.map(value=>value/100);
+  const floorDecorDensities=decorDensitiesByFloor.map(value=>value/100);
   const params = {
     seed,
-     roomCount:+el.rooms.value,
-     floorCount:editor.floorCount,
-    loopChance:+el.loops.value/100,
-    decorDensity:+el.decor.value/100,
+     roomCount:floorRoomCounts.reduce((sum,value)=>sum+value,0),
+     roomCountsByFloor:floorRoomCounts,
+     floorCount:targetFloorCount,
+    loopChance:floorLoopChances[0],
+    loopChancesByFloor:floorLoopChances,
+    decorDensity:floorDecorDensities[0],
+    decorDensitiesByFloor:floorDecorDensities,
     settingKey,
     paletteKey,
     editorEnabled:useEditorLayout && editor.dirty,
@@ -4233,8 +4802,18 @@ function forge(animate, useEditorLayout=false){
     secretRooms:(useEditorLayout && editor.dirty) ? [...editor.secretRooms] : []
   };
   const d = generateDungeon(params);
+  if(useEditorLayout && !d.valid && lastValidEditorState){
+    const reason=(d.generationErrors && d.generationErrors[0]) || '楼层连接无法通过连通性验证';
+    restoreEditorState(lastValidEditorState);
+    updateFloorUI();
+    drawEditor();
+    alert('本次修改无法生成有效的多层结构，已恢复上一次有效状态。\n\n'+reason);
+    return;
+  }
+  requestedFloorCount=d.floorCount;
   syncEditorGeneratedRooms(d);
   syncEditorLinksFromDungeon(d);
+  if(d.valid) lastValidEditorState=captureEditorState();
   /* D is null only for the first build. Parameter changes and editor drags
      rebuild geometry while preserving the camera pose. */
   buildScene(d, D === null);
@@ -4337,22 +4916,28 @@ function tick(){
   }
 }
 
-/* -------- camera controls: drag pan, wheel zoom, shift-drag orbit -------- */
+/* -------- camera controls: drag pan, ctrl-drag vertical pan, wheel zoom,
+   shift-drag orbit -------- */
 const cnv = renderer.domElement;
-let dragging=false, orbiting=false, lastX=0, lastY=0, downX=0, downY=0;
+let dragging=false, verticaling=false, orbiting=false, lastX=0, lastY=0, downX=0, downY=0;
 cnv.addEventListener('pointerdown', e=>{
   orbiting = e.button===2 || (e.button===0 && e.shiftKey);
-  dragging = e.button===0 && !e.shiftKey;
+  verticaling = e.button===0 && e.ctrlKey && !e.shiftKey;
+  dragging = e.button===0 && !e.shiftKey && !e.ctrlKey;
   lastX = e.clientX; lastY = e.clientY; downX = e.clientX; downY = e.clientY;
   cnv.setPointerCapture(e.pointerId);
 });
 cnv.addEventListener('pointermove', e=>{
-  if(!dragging && !orbiting) return;
+  if(!dragging && !verticaling && !orbiting) return;
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
   lastX = e.clientX; lastY = e.clientY;
   if(orbiting){
     yaw -= dx*0.005;
-    pitch = Math.min(1.15, Math.max(0.32, pitch + dy*0.005));
+    pitch = Math.min(CAMERA_PITCH_LIMIT, Math.max(-CAMERA_PITCH_LIMIT, pitch + dy*0.005));
+  } else if(verticaling){
+    const viewH = 2 * camDist * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5);
+    const wpp = viewH / cnv.clientHeight;
+    camTarget.y += dy*wpp;
   } else {
     const viewH = 2 * camDist * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5);
     const wpp = viewH / cnv.clientHeight;
@@ -4364,7 +4949,7 @@ cnv.addEventListener('pointermove', e=>{
 });
 const endDrag = e=>{
   const wasDragging = dragging, wasOrbiting = orbiting;
-  dragging=false; orbiting=false;
+  dragging=false; verticaling=false; orbiting=false;
   if(!wasDragging || wasOrbiting) return;
   if(Math.hypot(e.clientX-downX, e.clientY-downY) <= 4) selectRoomFromScene(e.clientX, e.clientY);
 };
@@ -4377,16 +4962,66 @@ cnv.addEventListener('wheel', e=>{
   updateCam();
 }, {passive:false});
 
+function resetCameraView(){
+  yaw = CAMERA_DEFAULT_YAW;
+  pitch = CAMERA_DEFAULT_PITCH;
+  const floorCount = D?.floorCount || 1;
+  const floorIndex = Math.max(0, Math.min(floorCount-1, Number(editor?.currentFloor) || 0));
+  const floorY = floorIndex * (D?.floorHeight || FLOOR_HEIGHT);
+  camTarget.set(0, floorY, 0);
+  if(D){
+    const fitSpan = Math.max(D.W, D.H) * 1.18;
+    camDist = Math.min(320, Math.max(70, fitSpan / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5))));
+  } else {
+    camDist = 170;
+  }
+  updateCam();
+}
+
 /* -------- UI wiring -------- */
 let deb = null;
-const sliderRegen = ()=>{ clearTimeout(deb); deb = setTimeout(()=>forge(false), 220); };
-el.rooms.addEventListener('input', ()=>{ el.vRooms.textContent = el.rooms.value; sliderRegen(); });
-el.loops.addEventListener('input', ()=>{ el.vLoops.textContent = el.loops.value + '%'; sliderRegen(); });
-el.decor.addEventListener('input', ()=>{ el.vDecor.textContent = el.decor.value + '%'; sliderRegen(); });
+const floorRoomRegen = ()=>{
+  clearTimeout(deb);
+  deb=setTimeout(()=>{ const keepFloor=editor.currentFloor; forge(false); setEditorFloor(Math.min(keepFloor,editor.floorCount-1)); },220);
+};
+el.rooms.addEventListener('input', ()=>{
+  normalizeFloorRoomCounts(editor.floorCount);
+  roomCountsByFloor[editor.currentFloor]=Math.max(6,Math.min(50,Math.round(+el.rooms.value||DEFAULT_ROOMS_PER_FLOOR)));
+  el.vRooms.textContent = String(roomCountsByFloor[editor.currentFloor]);
+  if(editor.dirty || editState.ortho) editorRequestForge(); else floorRoomRegen();
+});
+el.loops.addEventListener('input', ()=>{
+  normalizeFloorTuning(editor.floorCount);
+  loopRatesByFloor[editor.currentFloor]=Math.max(0,Math.min(40,Math.round(+el.loops.value||0)));
+  el.vLoops.textContent=loopRatesByFloor[editor.currentFloor]+'%';
+  if(editor.dirty || editState.ortho) editorRequestForge(); else floorRoomRegen();
+});
+el.decor.addEventListener('input', ()=>{
+  normalizeFloorTuning(editor.floorCount);
+  decorDensitiesByFloor[editor.currentFloor]=Math.max(0,Math.min(100,Math.round(+el.decor.value||0)));
+  el.vDecor.textContent=decorDensitiesByFloor[editor.currentFloor]+'%';
+  if(editor.dirty || editState.ortho) editorRequestForge(); else floorRoomRegen();
+});
 el.floorPrev.addEventListener('click', ()=>setEditorFloor(editor.currentFloor-1));
 el.floorNext.addEventListener('click', ()=>setEditorFloor(editor.currentFloor+1));
+el.floorAddNext.addEventListener('click', addEditorFloorAfterCurrent);
 el.floorAdd.addEventListener('click', addEditorFloor);
 el.floorRemove.addEventListener('click', removeEditorFloor);
+document.querySelectorAll('[data-floor-view]').forEach(button=>{
+  button.addEventListener('click',()=>{
+    floorViewMode=button.dataset.floorView;
+    document.querySelectorAll('[data-floor-view]').forEach(other=>other.classList.toggle('on',other===button));
+    if(D){
+      buildScene(D,false);
+      applyObjectVis();
+      applyHeat(el.tHeat.checked);
+      settleAll();
+      setOverlayStatic();
+      updateRouteOverlay();
+      drawEditor();
+    }
+  });
+});
 el.seed.addEventListener('change', ()=>forge(true));
 el.dice.addEventListener('click', ()=>{ el.seed.value = 1 + Math.floor(Math.random()*999999); forge(true); });
 el.forge.addEventListener('click', ()=>forge(true));
@@ -4418,7 +5053,11 @@ addEventListener('keydown', e=>{
   const tag = e.target.tagName;
   if(tag==='BUTTON') return;
   if(tag==='INPUT' && e.target.type!=='range' && e.target.type!=='checkbox') return;
-  if(e.code==='KeyR'){ el.seed.value = 1 + Math.floor(Math.random()*999999); forge(true); }
+  if(e.code==='Home'){
+    e.preventDefault();
+    if(!editState.phase && !editState.ortho) resetCameraView();
+  }
+  else if(e.code==='KeyR'){ el.seed.value = 1 + Math.floor(Math.random()*999999); forge(true); }
   else if(e.code==='KeyG'){ el.tGraph.checked = !el.tGraph.checked; if(!animating) setOverlayStatic(); }
   else if(e.code==='KeyH'){ el.tHeat.checked = !el.tHeat.checked; applyHeat(el.tHeat.checked); }
   else if(e.code==='KeyT'){

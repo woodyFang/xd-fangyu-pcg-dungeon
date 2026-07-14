@@ -81,21 +81,54 @@
       </div>
 
       <div class="sec sliders">
-        <label class="sl"><span class="lab"><span>区域数量</span><b id="vRooms">42</b></span>
-          <input type="range" id="rooms" min="12" max="80" value="42" aria-label="区域数量"></label>
-        <label class="sl"><span class="lab"><span>回环率</span><b id="vLoops">15%</b></span>
-          <input type="range" id="loops" min="0" max="40" value="15" aria-label="回环概率"></label>
-        <label class="sl"><span class="lab"><span>装饰密度</span><b id="vDecor">60%</b></span>
-          <input type="range" id="decor" min="0" max="100" value="60" aria-label="装饰密度"></label>
-        <div class="layer-control" aria-label="楼层编辑">
-          <span class="lab"><span>楼层</span><b id="vFloor">1 / 1</b></span>
-          <div class="layer-buttons">
-            <button class="mini-btn" id="floorPrev" type="button" title="上一层">−</button>
-            <button class="mini-btn" id="floorAdd" type="button" title="添加楼层">＋ 添加</button>
-            <button class="mini-btn" id="floorNext" type="button" title="下一层">＋</button>
-            <button class="mini-btn danger" id="floorRemove" type="button" title="删除当前楼层">删除</button>
+        <section class="layer-control" aria-label="楼层管理">
+          <div class="layer-heading">
+            <div><strong>楼层管理</strong><small>生成与编辑共用</small></div>
+            <b id="vFloorTotal">共 2 层 · 42 区</b>
           </div>
-        </div>
+
+          <div class="layer-section">
+            <span class="layer-section-title">当前编辑层</span>
+            <div class="layer-switcher">
+              <button class="mini-btn layer-neighbor" id="floorPrev" type="button" title="切换到上一层" aria-label="上一层">
+                <small>← 上一层</small><b id="vFloorPrev">无</b>
+              </button>
+              <div class="layer-current" aria-live="polite">
+                <small>当前层</small><b id="vFloor">第 1 层</b>
+              </div>
+              <button class="mini-btn layer-neighbor" id="floorNext" type="button" title="切换到下一层" aria-label="下一层">
+                <small>下一层 →</small><b id="vFloorNext">第 2 层 · 21 区</b>
+              </button>
+            </div>
+            <label class="sl layer-room-count"><span class="lab"><span>本层区域数量</span><b id="vRooms">21</b></span>
+              <input type="range" id="rooms" min="6" max="50" value="21" aria-label="当前层区域数量"></label>
+            <div class="layer-floor-settings">
+              <label class="sl"><span class="lab"><span>本层回环率</span><b id="vLoops">15%</b></span>
+                <input type="range" id="loops" min="0" max="40" value="15" aria-label="当前层回环概率"></label>
+              <label class="sl"><span class="lab"><span>本层装饰密度</span><b id="vDecor">60%</b></span>
+                <input type="range" id="decor" min="0" max="100" value="60" aria-label="当前层装饰密度"></label>
+            </div>
+          </div>
+
+          <div class="layer-section layer-count-section">
+            <span class="layer-section-title">调整层数 <em>最多 6 层</em></span>
+            <div class="layer-count-buttons">
+              <button class="mini-btn layer-add" id="floorAddNext" type="button" title="在当前层之后插入一层">＋ 新增下一层</button>
+              <button class="mini-btn layer-add" id="floorAdd" type="button" title="在顶部增加一层">＋ 新增顶层</button>
+              <button class="mini-btn danger" id="floorRemove" type="button" title="删除当前正在编辑的楼层">删除当前层</button>
+            </div>
+          </div>
+
+          <div class="layer-section layer-view-section">
+            <span class="layer-section-title">3D 显示范围</span>
+            <div class="layer-view-buttons" aria-label="楼层显示方式">
+              <button class="mini-btn" type="button" data-floor-view="current">仅当前</button>
+              <button class="mini-btn on" type="button" data-floor-view="neighbors">当前＋相邻</button>
+              <button class="mini-btn" type="button" data-floor-view="all">全部</button>
+              <button class="mini-btn" type="button" data-floor-view="explode">分层展开</button>
+            </div>
+          </div>
+        </section>
       </div>
 
       <div class="sec display-options">
@@ -125,7 +158,8 @@
       <button data-action="add-room" data-menu="blank">添加区域</button>
       <button data-action="delete" data-menu="room">删除区域</button>
       <button data-action="lock" data-menu="room">锁定/解锁</button>
-      <button data-action="move-floor" data-menu="room">移动到当前楼层</button>
+      <button data-action="move-floor-up" data-menu="room">移动到上一层</button>
+      <button data-action="move-floor-down" data-menu="room">移动到下一层</button>
       <button data-action="connect" data-menu="room">连接路径到这里</button>
       <button data-action="entrance" data-menu="room">设为起点</button>
       <button data-action="boss" data-menu="room">设为终点</button>
@@ -139,7 +173,7 @@
       <button data-action="reset-door" data-menu="door">重置门槽点</button>
     </div>
 
-    <div id="hints"><b>拖拽</b> 平移 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>E</b> 编辑布局 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
+    <div id="hints"><b>拖拽</b> 平移 · <b>Ctrl+拖拽</b> 上下移动 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>Home</b> 复原相机 · <b>E</b> 编辑布局 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
 
     <button id="editModeBtn" type="button" title="进入布局编辑模式（E）">✏ 编辑布局 <span class="key">E</span></button>
 

@@ -26,6 +26,11 @@ single number, so any seed rebuilds the exact same dungeon.** Rendered live with
 - **Graph-based layouts.** Rooms are Delaunay-triangulated, reduced to a **minimum spanning tree**
   for guaranteed connectivity, then selectively re-looped so the dungeon has shortcuts and cycles
   instead of a boring spanning-tree spider.
+- **True multi-floor generation.** Critical-path depth bands distribute rooms across up to six
+  floors, then compact each floor independently so rooms at different elevations can overlap in
+  plan without colliding on the same floor. Same-floor links use cost-aware A* corridors; adjacent
+  floors use spatially validated stair connectors with landings, headroom, and slab openings.
+  Room-count targets are stored independently per floor and remain stable while switching layers.
 - **Room semantics.** A BFS from the entrance assigns depth and difficulty, then tags rooms as
   **entrance, combat, elite, treasure, shrine, or boss** based on where they sit on the critical
   path — so the layout reads like a real level, not just connected boxes.
@@ -83,6 +88,8 @@ folder):
 ```bash
 npm run build
 npm run preview    # serve the production build locally
+npm test           # deterministic generator and connectivity tests
+npm run check      # tests + production build
 ```
 
 Requires Node 18+.
@@ -106,10 +113,12 @@ sense — the only entropy is the seed you give it.
 5. **Semantics.** A breadth-first search from the entrance assigns each room a depth and difficulty,
    finds the critical path to the boss, and tags rooms as entrance / combat / elite / treasure /
    shrine / boss.
-6. **Carve.** Rooms and their connecting corridors are stamped into a tile grid (floor / wall /
-   doorway), with L-shaped corridors and the occasional sunken liquid pit.
-7. **Rasterize + BFS.** The grid is walked to place walls, doorways, and edge trims, and to compute
-   per-tile shading (ambient occlusion from neighboring walls, moss, pool glow).
+6. **Route and connect.** Rooms are rasterized into independent floor grids. Same-floor links use
+   A* with low costs for existing corridors and high costs for unrelated rooms; cross-floor links
+   score oriented stair transitions, reserve their full tread / landing / headroom volume, cut the
+   upper slab opening, and route both corridor approaches to the resulting sockets.
+7. **Rasterize + 3D BFS.** Every floor is walked to place walls, doorways, and edge trims. A global
+   search over `(floor, x, y)` verifies rooms and both ends of every stair are reachable.
 8. **Decorate.** Props, torches, runes, portals, and a theme-appropriate particle field are
    scattered by density; point lights are budgeted and placed at the most important rooms and
    torches.
@@ -125,14 +134,18 @@ dungeon-forge/
 │   ├── main.js         # the whole app: RNG, generator pipeline, themes,
 │   │                   #   procedural textures/geometry, instanced render,
 │   │                   #   post-processing, camera, input, HUD
+│   ├── generation/
+│   │   └── multifloor.js # floor assignment, A*, stairs, and 3D validation
 │   └── ui/
 │       └── styles.css  # panel, HUD, legend, and control styling
+├── tests/
+│   └── multifloor.test.js # deterministic and batch connectivity tests
 ├── docs/preview.jpg    # README hero
 └── public/og.jpg       # social-share image
 ```
 
-The generator and renderer live in a single self-contained `main.js` — it's one tightly-coupled
-system (shared RNG, materials, geometry caches, and render targets), so it reads best as one module.
+The scene and editor remain in `main.js`; the browser-independent multi-floor algorithms live in a
+separate module so they can be tested without WebGL or DOM dependencies.
 
 ---
 
