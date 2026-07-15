@@ -57,19 +57,27 @@
       </div>
 
       <div class="sec">
-        <span class="lab"><span>题材</span><b id="vSetting">自动</b></span>
-        <div class="chips compact" id="settingChips">
-          <button class="chip on" data-s="auto">自动</button>
-          <button class="chip" data-s="dungeon">遗迹</button>
-          <button class="chip" data-s="hospital">医院</button>
+        <span class="lab palette-lab">
+          <span>题材</span>
+          <span class="palette-actions"><b id="vSetting">遗迹</b><button class="palette-random-btn" id="settingRandom" type="button" title="随机选择一个题材并重新生成">↻ 随机</button></span>
+        </span>
+        <div class="setting-choice-row">
+          <div class="chips compact" id="settingChips">
+            <button class="chip on" data-s="dungeon">遗迹</button>
+            <button class="chip" data-s="hospital">医院</button>
+          </div>
+          <button class="setting-add-btn" id="settingAdd" type="button" title="添加自定义题材组">＋ 自定义</button>
         </div>
+        <div class="custom-setting-list" id="customSettingChips" aria-label="自定义题材组"></div>
       </div>
 
       <div class="sec">
-        <span class="lab"><span>色调</span><b id="vTheme">自动</b></span>
+        <span class="lab palette-lab">
+          <span>色调</span>
+          <span class="palette-actions"><b id="vTheme">暖灰</b><button class="palette-random-btn" id="paletteRandom" type="button" title="随机选择适合当前题材的色调并重新生成">↻ 随机</button></span>
+        </span>
         <div class="chips palette" id="paletteChips">
-          <button class="chip on" data-p="auto">自动</button>
-          <button class="chip" data-p="ancient">暖灰</button>
+          <button class="chip on" data-p="ancient">暖灰</button>
           <button class="chip" data-p="molten">暖橙</button>
           <button class="chip" data-p="frost">冷蓝</button>
           <button class="chip" data-p="grim">暗绿</button>
@@ -77,6 +85,18 @@
           <button class="chip" data-p="sterile">冷白</button>
           <button class="chip" data-p="abandoned">灰绿</button>
           <button class="chip" data-p="emergency">警示红</button>
+        </div>
+      </div>
+
+      <div class="sec room-groups-sec">
+        <div class="room-groups-heading">
+          <span><strong>房间设置</strong><small>可复用的房间组定义</small></span>
+          <button class="mini-btn" id="roomGroupAdd" type="button">＋ 添加</button>
+        </div>
+        <div id="roomGroupList" class="room-group-list" aria-live="polite">
+          <button class="room-group-empty" id="roomGroupEmpty" type="button">
+            <b>＋ 添加房间组</b><span>填写提示词或上传参考图，例如“医院病房”</span>
+          </button>
         </div>
       </div>
 
@@ -88,18 +108,14 @@
           </div>
 
           <div class="layer-section">
-            <span class="layer-section-title">当前编辑层</span>
-            <div class="layer-switcher">
-              <button class="mini-btn layer-neighbor" id="floorPrev" type="button" title="切换到上一层" aria-label="上一层">
-                <small>← 上一层</small><b id="vFloorPrev">无</b>
-              </button>
-              <div class="layer-current" aria-live="polite">
-                <small>当前层</small><b id="vFloor">第 1 层</b>
-              </div>
-              <button class="mini-btn layer-neighbor" id="floorNext" type="button" title="切换到下一层" aria-label="下一层">
-                <small>下一层 →</small><b id="vFloorNext">第 2 层 · 21 区</b>
-              </button>
-            </div>
+            <span class="layer-section-title">当前编辑层 <em>逐层参数与 2D 编辑目标</em></span>
+            <label class="layer-select-row" for="floorSelect">
+              <span>选择楼层</span>
+              <select id="floorSelect" aria-label="选择当前编辑楼层">
+                <option value="0">第 1 层 · 21 个区域（当前）</option>
+                <option value="1">第 2 层 · 21 个区域</option>
+              </select>
+            </label>
             <label class="sl layer-room-count"><span class="lab"><span>本层区域数量</span><b id="vRooms">21</b></span>
               <input type="range" id="rooms" min="6" max="50" value="21" aria-label="当前层区域数量"></label>
             <div class="layer-floor-settings">
@@ -113,30 +129,28 @@
           <div class="layer-section layer-count-section">
             <span class="layer-section-title">调整层数 <em>最多 6 层</em></span>
             <div class="layer-count-buttons">
-              <button class="mini-btn layer-add" id="floorAddNext" type="button" title="在当前层之后插入一层">＋ 新增下一层</button>
-              <button class="mini-btn layer-add" id="floorAdd" type="button" title="在顶部增加一层">＋ 新增顶层</button>
-              <button class="mini-btn danger" id="floorRemove" type="button" title="删除当前正在编辑的楼层">删除当前层</button>
+              <button class="mini-btn layer-add" id="floorAddNext" type="button" title="在当前层之后插入一层">＋ 下一层</button>
+              <button class="mini-btn layer-add" id="floorAdd" type="button" title="在顶部增加一层">＋ 顶层</button>
+              <button class="mini-btn danger" id="floorRemove" type="button" title="删除当前正在编辑的楼层">删当前</button>
             </div>
           </div>
 
           <div class="layer-section layer-view-section">
             <span class="layer-section-title">3D 显示范围</span>
             <div class="layer-view-buttons" aria-label="楼层显示方式">
-              <button class="mini-btn" type="button" data-floor-view="current">仅当前</button>
-              <button class="mini-btn on" type="button" data-floor-view="neighbors">当前＋相邻</button>
+              <button class="mini-btn" type="button" data-floor-view="current" title="仅显示当前层">当前</button>
+              <button class="mini-btn on" type="button" data-floor-view="neighbors" title="显示当前层与相邻层">相邻</button>
               <button class="mini-btn" type="button" data-floor-view="all">全部</button>
-              <button class="mini-btn" type="button" data-floor-view="explode">分层展开</button>
+              <button class="mini-btn" type="button" data-floor-view="explode" title="分层展开显示">展开</button>
             </div>
           </div>
         </section>
       </div>
 
-      <div class="sec display-options">
-        <label class="tog"><input type="checkbox" id="tAnim" checked> 生成动画</label>
-        <label class="tog"><input type="checkbox" id="tPost" checked> 后期特效</label>
-        <label class="tog hidden-option"><input type="checkbox" id="tGraph"> 结构叠加</label>
-        <label class="tog hidden-option"><input type="checkbox" id="tHeat"> 强度热力图</label>
-      </div>
+      <input type="checkbox" id="tAnim" checked hidden>
+      <input type="checkbox" id="tPost" checked hidden>
+      <input type="checkbox" id="tGraph" hidden>
+      <input type="checkbox" id="tHeat" hidden>
 
       <div class="stats ui-hidden" aria-hidden="true">
         <b id="sRooms">—</b><b id="sEdges">—</b><b id="sCrit">—</b><b id="sTiles">—</b><b id="sLights">—</b><b id="sMs">—</b><b id="sCalls">—</b><b id="sTris">—</b><b id="sFps">—</b>
@@ -148,6 +162,12 @@
         <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
         <div class="editor-canvas-wrap">
           <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="2D 区域编辑器"></canvas>
+          <aside id="roomInspector" class="room-inspector" hidden>
+            <span>已选区域 <b id="roomInspectorName">—</b></span>
+            <label for="roomGroupSelect">房间组</label>
+            <select id="roomGroupSelect" aria-label="给已选区域赋予房间组"></select>
+            <button class="mini-btn" id="roomGroupAssignManage" type="button">管理房间组</button>
+          </aside>
         </div>
         <div class="editor-panel-resize editor-panel-resize-left" data-editor-resize="left" title="拖拽调整编辑器宽度"></div>
         <div class="editor-panel-resize editor-panel-resize-bottom" data-editor-resize="bottom" title="拖拽调整编辑器高度"></div>
@@ -164,6 +184,7 @@
       <button data-action="entrance" data-menu="room">设为起点</button>
       <button data-action="boss" data-menu="room">设为终点</button>
       <button data-action="secret" data-menu="room">设为/取消密室</button>
+      <button data-action="assign-room-group" data-menu="room">赋予房间组…</button>
       <button data-action="add-bend" data-menu="link">添加转折点</button>
       <button data-action="reset-link" data-menu="link">重置路径形状</button>
       <button data-action="narrower" data-menu="link">路径变窄</button>
@@ -173,9 +194,99 @@
       <button data-action="reset-door" data-menu="door">重置门槽点</button>
     </div>
 
-    <div id="hints"><b>拖拽</b> 平移 · <b>Ctrl+拖拽</b> 上下移动 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>Home</b> 复原相机 · <b>E</b> 编辑布局 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
+    <dialog id="customSettingDialog" class="room-group-dialog custom-setting-dialog">
+      <form id="customSettingForm" method="dialog">
+        <div class="room-group-dialog-head">
+          <div><small>自定义题材</small><h2 id="customSettingDialogTitle">新建题材组</h2></div>
+          <button class="dialog-close" type="button" data-custom-setting-close aria-label="关闭">×</button>
+        </div>
+        <p class="custom-setting-intro">创建与“遗迹”“医院”平级的新题材。所有题材共用同一套生成框架。</p>
+        <label class="room-group-field"><span>题材组名称 <em>必填</em></span>
+          <input id="customSettingName" type="text" maxlength="24" placeholder="例如：深海研究站" required>
+        </label>
+        <div class="custom-setting-source-head">
+          <span>题材内容</span><em>提示词或参考图至少填写一项</em>
+        </div>
+        <label class="room-group-field custom-setting-prompt-field"><span>提示词 <em>可选</em></span>
+          <textarea id="customSettingPrompt" rows="5" maxlength="1200" placeholder="描述环境、建筑、材质、道具和氛围，例如：位于海沟中的废弃研究站，厚重金属舱门，观景窗外有微光水母…"></textarea>
+        </label>
+        <label class="custom-setting-upload" for="customSettingImage">
+          <span class="custom-setting-upload-icon" aria-hidden="true">▧</span>
+          <span><b>添加参考图</b><small>PNG、JPG 或 WebP，最大 5 MB</small></span>
+          <input id="customSettingImage" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+        </label>
+        <div id="customSettingImagePreview" class="room-group-image-preview custom-setting-image-preview" hidden>
+          <img id="customSettingImagePreviewImg" alt="题材组参考图预览">
+          <span id="customSettingImageName"></span>
+          <button class="mini-btn danger" id="customSettingImageClear" type="button">移除图片</button>
+        </div>
+        <p class="room-group-form-error" id="customSettingFormError" role="alert"></p>
+        <div class="room-group-dialog-actions">
+          <button class="mini-btn danger" id="customSettingDelete" type="button" hidden>删除题材组</button>
+          <span></span>
+          <button class="mini-btn" type="button" data-custom-setting-close>取消</button>
+          <button class="btn primary" type="submit">保存并使用</button>
+        </div>
+      </form>
+    </dialog>
 
-    <button id="editModeBtn" type="button" title="进入布局编辑模式（E）">✏ 编辑布局 <span class="key">E</span></button>
+    <dialog id="roomGroupDialog" class="room-group-dialog">
+      <form id="roomGroupForm" method="dialog">
+        <div class="room-group-dialog-head">
+          <div><small>房间设置</small><h2 id="roomGroupDialogTitle">添加房间组</h2></div>
+          <button class="dialog-close" type="button" data-room-group-close aria-label="关闭">×</button>
+        </div>
+        <label class="room-group-field"><span>组名称</span>
+          <input id="roomGroupName" type="text" maxlength="40" placeholder="例如：医院病房" required>
+        </label>
+        <label class="room-group-field"><span>自定义提示词</span>
+          <textarea id="roomGroupPrompt" rows="5" maxlength="1000" placeholder="描述空间用途、布局、物件、材质和氛围，例如：四床位住院病房，床头医疗设备，浅蓝色隔帘…"></textarea>
+        </label>
+        <label class="room-group-field"><span>图片参考 <em>可选，最大 5 MB</em></span>
+          <input id="roomGroupImage" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+        </label>
+        <div id="roomGroupImagePreview" class="room-group-image-preview" hidden>
+          <img id="roomGroupImagePreviewImg" alt="房间组参考图预览">
+          <span id="roomGroupImageName"></span>
+          <button class="mini-btn danger" id="roomGroupImageClear" type="button">移除图片</button>
+        </div>
+        <p class="room-group-form-error" id="roomGroupFormError" role="alert"></p>
+        <div class="room-group-dialog-actions">
+          <button class="mini-btn danger" id="roomGroupDelete" type="button" hidden>删除组</button>
+          <span></span>
+          <button class="mini-btn" type="button" data-room-group-close>取消</button>
+          <button class="btn primary" type="submit">保存房间组</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="roomGroupAssignDialog" class="room-group-dialog room-group-assign-dialog">
+      <div class="room-group-dialog-head">
+        <div><small>区域设置</small><h2 id="roomGroupAssignTitle">赋予房间组</h2></div>
+        <button class="dialog-close" type="button" data-room-group-assign-close aria-label="关闭">×</button>
+      </div>
+      <div id="roomGroupAssignList" class="room-group-assign-list"></div>
+      <div class="room-group-dialog-actions">
+        <button class="mini-btn" id="roomGroupAssignCreate" type="button">＋ 新建房间组</button>
+        <span></span>
+        <button class="mini-btn" type="button" data-room-group-assign-close>完成</button>
+      </div>
+    </dialog>
+
+    <nav id="previewModeBar" aria-label="场景视角预览">
+      <span class="preview-mode-title"><small>CAMERA</small><b>视角预览</b></span>
+      <button id="thirdPersonPreview" type="button" aria-pressed="false"><i>3P</i><span><b>第三人称</b><small>观察角色与空间</small></span></button>
+      <button id="firstPersonPreview" type="button" aria-pressed="false"><i>1P</i><span><b>第一人称</b><small>检查室内尺度</small></span></button>
+      <button id="editModeBtn" type="button" title="进入布局编辑模式（E）"><i>✎</i><span><b>编辑布局</b><small>调整区域与路径</small></span><kbd>E</kbd></button>
+      <button id="previewExit" type="button" hidden>退出预览 <kbd>Esc</kbd></button>
+    </nav>
+
+    <section id="previewHud" aria-label="当前预览视角">
+      <div class="preview-mode-badge"><small>当前视角</small><strong id="previewModeLabel">第三人称预览</strong><span id="previewViewHint">跟随角色观察房间布局与动线</span></div>
+      <div class="preview-controls"><span><kbd>WASD</kbd> 移动</span><span><kbd>Shift</kbd> 加速</span><span><kbd>右键拖拽</kbd> 环视</span><span><kbd>1 / 2</kbd> 切换视角</span><span><kbd>Esc</kbd> 返回观察</span></div>
+    </section>
+
+    <div id="hints"><b>拖拽</b> 平移 · <b>Ctrl+拖拽</b> 上下移动 · <b>滚轮</b> 缩放 · <b>Shift+拖拽</b> 旋转 · <b>Home</b> 复原相机 · <b>E</b> 编辑布局 · <b>R</b> 重新生成 · <b>T</b> 切换色调 · <b>Shift+T</b> 切换题材 · <b>G</b> 结构 · <b>H</b> 强度图 · <b>P</b> 后期 · <b>空格</b> 跳过动画</div>
 
     <script type="module" src="./src/main.js"></script>
   </body>

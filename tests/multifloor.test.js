@@ -74,6 +74,58 @@ test('A* routes around unrelated rooms and prefers existing corridors', () => {
   assert.ok(route.cells.filter(cell => layer.corridor[cell]).length >= 8);
 });
 
+test('A* turn cost prevents excessive bends and very long reuse detours', () => {
+  const W = 32;
+  const H = 22;
+  const layer = createLayerData(0, W, H);
+  for (let y = 8; y <= 13; y++) {
+    for (let x = 13; x <= 18; x++) {
+      const cell = y * W + x;
+      layer.grid[cell] = TILES.FLOOR;
+      layer.roomId[cell] = 99;
+    }
+  }
+  for (let y = 1; y <= 11; y++) {
+    layer.corridor[y * W + 2] = 1;
+    layer.corridor[y * W + 29] = 1;
+  }
+  for (let x = 2; x <= 29; x++) layer.corridor[W + x] = 1;
+  const route = routeAStar(layer, { x: 2, y: 11 }, { x: 29, y: 11 }, { W, H });
+  assert.ok(route);
+  assert.equal(route.cells.some(cell => layer.roomId[cell] === 99), false);
+  assert.ok(route.points.length <= 5, `unexpected bends: ${route.points.length - 2}`);
+  assert.ok(route.cells.length < 48, `unexpected detour length: ${route.cells.length}`);
+});
+
+test('A* accepts the pre-stair legacy carving surface', () => {
+  const W = 14;
+  const H = 10;
+  const layer = {
+    grid: new Uint8Array(W * H),
+    roomId: new Int16Array(W * H).fill(-1),
+    corridor: new Uint8Array(W * H)
+  };
+  const route = routeAStar(layer, { x: 1, y: 2 }, { x: 12, y: 7 }, { W, H });
+  assert.ok(route);
+  assert.ok(route.points.length <= 3);
+});
+
+test('custom door constraints still use adaptive A* routing', () => {
+  const W=38, H=24;
+  const rooms=[room(0,8,12,0),room(1,29,12,0)];
+  const edges=[{
+    id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,
+    hasCustomDoorA:true,ax:8,ay:8,aside:'n',visualWidth:2
+  }];
+  const result=buildMultiFloorLayout({W,H,floorCount:1,rooms,edges,entrance:0,tiles:TILES,legacy:{}});
+  assert.equal(result.valid,true,result.errors.join('; '));
+  const edge=result.edges[0];
+  assert.deepEqual(edge.route[0],{x:8,y:8});
+  assert.equal(edge.aside,'n');
+  assert.notEqual(edge.useEditorRoute,true);
+  assert.ok(edge.route.length>=3);
+});
+
 test('critical path floor assignment is contiguous and reaches the requested top floor', () => {
   const rooms = Array.from({ length: 7 }, (_, id) => room(id, 10 + id * 10, 10));
   const parent = Int32Array.from([-1, 0, 1, 2, 3, 4, 5]);

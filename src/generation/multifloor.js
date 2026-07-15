@@ -237,11 +237,16 @@ export function routeAStar(layer, start, goal, options = {}) {
   const startRoomId = options.startRoomId ?? -1;
   const goalRoomId = options.goalRoomId ?? -1;
   const allowStairs = !!options.allowStairs;
-  const gScore = new Float64Array(total);
+  const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const directionCount = directions.length;
+  const stateCount = total * directionCount;
+  const corridorCost = options.corridorCost ?? 0.75;
+  const turnCost = options.turnCost ?? 0.85;
+  const reverseCost = options.reverseCost ?? 1.5;
+  const gScore = new Float64Array(stateCount);
   gScore.fill(Infinity);
-  gScore[startIndex] = 0;
-  const parent = new Int32Array(total).fill(-1);
-  const closed = new Uint8Array(total);
+  const parent = new Int32Array(stateCount).fill(-1);
+  const closed = new Uint8Array(stateCount);
   const heap = [];
   const push = (node, score) => {
     const entry = { node, score };
@@ -274,55 +279,67 @@ export function routeAStar(layer, start, goal, options = {}) {
     }
     return first;
   };
-  // Existing corridors cost 0.3, so the heuristic must use the same lower
-  // bound. A unit Manhattan heuristic would overestimate and make A* miss
-  // cheaper reused-corridor routes.
-  const heuristic = (x, y) => (Math.abs(x - gx) + Math.abs(y - gy)) * 0.3;
-  push(startIndex, heuristic(sx, sy));
-  const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-  let found = false;
+  // Door approach rewards can lower an individual step to 0.35, which is the
+  // admissible Manhattan lower bound. Direction is part of the search state so
+  // two arrivals at one tile can retain different future turn costs.
+  const heuristic = (x, y) => (Math.abs(x - gx) + Math.abs(y - gy)) * 0.35;
+  for (let direction = 0; direction < directionCount; direction++) {
+    const state = startIndex * directionCount + direction;
+    gScore[state] = 0;
+    push(state, heuristic(sx, sy));
+  }
+  let goalState = -1;
   let guardCount = 0;
-  while (heap.length && guardCount++ < total * 4) {
-    const current = pop().node;
-    if (closed[current]) continue;
-    closed[current] = 1;
+  while (heap.length && guardCount++ < stateCount * 4) {
+    const currentState = pop().node;
+    if (closed[currentState]) continue;
+    closed[currentState] = 1;
+    const current = Math.floor(currentState / directionCount);
+    const previousDirection = currentState % directionCount;
     if (current === goalIndex) {
-      found = true;
+      goalState = currentState;
       break;
     }
     const cx = current % W;
     const cy = Math.floor(current / W);
-    for (const [dx, dy] of directions) {
+    for (let direction = 0; direction < directionCount; direction++) {
+      const [dx, dy] = directions[direction];
       const nx = cx + dx;
       const ny = cy + dy;
       if (!inBounds(W, H, nx, ny)) continue;
       const next = idx2(W, nx, ny);
-      const stairRestricted = layer.stairMask[next] || layer.stairClearance?.[next] || layer.stairLanding?.[next] || layer.slabOpening?.[next];
-      if (closed[next] || (!allowStairs && stairRestricted && next !== goalIndex && next !== startIndex)) continue;
+      const nextState = next * directionCount + direction;
+      const stairRestricted = layer.stairMask?.[next] || layer.stairClearance?.[next] || layer.stairLanding?.[next] || layer.slabOpening?.[next];
+      if (closed[nextState] || (!allowStairs && stairRestricted && next !== goalIndex && next !== startIndex)) continue;
       const roomId = layer.roomId[next];
-      let step = layer.corridor[next] ? 0.3 : 1;
+      let step = layer.corridor[next] ? corridorCost : 1;
       if (roomId >= 0 && roomId !== startRoomId && roomId !== goalRoomId) step += 25;
       else if (roomId >= 0) step += 2.5;
       if (Math.abs(nx - sx) + Math.abs(ny - sy) <= 4 || Math.abs(nx - gx) + Math.abs(ny - gy) <= 4) {
         step = Math.max(0.35, step - 0.4);
       }
-      const nextScore = gScore[current] + step;
-      if (nextScore < gScore[next]) {
-        gScore[next] = nextScore;
-        parent[next] = current;
-        push(next, nextScore + heuristic(nx, ny));
+      if (direction !== previousDirection) {
+        const [pdx, pdy] = directions[previousDirection];
+        step += dx === -pdx && dy === -pdy ? reverseCost : turnCost;
+      }
+      const nextScore = gScore[currentState] + step;
+      if (nextScore < gScore[nextState]) {
+        gScore[nextState] = nextScore;
+        parent[nextState] = currentState;
+        push(nextState, nextScore + heuristic(nx, ny));
       }
     }
   }
-  if (!found) return null;
+  if (goalState < 0) return null;
   const cells = [];
-  for (let current = goalIndex; current >= 0; current = parent[current]) {
-    cells.push(current);
-    if (current === startIndex) break;
+  for (let state = goalState; state >= 0; state = parent[state]) {
+    const cell = Math.floor(state / directionCount);
+    cells.push(cell);
+    if (cell === startIndex) break;
   }
   if (cells[cells.length - 1] !== startIndex) return null;
   cells.reverse();
-  return { cells, points: simplifyCells(cells, W), cost: gScore[goalIndex] };
+  return { cells, points: simplifyCells(cells, W), cost: gScore[goalState] };
 }
 
 function roomDoorPoint(a, b, margin = 1) {
@@ -372,11 +389,31 @@ function carvePolyline(layer, points, W, H, width, owner, tiles) {
   carveCells(layer, polylineCells(points, W, H), W, H, width, owner, tiles);
 }
 
-function markDoor(layer, W, H, point) {
+function doorNormal(point) {
+  return point.side === 'e' ? { x: 1, y: 0 }
+    : point.side === 'w' ? { x: -1, y: 0 }
+    : point.side === 's' ? { x: 0, y: 1 }
+    : { x: 0, y: -1 };
+}
+
+function markDoor(layer, W, H, point, width = 1) {
   const x = Math.round(point.x);
   const y = Math.round(point.y);
-  if (!inBounds(W, H, x, y)) return;
-  layer.doorway[idx2(W, x, y)] = 1;
+  const normal = doorNormal(point);
+  const tangent = normal.y !== 0 ? { x: 1, y: 0 } : { x: 0, y: 1 };
+  for (const offset of widthOffsets(Math.max(1, Math.min(3, Math.round(width))))) {
+    const dx = x + tangent.x * offset;
+    const dy = y + tangent.y * offset;
+    if (inBounds(W, H, dx, dy)) layer.doorway[idx2(W, dx, dy)] = 1;
+  }
+}
+
+function doorApproach(point, depth = 2) {
+  const normal = doorNormal(point);
+  return {
+    x: Math.round(point.x) + normal.x * depth,
+    y: Math.round(point.y) + normal.y * depth
+  };
 }
 
 function rasterizeRooms(layers, rooms, W, H, tiles) {
@@ -889,19 +926,33 @@ export function buildMultiFloorLayout({
     const roomB = rooms[edge.b];
     if (edge.kind === 'corridor') {
       const layer = layers[edge.floor];
-      const start = roomDoorPoint(roomA, roomB);
-      const goal = roomDoorPoint(roomB, roomA);
+      const defaultStart = roomDoorPoint(roomA, roomB);
+      const defaultGoal = roomDoorPoint(roomB, roomA);
+      const start = edge.hasCustomDoorA && Number.isFinite(edge.ax) && Number.isFinite(edge.ay)
+        ? { x: Math.round(edge.ax), y: Math.round(edge.ay), side: edge.aside || defaultStart.side }
+        : defaultStart;
+      const goal = edge.hasCustomDoorB && Number.isFinite(edge.bx) && Number.isFinite(edge.by)
+        ? { x: Math.round(edge.bx), y: Math.round(edge.by), side: edge.bside || defaultGoal.side }
+        : defaultGoal;
       const width = Math.max(1, Math.min(3, Math.round(edge.visualWidth || (edge.isCritical ? 3 : 2))));
+      /* The roomDoorPoint is intentionally one cell inside the room. Extend
+         the route through the room's wall normal before A* starts, so the
+         first corridor segment is the actual door direction instead of an
+         arbitrary turn chosen from inside the room. */
+      const startApproach = doorApproach(start);
+      const goalApproach = doorApproach(goal);
       if (edge.useEditorRoute && Array.isArray(edge.route) && edge.route.length >= 2) {
         carvePolyline(layer, edge.route, W, H, width, edge.id, tiles);
+        carvePolyline(layer, [{ x: start.x, y: start.y }, startApproach], W, H, width, edge.id, tiles);
+        carvePolyline(layer, [{ x: goal.x, y: goal.y }, goalApproach], W, H, width, edge.id, tiles);
       } else {
-        const route = routeAStar(layer, start, goal, { W, H, startRoomId: roomA.id, goalRoomId: roomB.id });
+        const route = routeAStar(layer, startApproach, goalApproach, { W, H, startRoomId: roomA.id, goalRoomId: roomB.id });
         if (!route) {
           errors.push(`edge ${edge.id} has no A* route`);
           continue;
         }
-        edge.route = route.points;
-        carveCells(layer, route.cells, W, H, width, edge.id, tiles);
+        edge.route = [{ x: start.x, y: start.y }, ...route.points, { x: goal.x, y: goal.y }];
+        carvePolyline(layer, edge.route, W, H, width, edge.id, tiles);
       }
       edge.ax = start.x;
       edge.ay = start.y;
@@ -910,8 +961,8 @@ export function buildMultiFloorLayout({
       edge.by = goal.y;
       edge.bside = goal.side;
       edge.carvedWidth = width;
-      markDoor(layer, W, H, start);
-      markDoor(layer, W, H, goal);
+      markDoor(layer, W, H, start, width);
+      markDoor(layer, W, H, goal, width);
     } else {
       const connector = placeConnector({
         edge,
