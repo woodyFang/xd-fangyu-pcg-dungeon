@@ -131,6 +131,10 @@
   .editor-sec.collapsed .editor-title > span,
   .editor-sec.collapsed .editor-title > b,
   .editor-sec.collapsed #editorFullscreen,
+  .editor-sec.collapsed #editorAddStair,
+  .editor-sec.collapsed #editorStairCycle,
+  .editor-sec.collapsed #editorStairConfirm,
+  .editor-sec.collapsed #editorStairCancel,
   .editor-sec.collapsed .editor-canvas-wrap{display:none}
   .editor-sec.collapsed .editor-title{margin:0;width:44px;height:44px;display:flex;align-items:center;justify-content:center}
   .editor-sec.collapsed #editorCollapse{width:44px;height:44px;padding:0;border:0;background:transparent;border-radius:0}
@@ -142,6 +146,8 @@
     color:var(--dim);font-size:14px;letter-spacing:.05em;cursor:pointer;
   }
   .mini-btn:hover{color:var(--ink);border-color:#3a3f56}
+  .mini-btn.editor-stair-btn.on{color:#17120c;border-color:#ffd36a;background:#ffd36a;box-shadow:0 0 0 2px rgba(255,211,106,.16)}
+  .mini-btn.stair-confirm{color:#dfffea;border-color:#4cae78;background:rgba(76,174,120,.14)}
   .mini-btn:disabled{opacity:.32;cursor:not-allowed;color:var(--dim);border-color:var(--line)}
   .editor-canvas-wrap{position:relative;margin:12px 0 0;flex:1;min-height:0;display:flex}
   .editor-canvas{
@@ -191,19 +197,6 @@
   .editor-sec.overlay #editorExit{display:block;color:var(--ember);border-color:color-mix(in srgb,var(--ember) 45%,#141724)}
   .editor-sec.overlay .editor-panel-resize{display:none}
 
-  #editModeBtn{
-    position:fixed;left:50%;bottom:52px;transform:translateX(-50%);z-index:8;
-    padding:10px 18px;background:#10131de8;border:1px solid var(--line);border-radius:999px;
-    color:var(--ink);font-size:14px;letter-spacing:.05em;cursor:pointer;
-    box-shadow:0 10px 30px #000a;transition:color .12s,border-color .12s,opacity .2s;
-  }
-  #editModeBtn:hover{color:var(--ember);border-color:color-mix(in srgb,var(--ember) 45%,#141724)}
-  #editModeBtn.hidden{opacity:0;pointer-events:none}
-  #editModeBtn .key{
-    margin-left:6px;padding:1px 6px;border:1px solid #3a3f56;border-radius:4px;
-    font-size:11px;color:#8b92a8;
-  }
-
   /* -------- first/third person scene preview -------- */
   #previewModeBar{position:fixed;left:50%;bottom:48px;z-index:12;transform:translateX(-50%);display:flex;align-items:stretch;gap:5px;padding:5px;color:#e8ebf2;background:#0d1119e8;border:1px solid #30384b;border-radius:10px;box-shadow:0 12px 34px #000b;backdrop-filter:blur(12px)}
   .preview-mode-title{display:grid;min-width:74px;align-content:center;padding:0 10px 0 7px;border-right:1px solid #343b4d}
@@ -214,10 +207,10 @@
   #previewModeBar button>span{display:grid;gap:3px}#previewModeBar button b{font-size:11px;font-weight:600;letter-spacing:.04em}#previewModeBar button small{color:#727c91;font:8px/1 var(--mono)}
   #previewModeBar #previewExit{min-width:auto;padding-inline:12px;color:#d3af85;border-color:#5d4938;font-size:10px;white-space:nowrap}
   #previewModeBar #previewExit[hidden]{display:none}
-  #previewModeBar #editModeBtn{position:static;left:auto;bottom:auto;z-index:auto;transform:none;min-width:142px;padding:7px 10px;box-shadow:none;font-family:var(--mono);letter-spacing:0}
+  #previewModeBar #editModeBtn{position:static;transform:none;min-width:154px;font-family:var(--mono);box-shadow:none;backdrop-filter:none}
   #previewModeBar #editModeBtn:hover{transform:none}
   #previewModeBar #editModeBtn.hidden{display:none}
-  #previewModeBar #editModeBtn>kbd{margin-left:auto}
+  #previewModeBar #editModeBtn>kbd{margin-left:auto;color:#f1c996;border-color:#5b4937}
   #previewModeBar kbd,.preview-controls kbd{padding:2px 5px;color:#cbd1dd;background:#111621;border:1px solid #3a4358;border-radius:3px;font:8px/1 var(--mono)}
   body.preview-active #panel,body.preview-active #editModeBtn,body.preview-active #hints,body.preview-active .editor-sec{opacity:0;pointer-events:none;transition:opacity .3s}
   body.preview-active #previewModeBar{bottom:18px}
@@ -234,6 +227,7 @@
   @media(max-width:760px){
     .preview-mode-title{display:none}#previewModeBar button{min-width:116px}.preview-controls span:nth-child(2),.preview-controls span:nth-child(4){display:none}
     .preview-mode-badge{top:12px;left:12px;min-width:205px}
+    #previewModeBar #editModeBtn{min-width:126px}
   }
   .editor-menu{
     position:fixed;z-index:40;display:none;min-width:150px;padding:6px;
@@ -269,6 +263,17 @@
   .room-group-dialog-actions{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;align-items:center;margin-top:12px;padding-top:14px;border-top:1px solid #282e40}
   .room-group-dialog-actions .danger{color:#ff9789;border-color:#56302f}
   .room-group-dialog-actions .btn{min-height:36px;padding:8px 13px}
+  .editor-prompt-dialog{width:min(470px,calc(100vw - 28px));overflow:hidden}
+  .editor-prompt-content{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:12px;padding:13px;color:#c6ccda;background:#0c1018;border:1px solid #282f40;border-radius:10px}
+  .editor-prompt-content p{font-size:12px;line-height:1.65}
+  .editor-prompt-icon{display:grid;width:42px;height:42px;place-items:center;color:#ffc06f;background:color-mix(in srgb,var(--ember) 14%,#151925);border:1px solid color-mix(in srgb,var(--ember) 30%,#30364a);border-radius:10px;font-size:20px}
+  .editor-prompt-flow{display:grid;grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr);align-items:center;gap:8px;margin-top:12px}
+  .editor-prompt-flow span{display:grid;gap:3px;padding:10px 12px;color:#eef1f6;background:#171b27;border:1px solid #343b4f;border-radius:9px;font-size:12px;font-weight:650;text-align:center}
+  .editor-prompt-flow span small{color:#7f889b;font-size:9px;font-weight:400}
+  .editor-prompt-flow i{color:var(--ember);font-size:17px;font-style:normal;text-align:center}
+  .editor-prompt-hint{margin-top:10px;color:#838c9f;font-size:10.5px;line-height:1.6}
+  .editor-prompt-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:15px;padding-top:14px;border-top:1px solid #282e40}
+  .editor-prompt-actions .mini-btn,.editor-prompt-actions .btn{min-height:36px;padding:8px 14px}
   .custom-setting-dialog{width:min(590px,calc(100vw - 28px))}
   .custom-setting-intro{margin:-5px 0 2px;padding:10px 11px;color:#8f98ab;background:#0c1018;border:1px solid #252b3b;border-radius:8px;font-size:10.5px;line-height:1.55}
   .custom-setting-source-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:17px;padding-top:15px;border-top:1px solid #282e40;color:#c2c8d5;font-size:11px;letter-spacing:.04em}

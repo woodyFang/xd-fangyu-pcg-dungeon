@@ -11,7 +11,7 @@ function roomKey(room, offset) {
 }
 
 function stairCell(layer, cell) {
-  return !!(layer.stairMask?.[cell] || layer.stairClearance?.[cell] || layer.stairLanding?.[cell] || layer.slabOpening?.[cell]);
+  return !!(layer.stairMask?.[cell] || layer.stairwellMask?.[cell] || layer.stairClearance?.[cell] || layer.stairLanding?.[cell] || layer.slabOpening?.[cell]);
 }
 
 function protectAround(protectedCells, W, H, x, y, radius = 2) {
@@ -37,6 +37,7 @@ function remapLayer(previousDungeon, nextDungeon, previousLayer, nextLayer, room
   result.corridorOwner=cloneTyped(nextLayer.corridorOwner,Int32Array,-1);
   result.doorway=cloneTyped(nextLayer.doorway,Uint8Array);
   result.stairMask=cloneTyped(nextLayer.stairMask,Uint8Array);
+  result.stairwellMask=cloneTyped(nextLayer.stairwellMask,Uint8Array);
   result.stairClearance=cloneTyped(nextLayer.stairClearance,Uint8Array);
   result.stairLanding=cloneTyped(nextLayer.stairLanding,Uint8Array);
   result.slabOpening=cloneTyped(nextLayer.slabOpening,Uint8Array);

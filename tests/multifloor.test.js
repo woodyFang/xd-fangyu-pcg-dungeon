@@ -35,6 +35,7 @@ test('createLayerData creates isolated typed arrays for every floor', () => {
   const upper = createLayerData(1, 12, 10);
   assert.equal(lower.grid.length, 120);
   assert.equal(lower.roomId[0], -1);
+  assert.equal(lower.stairwellMask.length, 120);
   lower.grid[4] = TILES.FLOOR;
   assert.equal(upper.grid[4], TILES.VOID);
 });
@@ -207,9 +208,16 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
     assert.equal(connector.stepCount, 16);
     assert.equal(connector.stepRise, 0.25);
     assert.equal(connector.treadDepth, 0.5);
-    assert.equal(connector.openingCells.length, (connector.length - 1) * connector.width);
+    assert.ok(connector.openingCells.length >= (connector.length - 2) * connector.width);
+    assert.ok(connector.turn);
+    assert.equal(connector.firstRun + connector.secondRun, connector.length);
+    assert.equal(connector.firstFlightSteps + connector.secondFlightSteps, connector.stepCount);
     const lowerLayer = result.layers[connector.fromFloor];
     const upperLayer = result.layers[connector.toFloor];
+    for (const cell of connector.sharedFootprintCells) {
+      assert.equal(lowerLayer.stairwellMask[cell], 1);
+      assert.equal(upperLayer.stairwellMask[cell], 1);
+    }
     assert.equal(lowerLayer.stairLanding[connector.lower.y * 76 + connector.lower.x], 1);
     assert.equal(upperLayer.stairLanding[connector.upper.y * 76 + connector.upper.x], 1);
     for (const cell of connector.openingCells) {
@@ -226,6 +234,115 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
     const cell = roomData.floor * 76 * 40 + roomData.cy * 76 + roomData.cx;
     assert.ok(result.bfs3[cell] >= 0);
   }
+});
+
+test('stable stair specs preserve their anchor and reject conflicting locked placement', () => {
+  const rooms=[room(0,12,18,0),room(1,36,18,1)];
+  const base=buildMultiFloorLayout({
+    W:52,H:38,floorCount:2,rooms:clone(rooms),
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(base.valid,true,base.errors.join('\n'));
+  const original=base.connectors[0];
+  const stable=buildMultiFloorLayout({
+    W:52,H:38,floorCount:2,rooms:clone(rooms),
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      mode:'stable-auto',anchor:{...original.lower},direction:original.direction,width:original.width,length:original.length,landingDepth:original.landingDepth
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(stable.valid,true,stable.errors.join('\n'));
+  assert.deepEqual(stable.connectors[0].lower,original.lower);
+  assert.equal(stable.connectors[0].direction,original.direction);
+
+  const conflicting=buildMultiFloorLayout({
+    W:52,H:38,floorCount:2,rooms:clone(rooms),
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-locked',mode:'locked',anchor:{x:1,y:1},direction:'west',width:2,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(conflicting.valid,false);
+  assert.match(conflicting.errors.join('\n'),/no legal stair candidate/);
+  assert.deepEqual(conflicting.stairFailures.map(failure=>failure.stairId),['stair-locked']);
+});
+
+test('stacked rooms use one shared stairwell footprint on both floors', () => {
+  const lower={...room(0,24,20,0),w:18,h:16};
+  const upper={...room(1,24,20,1),w:18,h:16};
+  const result=buildMultiFloorLayout({
+    W:52,H:42,floorCount:2,rooms:[lower,upper],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  const connector=result.connectors[0];
+  assert.equal(connector.sharedFootprintKind,'room-overlap');
+  assert.ok(connector.sharedFootprintCells.length>connector.openingCells.length);
+  for(const cell of connector.sharedFootprintCells){
+    assert.equal(result.layers[0].stairwellMask[cell],1);
+    assert.equal(result.layers[1].stairwellMask[cell],1);
+  }
+  for(const cell of connector.openingCells){
+    assert.equal(result.layers[0].stairMask[cell],1);
+    assert.equal(result.layers[1].slabOpening[cell],1);
+  }
+});
+
+test('a locked stair may replace the room centre and reshapes both floor structures', () => {
+  const lower={...room(0,24,20,0),w:18,h:16};
+  const upper={...room(1,24,20,1),w:18,h:16};
+  const result=buildMultiFloorLayout({
+    W:52,H:42,floorCount:2,rooms:[lower,upper],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-centre',mode:'locked',anchor:{x:20,y:20},direction:'east',width:2,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  assert.equal(result.stairFailures.length,0);
+  const connector=result.connectors[0];
+  const centre=20*52+24;
+  assert.ok(connector.openingCells.includes(centre));
+  assert.equal(result.layers[0].stairMask[centre],1);
+  assert.equal(result.layers[0].roomId[centre],-1);
+  assert.equal(result.layers[1].slabOpening[centre],1);
+  assert.equal(result.layers[1].grid[centre],TILES.VOID);
+  assert.ok(result.layers[1].bfs.some(distance=>distance>=0));
+});
+
+test('a locked stair can sit flush against a room wall without carving side clearance outside it', () => {
+  const lower={...room(0,24,20,0),w:18,h:16};
+  const upper={...room(1,24,20,1),w:18,h:16};
+  const result=buildMultiFloorLayout({
+    W:52,H:42,floorCount:2,rooms:[lower,upper],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-wall',mode:'locked',anchor:{x:20,y:12},direction:'east',width:2,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  const connector=result.connectors[0];
+  assert.equal(connector.sideClearance,0);
+  const footprintRows=connector.sharedFootprintCells.map(cell=>Math.floor(cell/52));
+  assert.equal(Math.min(...footprintRows),12);
+  assert.equal(Math.max(...footprintRows),18);
+  assert.equal(result.layers[0].grid[11*52+24],TILES.WALL);
+});
+
+test('a user-locked stair reshapes unrelated room cells on both floors instead of reporting a false conflict', () => {
+  const lower=room(0,12,20,0);
+  const upper=room(1,48,20,1);
+  const lowerOverlap={...room(2,28,20,0),w:14,h:10};
+  const upperOverlap={...room(3,28,20,1),w:14,h:10};
+  const result=buildMultiFloorLayout({
+    W:64,H:42,floorCount:2,rooms:[lower,upper,lowerOverlap,upperOverlap],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-reshape',mode:'locked',anchor:{x:24,y:20},direction:'east',width:2,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  assert.equal(result.stairFailures.length,0);
+  const centre=20*64+28;
+  assert.equal(result.layers[0].stairMask[centre],1);
+  assert.equal(result.layers[0].roomId[centre],-1);
+  assert.equal(result.layers[1].slabOpening[centre],1);
+  assert.equal(result.layers[1].roomId[centre],-1);
 });
 
 test('multifloor generation is deterministic', () => {

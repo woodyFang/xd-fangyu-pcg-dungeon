@@ -43,8 +43,10 @@ test('edited floors and new stair neighborhoods keep regenerated data', () => {
   previous.layers[1].grid[cell]=1;
   next.layers[1].grid[cell]=0;
   next.layers[1].stairLanding[cell]=1;
+  next.layers[1].stairwellMask[cell]=1;
   preserveUneditedFloors(previous,next,[0]);
   assert.equal(next.layers[0].grid[cell],2);
   assert.equal(next.layers[1].grid[cell],0);
   assert.equal(next.layers[1].stairLanding[cell],1);
+  assert.equal(next.layers[1].stairwellMask[cell],1);
 });

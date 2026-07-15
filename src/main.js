@@ -22,7 +22,7 @@ import {
 import { normalizeFloorValues, updateFloorValue } from './ui/floor-settings.js';
 import { snapRouteControlPoint } from './ui/route-snapping.js';
 import { simplifyRoutePoints } from './ui/route-path.js';
-import { FLOOR_ALIGNMENT_OFFSETS, translateFloorLayout } from './generation/floor-shift.js';
+import { adaptRoomToRotatedStair, chooseStairTargetFloor, matchingStairRooms, pairedStairRoomPlacement, rotateStairPlacement90, stairPairError, stairRemovalDisconnectsRooms, stairRotationFromPointer, stairVisualForRotation, translateStairPlacement } from './ui/stair-editing.js';
 import { preserveUneditedFloors } from './generation/floor-preservation.js';
 import { adaptRouteBends } from './generation/adaptive-route.js';
 import { corridorCenterOffset, dungeonEditorOffset, dungeonLayerShift, editorToGridPoint } from './generation/coordinate-space.js';
@@ -338,12 +338,13 @@ function roomShapeContains(r, x, y){
   if(!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(r.w) || !Number.isFinite(r.h)) return false;
   return Math.abs(x - cx) <= Math.max(1, r.w/2) && Math.abs(y - cy) <= Math.max(1, r.h/2);
 }
-function makeRoomRecord(id, cx, cy, w, h, shape, locked, roleHint, roomGroupId){
+function makeRoomRecord(id, cx, cy, w, h, shape, locked, roleHint, roomGroupId, stairRoom=false, stairRoomPairId=null){
   w = Math.max(5, Math.round(w)); h = Math.max(5, Math.round(h));
   cx = Math.round(cx); cy = Math.round(cy);
   return { id, sourceId:id, cx, cy, w, h, arch:classifyArch(w,h), shape:'rect',
     sx0:cx, sy0:cy, type:TYPE.COMBAT, depth:0, difficulty:0.2, degree:0,
-    locked:!!locked, roleHint:roleHint || null, roomGroupId:roomGroupId || null, floor:0 };
+    locked:!!locked, roleHint:roleHint || null, roomGroupId:roomGroupId || null,
+    stairRoom:!!stairRoom, stairRoomPairId:stairRoomPairId || null, floor:0 };
 }
 function randomScatterRooms(rng, N, idStart, centerX, centerY){
   const R = Math.sqrt(Math.max(1, N)) * 4.6;
@@ -384,7 +385,7 @@ function initialRoomsFromParams(rng, params){
     return rooms;
   }
   if(!editorRooms.length) return randomScatterRooms(rng, params.roomCount, 0, 0, 0);
-  const rooms = editorRooms.map((r,i)=>{ const q=makeRoomRecord(i, r.x, r.y, r.w, r.h, r.shape, r.locked, r.roleHint, r.roomGroupId); q.floor=Math.max(0,Math.round(r.floor||0)); return q; });
+  const rooms = editorRooms.map((r,i)=>{ const q=makeRoomRecord(i, r.x, r.y, r.w, r.h, r.shape, r.locked, r.roleHint, r.roomGroupId, r.stairRoom, r.stairRoomPairId); q.floor=Math.max(0,Math.round(r.floor||0)); return q; });
   if(floorTargets?.length){
     for(let floor=0;floor<floorTargets.length;floor++){
       const existing=rooms.filter(room=>room.floor===floor), missing=Math.max(0,floorTargets[floor]-existing.length);
@@ -721,6 +722,11 @@ function tryGenerate(seed, params){
       e.useEditorRoute = hasCustomRoute;
       e.hasCustomDoorA = !!editorLink.doorA;
       e.hasCustomDoorB = !!editorLink.doorB;
+      if(editorLink.stairSpec){
+        const spec=editorLink.stairSpec;
+        e.stairSpec={...spec,anchor:Number.isFinite(spec.anchor?.x)&&Number.isFinite(spec.anchor?.y)
+          ? {x:Math.round(spec.anchor.x+offX),y:Math.round(spec.anchor.y+offY)} : null};
+      }
       if(Array.isArray(editorLink.bends) && editorLink.bends.length){
         const sourceA={cx:A0.x,cy:A0.y,w:A0.w,h:A0.h}, sourceB={cx:B0.x,cy:B0.y,w:B0.w,h:B0.h};
         const sourceDa=editorLink.doorA ? doorSpecPoint({x:A0.x,y:A0.y,w:A0.w,h:A0.h},editorLink.doorA) : roomDoorPoint(sourceA,sourceB);
@@ -1515,7 +1521,7 @@ function tryGenerate(seed, params){
     loopChancesByFloor:targetLoopChances, decorDensitiesByFloor:targetDecorDensities,
     props:baseLayer.props, spawns:baseLayer.spawns, torches:baseLayer.torches,
     pools:baseLayer.pools, lakeCells:baseLayer.lakeCells, lakeMask:baseLayer.lakeMask, arches:baseLayer.arches,
-    generationErrors:multi.errors,
+    generationErrors:multi.errors, stairFailures:multi.stairFailures || [],
     stats:{ rooms:N, edges:multi.edges.length, loops, critLen, floorTiles:totalFloorTiles, reach:multi.reach, floors:floorCount, genMs:0, attempts:1 }
   };
 }
@@ -2391,23 +2397,42 @@ function buildMesh(set, geo, mat, mode, dur, shadow){
   if(mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   if(shadow===1){ mesh.castShadow = true; mesh.receiveShadow = true; }
   else if(shadow===2) mesh.receiveShadow = true;
-  mesh.userData = { set, mode, dur, settled:false };
+  let delayMin=Infinity, delayMax=-Infinity;
+  for(const delay of set.delay){ delayMin=Math.min(delayMin,delay); delayMax=Math.max(delayMax,delay); }
+  if(!Number.isFinite(delayMin)){ delayMin=0; delayMax=0; }
+  mesh.userData = { set, mode, dur, settled:false, delayMin, delayMax, revealStart:null, revealSpan:0 };
   writeInstances(mesh, Infinity);
   return mesh;
 }
 const easeOutCubic = t => 1-Math.pow(1-t,3);
 const easeOutBack  = t => { const c=1.70158; return 1 + (c+1)*Math.pow(t-1,3) + c*Math.pow(t-1,2); };
+function instanceRevealProgress(u, s, i, t){
+  const rawDelay=s.delay[i] || 0;
+  const range=u.delayMax-u.delayMin;
+  const order=range>1e-6 ? (rawDelay-u.delayMin)/range : 0.5;
+  const delay=Number.isFinite(u.revealStart) ? u.revealStart + order*u.revealSpan : rawDelay;
+  return clamp01((t-delay)/u.dur);
+}
 function writeInstances(mesh, t){
   const u = mesh.userData, s = u.set;
   let allDone = true;
   for(let i=0;i<s.n;i++){
-    let k = (t - s.delay[i]) / u.dur;
+    const k = instanceRevealProgress(u,s,i,t);
     if(k < 1) allDone = false;
-    k = Math.max(0.0001, Math.min(1, k));
-    const g = u.mode==='rise' ? easeOutCubic(k) : easeOutBack(k)*Math.min(1,k*8);
+    const g = Math.max(0.0001,easeOutCubic(k));
     _q.setFromEuler(_E.set(s.rx[i], s.ry[i], s.rz[i]));
-    if(u.mode==='rise'){ _p.set(s.px[i], s.py[i], s.pz[i]); _s.set(s.sx[i], s.sy[i]*Math.max(g,0.0001), s.sz[i]); }
-    else { const m=Math.max(g,0.0001); _p.set(s.px[i], s.py[i], s.pz[i]); _s.set(s.sx[i]*m, s.sy[i]*m, s.sz[i]*m); }
+    if(u.mode==='rise'){
+      _p.set(s.px[i], s.py[i], s.pz[i]);
+      _s.set(s.sx[i], s.sy[i]*g, s.sz[i]);
+    } else if(u.mode==='tile'){
+      const m=0.82+0.18*g;
+      _p.set(s.px[i], s.py[i]-0.08*(1-g), s.pz[i]);
+      _s.set(s.sx[i]*m, s.sy[i]*g, s.sz[i]*m);
+    } else {
+      const m=0.78+0.22*g;
+      _p.set(s.px[i], s.py[i]+0.34*(1-g), s.pz[i]);
+      _s.set(s.sx[i]*m, s.sy[i]*m, s.sz[i]*m);
+    }
     _m.compose(_p,_q,_s); mesh.setMatrixAt(i,_m);
   }
   mesh.instanceMatrix.needsUpdate = true;
@@ -2425,7 +2450,7 @@ let roomSelection = null;
 let routeOverlay = null;
 let lights = [];
 let floorColorsBase = null, floorColorsHeat = null;
-let animT = Infinity, animEnd = 0, animating = false;
+let animT = Infinity, animEnd = 0, animating = false, animTimeline = null;
 let fx = { liquids:[], shafts:[], spinners:[], parts:null };
 let levelGeos = [];
 let levelMats = [];
@@ -2577,6 +2602,57 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
       root.add(nodes);
       continue;
     }
+    if(connector.turn){
+      const steps=connector.stepCount || Math.max(8,Math.round(floorHeight/.25));
+      const firstSteps=connector.firstFlightSteps || Math.floor(steps/2);
+      const secondSteps=connector.secondFlightSteps || (steps-firstSteps);
+      const firstRun=connector.firstRun || Math.max(3,Math.floor((connector.length||8)/2));
+      const secondRun=connector.secondRun || Math.max(3,(connector.length||8)-firstRun);
+      const d1=connector.directionVector || {x:1,y:0};
+      const d2=connector.secondDirectionVector || {x:-d1.y,y:d1.x};
+      const stepGeo=new THREE.BoxGeometry(1,1,1);
+      const landingGeo=new THREE.BoxGeometry(1,.16,1);
+      const rimGeo=new THREE.BoxGeometry(1,.56,1);
+      levelGeos.push(stepGeo,landingGeo,rimGeo);
+      const sm=new THREE.InstancedMesh(stepGeo,stairMat,steps);
+      const setStep=(index,origin,direction,along,depth,top)=>{
+        const x=origin.x+direction.x*along, z=origin.y+direction.y*along;
+        _p.set(wx(x),lowerY+top/2,wz(z)); _q.identity();
+        _s.set(direction.x ? depth : connector.width,top,direction.x ? connector.width : depth);
+        _m.compose(_p,_q,_s); sm.setMatrixAt(index,_m);
+      };
+      const tread1=firstRun/Math.max(1,firstSteps), tread2=secondRun/Math.max(1,secondSteps);
+      for(let i=0;i<firstSteps;i++) setStep(i,connector.lower,d1,(i+.5)*tread1,tread1,totalRise*(i+1)/steps);
+      for(let i=0;i<secondSteps;i++) setStep(firstSteps+i,connector.turn,d2,(i+.5)*tread2,tread2,totalRise*(firstSteps+i+1)/steps);
+      sm.castShadow=true; sm.receiveShadow=true; root.add(sm);
+
+      const landingDepth=connector.landingDepth || 2;
+      const landings=new THREE.InstancedMesh(landingGeo,stairMat,3);
+      const setLanding=(index,point,direction,length,y,width=connector.width)=>{
+        _p.set(wx(point.x),y,wz(point.y)); _q.identity();
+        _s.set(direction.x?length:width,1,direction.x?width:length);
+        _m.compose(_p,_q,_s); landings.setMatrixAt(index,_m);
+      };
+      setLanding(0,{x:connector.lower.x-d1.x*landingDepth/2,y:connector.lower.y-d1.y*landingDepth/2},d1,landingDepth+1,lowerY-.01);
+      setLanding(1,connector.turn,d1,connector.width+1,lowerY+totalRise*firstSteps/steps-.01,connector.width+1);
+      setLanding(2,{x:connector.upper.x+d2.x*landingDepth/2,y:connector.upper.y+d2.y*landingDepth/2},d2,landingDepth+1,lowerY+totalRise-.01);
+      landings.castShadow=true; landings.receiveShadow=true; root.add(landings);
+
+      const rims=new THREE.InstancedMesh(rimGeo,stairMat,4);
+      const setRim=(index,a,b,direction,side,y)=>{
+        const perpendicular={x:-direction.y,y:direction.x};
+        const offset=(connector.width/2+.12)*side;
+        _p.set(wx((a.x+b.x)/2+perpendicular.x*offset),y,wz((a.y+b.y)/2+perpendicular.y*offset)); _q.identity();
+        _s.set(direction.x ? Math.hypot(b.x-a.x,b.y-a.y) : .14,1,direction.x ? .14 : Math.hypot(b.x-a.x,b.y-a.y));
+        _m.compose(_p,_q,_s); rims.setMatrixAt(index,_m);
+      };
+      setRim(0,connector.lower,connector.turn,d1,1,lowerY+totalRise*.5+.28);
+      setRim(1,connector.lower,connector.turn,d1,-1,lowerY+totalRise*.5+.28);
+      setRim(2,connector.turn,connector.upper,d2,1,lowerY+totalRise+.28);
+      setRim(3,connector.turn,connector.upper,d2,-1,lowerY+totalRise+.28);
+      rims.castShadow=true; root.add(rims);
+      continue;
+    }
     const steps=connector.stepCount || Math.max(8,Math.round(floorHeight/.25));
     const alongX=Math.abs(connector.upper.x-connector.lower.x)>Math.abs(connector.upper.y-connector.lower.y);
     const run=connector.length || Math.max(1,Math.hypot(connector.upper.x-connector.lower.x,connector.upper.y-connector.lower.y));
@@ -2616,7 +2692,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   const d=activeLayer ? {
     ...sourceDungeon,
     grid:activeLayer.grid, roomId:activeLayer.roomId, corridor:activeLayer.corridor,
-    doorway:activeLayer.doorway, stairMask:activeLayer.stairMask,
+    doorway:activeLayer.doorway, stairMask:activeLayer.stairMask, stairwellMask:activeLayer.stairwellMask,
     stairClearance:activeLayer.stairClearance, stairLanding:activeLayer.stairLanding, slabOpening:activeLayer.slabOpening,
     bfs:activeLayer.bfs, maxBfs:activeLayer.maxBfs, lakeMask:activeLayer.lakeMask,
     props:activeLayer.props, spawns:activeLayer.spawns, torches:activeLayer.torches,
@@ -2681,8 +2757,8 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     fs.add(wx(x), cellRng.f(-0.02,0.008), wz(y), 1,1,1, 0, floorColorsBase[floorColorsBase.length-1], Math.max(0,bfs[c])*dStep);
   }
   meshes.floor = TH.kit === 'hospital'
-    ? buildMesh(fs, GEO.hospitalFloor, matHospitalFloor, 'pop', 0.34, 2)
-    : buildMesh(fs, GEO.floor, matStone, 'pop', 0.34, 2);
+    ? buildMesh(fs, GEO.hospitalFloor, matHospitalFloor, 'tile', 0.34, 2)
+    : buildMesh(fs, GEO.floor, matStone, 'tile', 0.34, 2);
 
   /* walls + trim caps */
   const nearFloorBfs = (x,y)=>{ let b=1e4;
@@ -3308,8 +3384,12 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     updateCam();
   } else if(focusFloor){ updateCam(); }
 
-  const maxDelay = maxBfs*dStep + 1.2;
-  animEnd = 2.3 + maxDelay + 0.8;
+  if(!staticLayer){
+    const depthSpan=Math.max(0.65,Math.min(1.8,maxBfs*dStep));
+    animTimeline=createBuildTimeline(depthSpan);
+    animEnd=animTimeline.end;
+    configureRevealSchedules(meshes,animTimeline);
+  }
   if(staticLayer) disableContextFloorShadowCasting(group);
   return {floor:activeFloor,group,meshes,fx,lights,floorColorsBase,floorColorsHeat,staticLayer};
 }
@@ -3364,21 +3444,60 @@ function updateRects(t){
 /* -------- reveal / overlay opacity per frame -------- */
 const clamp01 = v => Math.max(0, Math.min(1, v));
 function phase(t,a,b){ return clamp01((t-a)/(b-a)); }
+function createBuildTimeline(depthSpan){
+  const specs=[
+    ['layout',0.75],
+    ['graph',0.72],
+    ['structure',1.0+depthSpan],
+    ['rooms',0.72+depthSpan*0.45],
+    ['atmosphere',0.78]
+  ];
+  let cursor=0;
+  const stages=specs.map(([id,duration])=>{
+    const stage={id,start:cursor,end:cursor+duration,duration};
+    cursor=stage.end;
+    return stage;
+  });
+  return {stages,byId:Object.fromEntries(stages.map(stage=>[stage.id,stage])),end:cursor};
+}
+const STRUCTURE_REVEAL_KEYS=new Set(['floor','wall','wallCap','arch','archL','hospitalDoorPost','hospitalDoorLintel']);
+const ATMOSPHERE_REVEAL_KEYS=new Set([
+  'flame','flameCore','coals','chestGlow','emblem','band2','band3','crystal','ring','bossGlow',
+  'wallLight','deptSign','floorCross','floorStripe','cleanZone','floorArrow'
+]);
+function setMeshRevealWindow(mesh,start,end){
+  if(!mesh?.userData) return;
+  mesh.userData.revealStart=start;
+  mesh.userData.revealSpan=Math.max(0,end-start-mesh.userData.dur);
+}
+function configureRevealSchedules(sceneMeshes,timeline){
+  const structure=timeline.byId.structure, rooms=timeline.byId.rooms, atmosphere=timeline.byId.atmosphere;
+  for(const [key,mesh] of Object.entries(sceneMeshes)){
+    if(ATMOSPHERE_REVEAL_KEYS.has(key)) setMeshRevealWindow(mesh,atmosphere.start,atmosphere.end);
+    else if(STRUCTURE_REVEAL_KEYS.has(key)){
+      const offset=key==='floor'?0:(key==='wall'?0.16:0.34);
+      setMeshRevealWindow(mesh,structure.start+offset,structure.end);
+    } else setMeshRevealWindow(mesh,rooms.start,rooms.end);
+  }
+}
 function applyReveal(t){
+  if(!animTimeline) return;
   const u = overlay.userData, graphOn = el.tGraph.checked;
-  updateRects(Math.min(t, 1.0));
-  u.rects.material.opacity = 0.9 * (1 - phase(t, 2.5, 3.2));
-  u.del.material.opacity  = 0.13 * phase(t,0.95,1.45) * (graphOn ? 1 : (1 - phase(t,3.0,3.6)));
-  const resolved = phase(t,1.55,2.15);
-  u.mst.material.opacity  = 0.7*resolved * (graphOn?1:(1-phase(t,3.2,3.9)));
-  u.loop.material.opacity = 0.9*resolved * (graphOn?1:(1-phase(t,3.2,3.9)));
-  u.crit.material.opacity = 0.95*phase(t,1.9,2.35) * (graphOn?1:(1-phase(t,3.4,4.1)));
-  u.pts.material.opacity  = 0.95*phase(t,0.15,0.5) * (graphOn?1:(1-phase(t,3.0,3.6)));
-  const tt = t - 2.3;
-  for(const k in meshes){ const m=meshes[k]; if(!m.userData.settled) writeInstances(m, tt); }
-  const lightRamp = phase(t, 2.6, animEnd*0.85);
+  const layout=animTimeline.byId.layout, graph=animTimeline.byId.graph;
+  const structure=animTimeline.byId.structure, rooms=animTimeline.byId.rooms, atmosphere=animTimeline.byId.atmosphere;
+  updateRects(phase(t,layout.start,layout.end));
+  const overlayFade=graphOn ? 1 : 1-phase(t,structure.start,structure.start+0.42);
+  u.rects.material.opacity = 0.9*(1-phase(t,graph.end,structure.start+0.34));
+  u.del.material.opacity  = 0.13*phase(t,graph.start,graph.start+0.22)*overlayFade;
+  const resolved=phase(t,graph.start+0.22,graph.end);
+  u.mst.material.opacity  = 0.7*resolved*overlayFade;
+  u.loop.material.opacity = 0.9*resolved*overlayFade;
+  u.crit.material.opacity = 0.95*phase(t,graph.end-0.18,rooms.start+0.2)*(graphOn?1:(1-phase(t,rooms.start,rooms.start+0.38)));
+  u.pts.material.opacity  = 0.95*phase(t,layout.start,layout.start+0.18)*(graphOn?1:(1-phase(t,graph.end,structure.start+0.3)));
+  for(const k in meshes){ const m=meshes[k]; if(!m.userData.settled) writeInstances(m,t); }
+  const lightRamp = phase(t,atmosphere.start,atmosphere.end);
   for(const L of lights) L.userData.ramp = lightRamp;
-  setFxRamp(phase(t, 2.7, Math.max(3.6, animEnd*0.8)));
+  setFxRamp(phase(t,atmosphere.start,atmosphere.end));
   setStage(t);
 }
 function setFxRamp(v){
@@ -3405,12 +3524,11 @@ function setOverlayStatic(){
 /* -------- pipeline stepper -------- */
 const pipeEls = [...document.querySelectorAll('#pipe li')];
 function setStage(t){
-  const bounds = [0, 0.3,
- 0.95, 1.55, 2.3, 2.3 + Math.max(0.6,(animEnd-2.3)*0.55)];
-  pipeEls.forEach((li,i)=>{
-    const s = bounds[i], e = i<5 ? bounds[i+1] : animEnd;
-    li.classList.toggle('active', t>=s && t<e);
-    li.classList.toggle('done', t>=e);
+  if(!animTimeline) return;
+  pipeEls.forEach(li=>{
+    const stage=animTimeline.byId[li.dataset.stage];
+    li.classList.toggle('active',!!stage && t>=stage.start && t<stage.end);
+    li.classList.toggle('done',!!stage && t>=stage.end);
   });
 }
 function setStageDone(){ pipeEls.forEach(li=>{ li.classList.remove('active'); li.classList.add('done'); }); }
@@ -3423,8 +3541,12 @@ const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
   vFloorTotal:$('vFloorTotal'), floorSelect:$('floorSelect'),
   floorAddNext:$('floorAddNext'), floorAdd:$('floorAdd'), floorRemove:$('floorRemove'),
   tGraph:$('tGraph'), tHeat:$('tHeat'), tAnim:$('tAnim'), tPost:$('tPost'),
-  tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'),
+  tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'), editorAddStair:$('editorAddStair'),
+  editorStairCycle:$('editorStairCycle'), editorStairConfirm:$('editorStairConfirm'), editorStairCancel:$('editorStairCancel'),
   editorMenu:$('editorMenu'), editorExit:$('editorExit'), editorTitleText:$('editorTitleText'), editModeBtn:$('editModeBtn'),
+  editorPromptDialog:$('editorPromptDialog'), editorPromptEyebrow:$('editorPromptEyebrow'), editorPromptTitle:$('editorPromptTitle'),
+  editorPromptMessage:$('editorPromptMessage'), editorPromptFromFloor:$('editorPromptFromFloor'), editorPromptToFloor:$('editorPromptToFloor'),
+  editorPromptHint:$('editorPromptHint'), editorPromptConfirm:$('editorPromptConfirm'), editorPromptCancel:$('editorPromptCancel'),
   roomGroupAdd:$('roomGroupAdd'), roomGroupList:$('roomGroupList'), roomGroupEmpty:$('roomGroupEmpty'),
   roomGroupDialog:$('roomGroupDialog'), roomGroupForm:$('roomGroupForm'), roomGroupDialogTitle:$('roomGroupDialogTitle'),
   roomGroupName:$('roomGroupName'), roomGroupPrompt:$('roomGroupPrompt'), roomGroupImage:$('roomGroupImage'),
@@ -3498,6 +3620,21 @@ function updateFloorUI(){
   if(el.vLoops) el.vLoops.textContent=loopRate+'%';
   if(el.decor) el.decor.value=String(decorDensity);
   if(el.vDecor) el.vDecor.textContent=decorDensity+'%';
+  syncStairToolUI();
+}
+function stairToolActive(){ return editor.tool==='stair-source' || editor.tool==='stair-preview'; }
+function syncStairToolUI(){
+  if(!el.editorAddStair) return;
+  const active=stairToolActive();
+  const preview=editor.tool==='stair-preview';
+  el.editorAddStair.classList.toggle('on',active);
+  el.editorAddStair.setAttribute('aria-pressed',String(active));
+  el.editorAddStair.textContent=preview ? '楼梯预览' : (active ? '取消楼梯' : '＋ 楼梯');
+  el.editorAddStair.disabled=editor.floorCount<2;
+  const stair=selectedEditorStair();
+  if(el.editorStairCycle){ el.editorStairCycle.hidden=!(preview || stair); el.editorStairCycle.disabled=!stair; }
+  if(el.editorStairConfirm){ el.editorStairConfirm.hidden=!preview; el.editorStairConfirm.disabled=!!stair?.invalid || !stair?.previewAnchor; }
+  if(el.editorStairCancel) el.editorStairCancel.hidden=!preview;
 }
 function setEditorFloor(floor){
   editor.currentFloor=Math.max(0,Math.min(editor.floorCount-1,Math.round(floor)));
@@ -3533,6 +3670,7 @@ function addEditorFloorAfterCurrent(){
       const floor=room.floor||0;
       return floor>=inserted ? {...room,floor:floor+1} : room;
     });
+    reconcileEditorStairs();
     editor.floorCount++;
     requestedFloorCount=editor.floorCount;
     editor.dirty=true;
@@ -3590,6 +3728,7 @@ function removeEditorFloor(){
     if(floor>removed) floor--;
     return {...r,floor};
   });
+  reconcileEditorStairs();
   editor.floorCount--;
   requestedFloorCount=editor.floorCount;
   setEditorFloor(Math.min(removed,editor.floorCount-1));
@@ -3804,7 +3943,7 @@ let loopRatesByFloor=[DEFAULT_LOOP_RATE,DEFAULT_LOOP_RATE];
 let decorDensitiesByFloor=[DEFAULT_DECOR_DENSITY,DEFAULT_DECOR_DENSITY];
 const pendingFloorEdits=new Set();
 let lastValidEditorState=null;
-const editor = { tool:'select', rooms:[], links:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, drag:null, scale:6, panX:0, panY:0, nextId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:2, currentFloor:0 };
+const editor = { tool:'select', rooms:[], links:[], stairs:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, stairFrom:null, stairTargetFloor:null, stairDraftSnapshot:null, stairError:'', drag:null, scale:6, panX:0, panY:0, nextId:1, nextStairId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:2, currentFloor:0 };
 const ROOM_GROUP_STORAGE='dungeon.roomGroups.v1';
 const ROOM_GROUP_COLORS=['#5fd1c7','#7fd4ff','#e8973f','#9b6cf0','#d9a441','#59d68f','#ff7468','#d88ad8'];
 let roomGroups=[];
@@ -3973,16 +4112,18 @@ function captureEditorState(){
   return {
     rooms:editor.rooms.map(r=>({...r})),
     links:editor.links.map(l=>({...l,bends:(l.bends||[]).map(p=>({...p})),autoRoute:Array.isArray(l.autoRoute)?l.autoRoute.map(p=>({...p})):null})),
+    stairs:editor.stairs.map(stair=>({...stair,anchor:stair.anchor?{...stair.anchor}:null,previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null})),
     blockedLinks:[...editor.blockedLinks], secretRooms:[...editor.secretRooms],
     floorCount:editor.floorCount, currentFloor:editor.currentFloor,
     roomCountsByFloor:[...roomCountsByFloor], loopRatesByFloor:[...loopRatesByFloor], decorDensitiesByFloor:[...decorDensitiesByFloor],
-    nextId:editor.nextId, dirty:editor.dirty
+    nextId:editor.nextId, nextStairId:editor.nextStairId, dirty:editor.dirty
   };
 }
 function restoreEditorState(state){
   if(!state) return;
   editor.rooms=state.rooms.map(r=>({...r}));
   editor.links=state.links.map(l=>({...l,bends:(l.bends||[]).map(p=>({...p})),autoRoute:Array.isArray(l.autoRoute)?l.autoRoute.map(p=>({...p})):null}));
+  editor.stairs=Array.isArray(state.stairs)?state.stairs.map(stair=>({...stair,anchor:stair.anchor?{...stair.anchor}:null,previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null})):[];
   editor.blockedLinks=[...state.blockedLinks]; editor.secretRooms=[...state.secretRooms];
   editor.floorCount=state.floorCount; editor.currentFloor=Math.min(state.currentFloor,state.floorCount-1);
   requestedFloorCount=state.floorCount;
@@ -3991,19 +4132,26 @@ function restoreEditorState(state){
   decorDensitiesByFloor=Array.isArray(state.decorDensitiesByFloor)?[...state.decorDensitiesByFloor]:Array.from({length:state.floorCount},()=>DEFAULT_DECOR_DENSITY);
   normalizeFloorRoomCounts(state.floorCount);
   normalizeFloorTuning(state.floorCount);
-  editor.nextId=state.nextId; editor.dirty=state.dirty;
-  editor.selectedId=null; editor.selectedLinkKey=null; editor.connectFrom=null; editor.drag=null;
+  editor.nextId=state.nextId; editor.nextStairId=state.nextStairId || 1; editor.dirty=state.dirty;
+  editor.selectedId=null; editor.selectedLinkKey=null; editor.connectFrom=null; editor.stairFrom=null; editor.stairTargetFloor=null; editor.stairDraftSnapshot=null; editor.stairError=''; editor.tool='select'; editor.drag=null;
 }
 function resetEditorLayoutState(){
   editor.rooms=[];
   editor.links=[];
+  editor.stairs=[];
   editor.blockedLinks=[];
   editor.secretRooms=[];
   editor.selectedId=null;
   editor.selectedLinkKey=null;
   editor.connectFrom=null;
+  editor.stairFrom=null;
+  editor.stairTargetFloor=null;
+  editor.stairDraftSnapshot=null;
+  editor.stairError='';
+  editor.tool='select';
   editor.drag=null;
   editor.nextId=1;
+  editor.nextStairId=1;
   editor.floorCount=requestedFloorCount; editor.currentFloor=0;
   normalizeFloorRoomCounts(requestedFloorCount);
   normalizeFloorTuning(requestedFloorCount);
@@ -4365,6 +4513,21 @@ function normalizeLinkBends(l, da=linkDoorPoint(l,'a'), db=linkDoorPoint(l,'b'))
   l.bends=route.slice(1,-1).map(point=>({x:point.x,y:point.y}));
   return [da,...l.bends,db];
 }
+function stairRotationHandle(stair){
+  if(!stair?.lower || !stair?.upper) return null;
+  const segmentStart=stair.turn || stair.lower;
+  const dx=stair.upper.x-segmentStart.x, dy=stair.upper.y-segmentStart.y, length=Math.max(1,Math.hypot(dx,dy));
+  const perpendicular={x:-dy/length,y:dx/length};
+  const corner={x:stair.upper.x+perpendicular.x*(stair.width||2)/2,y:stair.upper.y+perpendicular.y*(stair.width||2)/2};
+  const distance=Math.max(1.8,(stair.width||2)/2+1.4);
+  const points=[stair.lower,stair.turn,stair.upper].filter(Boolean);
+  return {
+    point:{x:stair.upper.x+perpendicular.x*distance,y:stair.upper.y+perpendicular.y*distance},
+    corner,
+    center:{x:(Math.min(...points.map(point=>point.x))+Math.max(...points.map(point=>point.x)))/2,
+      y:(Math.min(...points.map(point=>point.y))+Math.max(...points.map(point=>point.y)))/2}
+  };
+}
 function editorLinkHandleAt(p){
   /* handles are only drawn for the selected link, so only that link's handles
      are clickable — a first click on any route selects it / drags the segment,
@@ -4373,6 +4536,13 @@ function editorLinkHandleAt(p){
   const l = editor.links.find(q=>editorLinkKey(q.a,q.b)===editor.selectedLinkKey);
   if(!l) return null;
   const tol=Math.max(1.4, 9/editor.scale);
+  if(l.stair){
+    const rotation=stairRotationHandle(l.stair);
+    if(rotation){
+      const d=Math.hypot(p.x-rotation.point.x,p.y-rotation.point.y);
+      if(d<=Math.max(tol,12/editor.scale)) return {kind:'stairRotate',link:l,point:rotation.point,center:rotation.center,d};
+    }
+  }
   let best=null;
   for(const h of linkHandles(l)){
     const d=Math.hypot(p.x-h.point.x, p.y-h.point.y);
@@ -4412,7 +4582,7 @@ function editorLinkAt(p){
     const af=A.floor||0, bf=B.floor||0;
     if(af!==bf){
       if((af!==editor.currentFloor && bf!==editor.currentFloor) || !l.stair) continue;
-      const hit=hitRouteSegment(p,[l.stair.lower,l.stair.upper],Math.max(l.stair.width/2,8/editor.scale));
+      const hit=hitRouteSegment(p,[l.stair.lower,l.stair.turn,l.stair.upper].filter(Boolean),Math.max(l.stair.width/2,8/editor.scale));
       if(hit && (!best || hit.d<best.hit.d)) best={link:l,hit,stair:true};
       continue;
     }
@@ -4523,6 +4693,331 @@ function moveLinkRouteSegment(l, seg, startPts, delta, snapTargets){
   l.manual=true;
   const route=simplifyRoutePoints(inner);
   l.bends = route.slice(1,-1).map(p=>({x:editorSnap(p.x), y:editorSnap(p.y)}));
+}
+function editorStairForLink(link){
+  if(!link) return null;
+  return editor.stairs.find(stair=>stair.id===link.stairId)
+    || editor.stairs.find(stair=>editorLinkKey(stair.fromRoomId,stair.toRoomId)===editorLinkKey(link.a,link.b)) || null;
+}
+function ensureEditorStairForLink(link){
+  let stair=editorStairForLink(link);
+  if(stair){ link.stairId=stair.id; return stair; }
+  const roomA=editorRoom(link.a), roomB=editorRoom(link.b);
+  if(!roomA || !roomB || Math.abs((roomA.floor||0)-(roomB.floor||0))!==1) return null;
+  const lower=(roomA.floor||0)<(roomB.floor||0)?roomA:roomB, upper=lower===roomA?roomB:roomA;
+  stair={id:'stair-'+editor.nextStairId++,fromRoomId:lower.id,toRoomId:upper.id,fromFloor:lower.floor||0,toFloor:upper.floor||0,
+    mode:'stable-auto',anchor:null,direction:null,width:2,length:null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:false,invalid:false,error:''};
+  editor.stairs.push(stair); link.stairId=stair.id; link.kind='stairs';
+  return stair;
+}
+function reconcileEditorStairs(){
+  const active=new Set();
+  for(const link of editor.links){
+    const a=editorRoom(link.a), b=editorRoom(link.b);
+    if(!a || !b) continue;
+    const difference=Math.abs((a.floor||0)-(b.floor||0));
+    if(difference===1){
+      const stair=ensureEditorStairForLink(link);
+      if(stair){
+        const lower=(a.floor||0)<(b.floor||0)?a:b, upper=lower===a?b:a;
+        stair.fromRoomId=lower.id; stair.toRoomId=upper.id; stair.fromFloor=lower.floor||0; stair.toFloor=upper.floor||0;
+        active.add(stair.id);
+      }
+    } else if(link.stairId){
+      delete link.stairId; delete link.stair; link.kind='corridor';
+    }
+  }
+  editor.stairs=editor.stairs.filter(stair=>active.has(stair.id) || stair.pending);
+}
+function selectedEditorStair(){
+  const link=editor.selectedLinkKey ? editor.links.find(item=>editorLinkKey(item.a,item.b)===editor.selectedLinkKey) : null;
+  return editorStairForLink(link);
+}
+function captureAttachedStairPlacements(roomId){
+  const snapshots=[];
+  for(const link of editor.links){
+    if(link.a!==roomId && link.b!==roomId) continue;
+    const stair=editorStairForLink(link);
+    if(!stair) continue;
+    snapshots.push({
+      link,
+      stair,
+      stairStart:{
+        anchor:stair.anchor?{...stair.anchor}:null,
+        previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null
+      },
+       visualStart:link.stair?{
+         ...link.stair,
+         lower:{...link.stair.lower}, turn:link.stair.turn?{...link.stair.turn}:null, upper:{...link.stair.upper},
+        lowerApproach:{...link.stair.lowerApproach}, upperApproach:{...link.stair.upperApproach}
+      }:null
+    });
+  }
+  return snapshots;
+}
+function moveAttachedStairPlacements(snapshots,delta){
+  for(const snapshot of snapshots || []){
+    const moved=translateStairPlacement(snapshot.stairStart,snapshot.visualStart,delta);
+    if(moved.anchor) snapshot.stair.anchor=moved.anchor;
+    if(moved.previewAnchor) snapshot.stair.previewAnchor=moved.previewAnchor;
+    if(moved.visual) snapshot.link.stair=moved.visual;
+    snapshot.stair.invalid=false;
+    snapshot.stair.error='';
+    pendingFloorEdits.add(snapshot.stair.fromFloor||0);
+    pendingFloorEdits.add(snapshot.stair.toFloor||0);
+  }
+  if((snapshots || []).length) editor.stairError='';
+}
+function stairSpecForGenerator(link){
+  const stair=editorStairForLink(link);
+  if(!stair) return null;
+  return {
+    id:stair.id,
+    mode:stair.mode || 'stable-auto',
+    anchor:stair.pending && !stair.manualPreview ? null : (stair.pending ? {...stair.previewAnchor} : (stair.anchor ? {...stair.anchor} : null)),
+    direction:stair.pending && !stair.manualPreview ? null : (stair.pending ? stair.previewDirection : stair.direction),
+    width:stair.width || 2,
+    length:stair.length || undefined,
+    landingDepth:stair.landingDepth || 2,
+    candidateIndex:stair.candidateIndex || 0
+  };
+}
+function cancelAddStair({returnToSource=false}={}){
+  const source=editorRoom(editor.stairFrom);
+  const snapshot=editor.stairDraftSnapshot;
+  if(snapshot){
+    editor.stairDraftSnapshot=null;
+    restoreEditorState(snapshot);
+    syncStairToolUI();
+    drawEditor();
+    forgeFromEditor(false);
+    return;
+  }
+  editor.stairFrom=null;
+  editor.stairTargetFloor=null;
+  editor.stairError='';
+  editor.tool='select';
+  editor.drag=null;
+  syncStairToolUI();
+  if(returnToSource && source && (source.floor||0)!==editor.currentFloor) setEditorFloor(source.floor||0);
+  else drawEditor();
+}
+function openEditorPrompt({eyebrow='楼梯匹配',title,message,fromFloor,toFloor,hint='将自动创建匹配结构，然后进入楼梯预览。',confirmLabel='确认',cancelLabel='取消',notice=false}){
+  const dialog=el.editorPromptDialog;
+  if(!dialog) return Promise.resolve(false);
+  if(dialog.open) dialog.close('cancel');
+  el.editorPromptEyebrow.textContent=eyebrow;
+  el.editorPromptTitle.textContent=title;
+  el.editorPromptMessage.textContent=message;
+  el.editorPromptFromFloor.parentElement.hidden=notice;
+  el.editorPromptFromFloor.innerHTML=`第 ${fromFloor+1} 层<small>当前层</small>`;
+  el.editorPromptToFloor.innerHTML=`第 ${toFloor+1} 层<small>目标层</small>`;
+  el.editorPromptHint.textContent=hint;
+  el.editorPromptCancel.hidden=notice;
+  el.editorPromptCancel.textContent=cancelLabel;
+  el.editorPromptConfirm.textContent=confirmLabel;
+  dialog.returnValue='cancel';
+  dialog.showModal();
+  requestAnimationFrame(()=>el.editorPromptConfirm.focus());
+  return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true}));
+}
+async function beginAddStair(source=null,preferredDelta=1){
+  if(editor.floorCount<2){ alert('至少需要两层才能添加楼梯。'); return false; }
+  const room=source || editorRoom(editor.selectedId);
+  if(!room || (room.floor||0)!==editor.currentFloor){
+    editor.stairFrom=null;
+    editor.stairTargetFloor=null;
+    editor.tool='stair-source';
+    editor.selectedId=null;
+    editor.selectedLinkKey=null;
+    hideEditorMenu();
+    syncStairToolUI();
+    drawEditor();
+    return true;
+  }
+  const targetFloor=chooseStairTargetFloor(room.floor||0,editor.floorCount,preferredDelta);
+  if(targetFloor===null){ alert('当前区域没有可连接的相邻楼层。'); return false; }
+  const sourceFloorSnapshot=captureEditorState();
+  editor.stairFrom=room.id;
+  editor.stairTargetFloor=targetFloor;
+  editor.tool='stair-source';
+  editor.selectedId=room.id;
+  editor.selectedLinkKey=null;
+  editor.connectFrom=null;
+  hideEditorMenu();
+  syncStairToolUI();
+  const matches=matchingStairRooms(room,editor.rooms,targetFloor).filter(target=>{
+    const link=editor.links.find(item=>editorLinkKey(item.a,item.b)===editorLinkKey(room.id,target.id));
+    return !link || !editorStairForLink(link);
+  });
+  if(matches.length){
+    completeAddStair(matches[0],{draftSnapshot:sourceFloorSnapshot});
+    return true;
+  }
+  const createMatchedRooms=!matches.length && await openEditorPrompt({
+    title:'创建匹配楼梯间？',
+    message:'目标楼层没有与当前区域重叠、可用于楼梯井的房间。',
+    fromFloor:room.floor||0,
+    toFloor:targetFloor,
+    hint:'将自动在上下层创建一对重叠楼梯间，然后进入楼梯预览。',
+    confirmLabel:'创建并预览',
+    cancelLabel:'暂不创建'
+  });
+  if(createMatchedRooms){
+    const placement=pairedStairRoomPlacement(room,editor.rooms,targetFloor);
+    if(!placement){
+      await openEditorPrompt({
+        eyebrow:'楼梯匹配失败',title:'附近没有足够空间',
+        message:'上下层附近没有足够的共享空间创建成对楼梯间。',
+        fromFloor:room.floor||0,toFloor:targetFloor,
+        hint:'请移动房间或清理附近结构后重新添加楼梯。',confirmLabel:'知道了',notice:true
+      });
+      editor.stairFrom=null; editor.stairTargetFloor=null; editor.tool='select'; editor.selectedId=room.id;
+      syncStairToolUI(); drawEditor();
+      return true;
+    }
+    const pairId='stair-room-pair-'+editor.nextStairId;
+    const sourceStairRoom={id:editor.nextId++,x:placement.x,y:placement.y,w:placement.w,h:placement.h,
+      floor:room.floor||0,shape:'rect',locked:true,roleHint:null,roomGroupId:room.roomGroupId || null,stairRoom:true,stairRoomPairId:pairId};
+    const targetStairRoom={id:editor.nextId++,x:placement.x,y:placement.y,w:placement.w,h:placement.h,
+      floor:targetFloor,shape:'rect',locked:true,roleHint:null,roomGroupId:room.roomGroupId || null,stairRoom:true,stairRoomPairId:pairId};
+    editor.rooms.push(sourceStairRoom,targetStairRoom);
+    editor.links.push({a:room.id,b:sourceStairRoom.id,bends:[],width:2,manual:true,generated:false,kind:'corridor'});
+    editor.stairFrom=sourceStairRoom.id;
+    editor.stairTargetFloor=targetFloor;
+    roomCountsByFloor[room.floor||0]=editor.rooms.filter(item=>(item.floor||0)===(room.floor||0)).length;
+    roomCountsByFloor[targetFloor]=editor.rooms.filter(item=>(item.floor||0)===targetFloor).length;
+    pendingFloorEdits.add(room.floor||0);
+    pendingFloorEdits.add(targetFloor);
+    updateFloorUI();
+    completeAddStair(targetStairRoom,{draftSnapshot:sourceFloorSnapshot});
+  } else if(!matches.length) {
+    editor.stairFrom=null;
+    editor.stairTargetFloor=null;
+    editor.tool='select';
+    editor.selectedId=room.id;
+    syncStairToolUI();
+    drawEditor();
+  }
+  return true;
+}
+function completeAddStair(target,{draftSnapshot=null}={}){
+  const source=editorRoom(editor.stairFrom);
+  const error=stairPairError(source,target);
+  if(error){ alert(error); return false; }
+  if((target.floor||0)!==editor.stairTargetFloor){
+    alert('请在目标相邻楼层选择楼梯终点区域。');
+    return false;
+  }
+  const key=editorLinkKey(source.id,target.id);
+  const existing=editor.links.find(link=>editorLinkKey(link.a,link.b)===key);
+  if(existing){
+    editor.stairFrom=null; editor.stairTargetFloor=null; editor.tool='select'; editor.stairError='';
+    editor.selectedId=null; editor.selectedLinkKey=key;
+    syncStairToolUI(); drawEditor();
+    return true;
+  }
+  editor.stairDraftSnapshot=draftSnapshot || captureEditorState();
+  unblockEditorLink(source.id,target.id);
+  const lower=(source.floor||0)<(target.floor||0)?source:target;
+  const upper=lower===source?target:source;
+  const stair={id:'stair-'+editor.nextStairId++,fromRoomId:lower.id,toRoomId:upper.id,fromFloor:lower.floor||0,toFloor:upper.floor||0,
+    mode:'stable-auto',anchor:null,direction:null,width:2,length:null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:true,invalid:false,error:''};
+  editor.stairs.push(stair);
+  const link={a:source.id,b:target.id,bends:[],width:2,manual:true,generated:false,kind:'stairs',stairId:stair.id};
+  editor.links.push(link);
+  editor.stairFrom=null;
+  editor.stairTargetFloor=null;
+  editor.tool='stair-preview';
+  editor.selectedId=null;
+  editor.selectedLinkKey=key;
+  editor.dirty=true;
+  pendingFloorEdits.add(source.floor||0);
+  pendingFloorEdits.add(target.floor||0);
+  syncStairToolUI();
+  drawEditor();
+  forgeFromEditor(false);
+  return true;
+}
+function confirmStairPreview(){
+  const stair=selectedEditorStair();
+  if(!stair || !stair.pending || stair.invalid || !stair.previewAnchor){ return false; }
+  stair.anchor={...stair.previewAnchor};
+  stair.direction=stair.previewDirection;
+  stair.width=stair.previewWidth || stair.width;
+  stair.length=stair.previewLength || stair.length;
+  stair.landingDepth=stair.previewLandingDepth || stair.landingDepth;
+  stair.pending=false;
+  stair.manualPreview=false;
+  stair.invalid=false;
+  stair.error='';
+  editor.stairDraftSnapshot=null;
+  editor.stairError='';
+  editor.tool='select';
+  syncStairToolUI();
+  forgeFromEditor(false);
+  return true;
+}
+function rotateSelectedStair90(){
+  const stair=selectedEditorStair();
+  const link=editor.selectedLinkKey ? editor.links.find(item=>editorLinkKey(item.a,item.b)===editor.selectedLinkKey) : null;
+  const rotated=rotateStairPlacement90(stair,link?.stair);
+  if(!stair || !link || !rotated) return false;
+  const routeSnapshots=captureAdaptiveRoutes();
+  let roomAdapted=false;
+  for(const roomId of new Set([stair.fromRoomId,stair.toRoomId])){
+    const room=editorRoom(roomId);
+    if(!room) continue;
+    const adapted=adaptRoomToRotatedStair(room,stair,rotated);
+    if(!adapted) continue;
+    if(adapted.x!==room.x || adapted.y!==room.y || adapted.w!==room.w || adapted.h!==room.h) roomAdapted=true;
+    Object.assign(room,adapted);
+    pendingFloorEdits.add(room.floor||0);
+  }
+  applyAdaptiveRoutes(routeSnapshots);
+  stair.previewAnchor={...rotated.anchor};
+  stair.previewDirection=rotated.direction;
+  stair.previewLength=rotated.length;
+  stair.mode='locked';
+  stair.manualPreview=!!stair.pending;
+  if(!stair.pending){
+    stair.anchor={...rotated.anchor};
+    stair.direction=rotated.direction;
+    stair.length=rotated.length;
+  }
+  stair.invalid=false;
+  stair.error='';
+  stair.roomAdapted=roomAdapted;
+  editor.stairError='';
+  forgeFromEditor(false);
+  return true;
+}
+function toggleSelectedStairLock(){
+  const stair=selectedEditorStair();
+  if(!stair) return false;
+  stair.mode=stair.mode==='locked'?'stable-auto':'locked';
+  stair.invalid=false; stair.error=''; editor.stairError='';
+  drawEditor();
+  return true;
+}
+function deleteEditorStair(link){
+  const stair=editorStairForLink(link);
+  if(!link || !stair) return false;
+  if(stair.pending){ cancelAddStair(); return true; }
+  const critical=stairRemovalDisconnectsRooms(editor.rooms,editor.links,link);
+  if(critical && !confirm('这是当前结构的关键楼梯。删除后会有区域或楼层无法从入口到达。\n\n仍然删除楼梯吗？')) return false;
+  blockEditorLink(link.a,link.b);
+  editor.links=editor.links.filter(item=>item!==link);
+  editor.stairs=editor.stairs.filter(item=>item!==stair);
+  editor.selectedLinkKey=null;
+  editor.stairError='';
+  editor.dirty=true;
+  pendingFloorEdits.add(stair.fromFloor||0);
+  pendingFloorEdits.add(stair.toFloor||0);
+  markDisconnectedRoomsAsSecret();
+  hideEditorMenu();
+  forgeFromEditor(false);
+  return true;
 }
 function toggleEditorLink(a,b){
   if(!a || !b || a===b) return;
@@ -4746,29 +5241,58 @@ function drawEditorCorridor(g, pts, color, width, selected=false){
   g.stroke();
   g.restore();
 }
-function drawEditorStair(g, stair, selected=false){
+function drawEditorStair(g, stair, selected=false, invalid=false){
   if(!stair || (stair.fromFloor!==editor.currentFloor && stair.toFloor!==editor.currentFloor)) return;
   const a=stair.lower, b=stair.upper, dx=b.x-a.x, dy=b.y-a.y, len=Math.max(1,Math.hypot(dx,dy));
-  const px=-dy/len*(stair.width||2)/2, py=dx/len*(stair.width||2)/2;
-  const corners=[{x:a.x+px,y:a.y+py},{x:b.x+px,y:b.y+py},{x:b.x-px,y:b.y-py},{x:a.x-px,y:a.y-py}].map(p=>editorWorldToCanvas(p.x,p.y));
   const lower=stair.fromFloor===editor.currentFloor;
   g.save();
-  g.fillStyle=lower?'rgba(232,151,63,.24)':'rgba(155,108,240,.20)';
-  g.strokeStyle=selected?'#ffd36a':(lower?'#e8973f':'#b58cff');
+  g.fillStyle=invalid?'rgba(255,72,72,.24)':(lower?'rgba(232,151,63,.24)':'rgba(155,108,240,.20)');
+  g.strokeStyle=invalid?'#ff5f5f':(selected?'#ffd36a':(lower?'#e8973f':'#b58cff'));
   g.lineWidth=selected?2.5:1.6;
   if(!lower) g.setLineDash([6,4]);
-  g.beginPath(); corners.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y)); g.closePath(); g.fill(); g.stroke();
+  const route=[a,stair.turn,b].filter(Boolean);
+  if(stair.turn){
+    const canvasRoute=route.map(point=>editorWorldToCanvas(point.x,point.y));
+    g.lineJoin='round'; g.lineCap='butt';
+    g.strokeStyle=g.fillStyle;
+    g.globalAlpha=.9; g.lineWidth=Math.max(4,(stair.width||2)*editor.scale);
+    g.beginPath(); canvasRoute.forEach((point,index)=>index?g.lineTo(point.x,point.y):g.moveTo(point.x,point.y)); g.stroke();
+    g.globalAlpha=1; g.strokeStyle=invalid?'#ff5f5f':(selected?'#ffd36a':(lower?'#e8973f':'#b58cff')); g.lineWidth=selected?2.5:1.6;
+    g.beginPath(); canvasRoute.forEach((point,index)=>index?g.lineTo(point.x,point.y):g.moveTo(point.x,point.y)); g.stroke();
+  } else {
+    const px=-dy/len*(stair.width||2)/2, py=dx/len*(stair.width||2)/2;
+    const corners=[{x:a.x+px,y:a.y+py},{x:b.x+px,y:b.y+py},{x:b.x-px,y:b.y-py},{x:a.x-px,y:a.y-py}].map(p=>editorWorldToCanvas(p.x,p.y));
+    g.beginPath(); corners.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y)); g.closePath(); g.fill(); g.stroke();
+  }
   g.setLineDash([]);
   const steps=Math.min(12,stair.stepCount||12);
-  for(let i=1;i<steps;i++){
-    const t=i/steps, cx=a.x+dx*t, cy=a.y+dy*t;
-    const p0=editorWorldToCanvas(cx+px,cy+py), p1=editorWorldToCanvas(cx-px,cy-py);
-    g.globalAlpha=.45; g.beginPath(); g.moveTo(p0.x,p0.y); g.lineTo(p1.x,p1.y); g.stroke();
+  const routeLengths=route.slice(0,-1).map((point,index)=>Math.hypot(route[index+1].x-point.x,route[index+1].y-point.y));
+  const totalLength=routeLengths.reduce((sum,value)=>sum+value,0) || 1;
+  for(let segment=0;segment<route.length-1;segment++){
+    const start=route[segment], end=route[segment+1], sx=end.x-start.x, sy=end.y-start.y, segmentLength=Math.max(1,routeLengths[segment]);
+    const segmentSteps=Math.max(2,Math.round(steps*segmentLength/totalLength));
+    const px=-sy/segmentLength*(stair.width||2)/2, py=sx/segmentLength*(stair.width||2)/2;
+    for(let i=1;i<segmentSteps;i++){
+      const t=i/segmentSteps, cx=start.x+sx*t, cy=start.y+sy*t;
+      const p0=editorWorldToCanvas(cx+px,cy+py), p1=editorWorldToCanvas(cx-px,cy-py);
+      g.globalAlpha=.45; g.beginPath(); g.moveTo(p0.x,p0.y); g.lineTo(p1.x,p1.y); g.stroke();
+    }
   }
   g.globalAlpha=1;
   const anchor=editorWorldToCanvas(lower?a.x:b.x,lower?a.y:b.y);
-  g.fillStyle=lower?'#ffd39a':'#d0b6ff'; g.font='12px sans-serif';
-  g.fillText(lower?'上楼 → F'+(stair.toFloor+1):'下楼 → F'+(stair.fromFloor+1),anchor.x+9,anchor.y-8);
+  g.fillStyle=invalid?'#ff9090':(lower?'#ffd39a':'#d0b6ff'); g.font='12px sans-serif';
+  g.fillText((invalid?'冲突 · ':'')+(lower?'上楼 → F'+(stair.toFloor+1):'下楼 → F'+(stair.fromFloor+1)),anchor.x+9,anchor.y-8);
+  if(selected){
+    const rotation=stairRotationHandle(stair);
+    if(rotation){
+      const corner=editorWorldToCanvas(rotation.corner.x,rotation.corner.y), handle=editorWorldToCanvas(rotation.point.x,rotation.point.y);
+      g.strokeStyle=invalid?'#ff7474':'#ffd36a'; g.fillStyle='#121724'; g.lineWidth=1.8; g.setLineDash([3,3]);
+      g.beginPath(); g.moveTo(corner.x,corner.y); g.lineTo(handle.x,handle.y); g.stroke(); g.setLineDash([]);
+      g.beginPath(); g.arc(handle.x,handle.y,7,0,Math.PI*2); g.fill(); g.stroke();
+      g.fillStyle=invalid?'#ff9090':'#ffe3a3'; g.font='11px sans-serif'; g.textAlign='center'; g.textBaseline='middle';
+      g.fillText('↻',handle.x,handle.y+.5); g.textAlign='start'; g.textBaseline='alphabetic';
+    }
+  }
   g.restore();
 }
 function editorLinkRoute(l,A,B){
@@ -4796,6 +5320,18 @@ function drawEditor(){
     g.strokeStyle=delta>0?'rgba(90,143,232,.28)':'rgba(155,108,240,.28)';
     g.fillRect(p.x,p.y,w,h); g.strokeRect(p.x,p.y,w,h); g.restore();
   }
+  if(editor.stairFrom){
+    const source=editorRoom(editor.stairFrom);
+    if(source){
+      const p=editorWorldToCanvas(source.x,source.y);
+      g.save();
+      g.strokeStyle='#ffd36a'; g.fillStyle='rgba(255,211,106,.18)'; g.lineWidth=2; g.setLineDash([5,3]);
+      g.beginPath(); g.arc(p.x,p.y,11,0,Math.PI*2); g.fill(); g.stroke(); g.setLineDash([]);
+      g.fillStyle='#ffdca0'; g.font='12px sans-serif';
+      g.fillText('F'+((source.floor||0)+1)+' 楼梯起点',p.x+15,p.y-10);
+      g.restore();
+    }
+  }
   if(editor.links.length){
     for(const l of editor.links){
       const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) continue;
@@ -4803,7 +5339,14 @@ function drawEditor(){
       if(af===bf || (af!==editor.currentFloor && bf!==editor.currentFloor)) continue;
       const here=af===editor.currentFloor?A:B, other=here===A?B:A;
       const key=editorLinkKey(l.a,l.b);
-      if(l.stair) drawEditorStair(g,l.stair,key===editor.selectedLinkKey);
+      const stairModel=editorStairForLink(l);
+      if(l.stair) drawEditorStair(g,l.stair,key===editor.selectedLinkKey,!!stairModel?.invalid);
+      else if(stairModel){
+        const a=editorWorldToCanvas(here.x,here.y), b=editorWorldToCanvas(other.x,other.y);
+        g.save(); g.strokeStyle=stairModel.invalid?'#ff5f5f':'#ffd36a'; g.fillStyle='rgba(255,72,72,.16)'; g.lineWidth=3; g.setLineDash([7,5]);
+        g.beginPath(); g.moveTo(a.x,a.y); g.lineTo(b.x,b.y); g.stroke();
+        g.beginPath(); g.arc(a.x,a.y,8,0,Math.PI*2); g.fill(); g.stroke(); g.restore();
+      }
       const door=editorDoorPoint(here,other), p=editorWorldToCanvas(door.x,door.y);
       const up=(other.floor||0)>editor.currentFloor;
       g.fillStyle=up?'#5a8fe8':'#9b6cf0'; g.strokeStyle='#10131c'; g.lineWidth=2;
@@ -4880,9 +5423,17 @@ function drawEditor(){
     : 0;
   let status = currentFloorRooms.length + ' 区域 · ' + currentFloorLinks.length + ' 条路径';
   if(link) status = '已选路径 · ' + (link.manual?'手动':'生成') + ' · ' + (Array.isArray(link.bends)?link.bends.length:0) + ' 个转折点';
+  const selectedStair=editorStairForLink(link);
+  if(selectedStair) status='已选楼梯 · '+(selectedStair.mode==='locked'?'已锁定':'稳定自动')+(selectedStair.invalid?' · 冲突':'');
   if(selected) status = (selected.locked?'已选锁定':'已选可动') + ' · 区域#' + (si+1);
   if(floatingCount) status = '有 ' + floatingCount + ' 个悬浮区域 · 可作为密室';
+  if(editor.tool==='stair-source') status='添加楼梯 · 请选择要放置楼梯的房间';
+  if(editor.tool==='stair-preview'){
+    const stair=selectedEditorStair();
+    status=stair?.invalid ? '楼梯位置冲突 · 请旋转或取消' : '房间内楼梯预览 · 可旋转 90° 或确认';
+  } else if(editor.stairError) status='楼梯冲突 · '+editor.stairError;
    el.editorStatus.textContent = 'F'+(editor.currentFloor+1)+' · ' + status;
+   syncStairToolUI();
    updateFloorUI();
   syncRoomInspector();
   updateSceneSelection();
@@ -4936,7 +5487,8 @@ function syncEditorFromDungeon(d, keepManual=false){
   const offset=dungeonEditorOffset(d);
   editor.floorCount = Math.max(1, d.floorCount || 1); editor.currentFloor = Math.min(editor.currentFloor, editor.floorCount-1);
   editor.rooms = d.rooms.map((r,i)=>({ id:i+1, x:Math.round(r.cx-offset.x), y:Math.round(r.cy-offset.y),
-     w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:false, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null), roomGroupId:r.roomGroupId || null }));
+     w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:!!r.locked, roleHint:r.type===TYPE.ENTRANCE?'entrance':(r.type===TYPE.BOSS?'boss':null), roomGroupId:r.roomGroupId || null,
+     stairRoom:!!r.stairRoom, stairRoomPairId:r.stairRoomPairId || null }));
   if(!keepManual) editor.links = d.edges.map(e=>({a:e.a+1,b:e.b+1,bends:[],width:2,generated:true}));
   editor.nextId = editor.rooms.length + 1;
 }
@@ -4952,13 +5504,15 @@ function syncEditorGeneratedRooms(d){
     if(source < 0) continue;
     let er = editor.rooms[source];
     if(!er){
-      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:false, roleHint:null, roomGroupId:r.roomGroupId || null };
+      er = { id:editor.nextId++, x:0, y:0, w:r.w, h:r.h, shape:'rect', floor:r.floor||0, locked:!!r.locked, roleHint:null, roomGroupId:r.roomGroupId || null,
+        stairRoom:!!r.stairRoom, stairRoomPairId:r.stairRoomPairId || null };
       editor.rooms[source] = er;
     }
     er.x = Math.round(r.cx-offset.x);
     er.y = Math.round(r.cy-offset.y);
     er.w = r.w; er.h = r.h; er.shape = 'rect'; er.floor = r.floor||0;
     er.roomGroupId = r.roomGroupId || null;
+    er.stairRoom=!!r.stairRoom; er.stairRoomPairId=r.stairRoomPairId || null;
     if(r.type===TYPE.ENTRANCE && !editor.rooms.some(q=>q!==er && q && q.roleHint==='entrance')) er.roleHint = 'entrance';
     if(r.type===TYPE.BOSS && !editor.rooms.some(q=>q!==er && q && q.roleHint==='boss')) er.roleHint = 'boss';
   }
@@ -5013,6 +5567,39 @@ function clipRouteToRooms(pts, A, B){
   out=trim(out.slice().reverse(), B).reverse();
   return simplifyRoutePoints(out);
 }
+function syncEditorStairFromConnector(link,connector,offset){
+  if(!link || !connector) return null;
+  let stair=editorStairForLink(link);
+  if(!stair){
+    stair={id:'stair-'+editor.nextStairId++,pending:false,invalid:false,error:'',mode:'stable-auto'};
+    editor.stairs.push(stair);
+  }
+  link.stairId=stair.id;
+  const roomA=editorRoom(link.a), roomB=editorRoom(link.b);
+  const lower=(roomA?.floor||0)<(roomB?.floor||0)?roomA:roomB;
+  const upper=lower===roomA?roomB:roomA;
+  stair.fromRoomId=lower?.id ?? link.a;
+  stair.toRoomId=upper?.id ?? link.b;
+  stair.fromFloor=connector.fromFloor;
+  stair.toFloor=connector.toFloor;
+  stair.previewAnchor={x:connector.lower.x-offset.x,y:connector.lower.y-offset.y};
+  stair.previewDirection=connector.direction;
+  stair.previewWidth=connector.width;
+  stair.previewLength=connector.length;
+  stair.previewLandingDepth=connector.landingDepth;
+  stair.candidateIndex=connector.candidateIndex || 0;
+  stair.candidateCount=connector.candidateCount || 1;
+  stair.invalid=false;
+  stair.error='';
+  if(!stair.pending && !stair.anchor){
+    stair.anchor={...stair.previewAnchor};
+    stair.direction=stair.previewDirection;
+    stair.width=stair.previewWidth;
+    stair.length=stair.previewLength;
+    stair.landingDepth=stair.previewLandingDepth;
+  }
+  return stair;
+}
 function syncEditorLinksFromDungeon(d){
   if(!d) return;
   const offset=dungeonEditorOffset(d);
@@ -5031,15 +5618,20 @@ function syncEditorLinksFromDungeon(d){
     const nl = prev ? {...prev, a:ea.id, b:eb.id, kind:e.kind, connectorId:e.connectorId, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, kind:e.kind, connectorId:e.connectorId, generated:true};
     const connector=e.kind==='stairs' ? d.connectors?.find(c=>c.id===e.connectorId) : null;
     nl.stair=connector ? {
-      fromFloor:connector.fromFloor, toFloor:connector.toFloor,
-      lower:{x:connector.lower.x-offset.x,y:connector.lower.y-offset.y},
-      upper:{x:connector.upper.x-offset.x,y:connector.upper.y-offset.y},
+       fromFloor:connector.fromFloor, toFloor:connector.toFloor,
+       lower:{x:connector.lower.x-offset.x,y:connector.lower.y-offset.y},
+       turn:connector.turn?{x:connector.turn.x-offset.x,y:connector.turn.y-offset.y}:null,
+       upper:{x:connector.upper.x-offset.x,y:connector.upper.y-offset.y},
       lowerApproach:{x:connector.lowerApproach.x-offset.x,y:connector.lowerApproach.y-offset.y},
       upperApproach:{x:connector.upperApproach.x-offset.x,y:connector.upperApproach.y-offset.y},
-      direction:connector.direction, directionVector:{...connector.directionVector},
-      width:connector.width, length:connector.length, stepCount:connector.stepCount,
-      landingDepth:connector.landingDepth
+       direction:connector.direction, directionVector:{...connector.directionVector},
+       secondDirection:connector.secondDirection, secondDirectionVector:connector.secondDirectionVector?{...connector.secondDirectionVector}:null,
+       width:connector.width, length:connector.length, stepCount:connector.stepCount,
+       firstRun:connector.firstRun, secondRun:connector.secondRun,
+       firstFlightSteps:connector.firstFlightSteps, secondFlightSteps:connector.secondFlightSteps,
+       landingDepth:connector.landingDepth
     } : null;
+    if(connector) syncEditorStairFromConnector(nl,connector,offset);
     /* remember the carved corridor's actual centerline (clipped to the room
        rects, in editor coords) so the preview matches the generated geometry
        instead of re-guessing doors and elbows */
@@ -5051,12 +5643,20 @@ function syncEditorLinksFromDungeon(d){
   }
   for(const l of old.values()) if(l.manual && !blocked.has(editorLinkKey(l.a,l.b))){ l.autoRoute=null; l.autoWidth=null; next.push(l); }
   editor.links = next;
+  const activeStairIds=new Set(next.filter(link=>link.stairId).map(link=>link.stairId));
+  editor.stairs=editor.stairs.filter(stair=>activeStairIds.has(stair.id));
   if(editor.selectedLinkKey && !editor.links.some(l=>editorLinkKey(l.a,l.b)===editor.selectedLinkKey)) editor.selectedLinkKey=null;
 }
 function deleteSelectedEditorRoom(){
   if(editor.selectedId===null) return false;
-  editor.links=editor.links.filter(l=>l.a!==editor.selectedId && l.b!==editor.selectedId);
-  editor.rooms=editor.rooms.filter(r=>r.id!==editor.selectedId);
+  const selected=editorRoom(editor.selectedId);
+  const removedIds=new Set([editor.selectedId]);
+  if(selected?.stairRoomPairId) for(const room of editor.rooms){
+    if(room.stairRoomPairId===selected.stairRoomPairId) removedIds.add(room.id);
+  }
+  editor.links=editor.links.filter(l=>!removedIds.has(l.a) && !removedIds.has(l.b));
+  editor.rooms=editor.rooms.filter(r=>!removedIds.has(r.id));
+  reconcileEditorStairs();
   editor.selectedId=null; editor.connectFrom=null; editor.selectedLinkKey=null;
   hideEditorMenu(); editorRequestForge();
   return true;
@@ -5081,6 +5681,7 @@ function moveEditorRoomFloor(room,delta){
     link.bends=[];
     link.autoRoute=null;
   }
+  reconcileEditorStairs();
   editor.currentFloor=target;
   hideEditorMenu();
   editorRequestForge();
@@ -5095,23 +5696,35 @@ function showEditorMenu(e, h){
   drawEditor();
   el.editorMenu._ctx={kind:'room', room:h.room};
   el.editorMenu.querySelectorAll('button').forEach(btn=>{ btn.style.display = btn.dataset.menu==='room' ? 'block' : 'none'; });
+  const addStairButton=el.editorMenu.querySelector('[data-action="add-stair"]');
+  if(addStairButton){
+    const targetFloor=chooseStairTargetFloor(h.room.floor||0,editor.floorCount,1);
+    addStairButton.disabled=targetFloor===null;
+    addStairButton.textContent=targetFloor===null ? '至少需要两层' : `添加楼梯至第 ${targetFloor+1} 层`;
+  }
   const assignButton=el.editorMenu.querySelector('[data-action="assign-room-group"]');
   if(assignButton){ const group=roomGroupById(h.room.roomGroupId); assignButton.textContent=group ? '房间组：'+group.name+'…' : '赋予房间组…'; }
-  el.editorMenu.style.left = Math.min(e.clientX, innerWidth - 170) + 'px';
-  el.editorMenu.style.top = Math.min(e.clientY, innerHeight - 190) + 'px';
   el.editorMenu.classList.add('on');
+  const menuHeight=el.editorMenu.getBoundingClientRect().height;
+  el.editorMenu.style.left = Math.min(e.clientX, innerWidth - 170) + 'px';
+  el.editorMenu.style.top = Math.max(8,Math.min(e.clientY, innerHeight-menuHeight-8)) + 'px';
 }
 function showEditorLinkMenu(e, kind, ctx){
   if(!el.editorMenu || !ctx || !ctx.link) return;
   editor.selectedId=null;
   editor.selectedLinkKey=editorLinkKey(ctx.link.a, ctx.link.b);
-  editor.tool='select';
+  if(!(kind==='stair' && editor.tool==='stair-preview')) editor.tool='select';
   drawEditor();
   el.editorMenu._ctx={kind, ...ctx};
   el.editorMenu.querySelectorAll('button').forEach(btn=>{
     const menu=btn.dataset.menu;
     btn.style.display = (menu===kind || (kind==='link' && menu==='link')) ? 'block' : 'none';
   });
+  if(kind==='stair'){
+    const stair=editorStairForLink(ctx.link);
+    const lockButton=el.editorMenu.querySelector('[data-action="toggle-stair-lock"]');
+    if(lockButton) lockButton.textContent=stair?.mode==='locked'?'切换为稳定自动':'锁定楼梯位置';
+  }
   el.editorMenu.style.left = Math.min(e.clientX, innerWidth - 170) + 'px';
   el.editorMenu.style.top = Math.min(e.clientY, innerHeight - 190) + 'px';
   el.editorMenu.classList.add('on');
@@ -5197,6 +5810,13 @@ function initEditor(){
   if(el.editorFullscreen) el.editorFullscreen.addEventListener('click', toggleEditorFullscreen);
   if(el.editorExit) el.editorExit.addEventListener('click', exitEditMode);
   if(el.editModeBtn) el.editModeBtn.addEventListener('click', enterEditMode);
+  if(el.editorAddStair) el.editorAddStair.addEventListener('click',()=>{
+    if(stairToolActive()) cancelAddStair({returnToSource:true});
+    else beginAddStair();
+  });
+  if(el.editorStairCycle) el.editorStairCycle.addEventListener('click',rotateSelectedStair90);
+  if(el.editorStairConfirm) el.editorStairConfirm.addEventListener('click',confirmStairPreview);
+  if(el.editorStairCancel) el.editorStairCancel.addEventListener('click',()=>cancelAddStair());
   document.querySelectorAll('[data-editor-resize]').forEach(h=>h.addEventListener('pointerdown', startEditorResize));
   if(el.editorMenu){
     el.editorMenu.addEventListener('click', e=>{
@@ -5215,13 +5835,24 @@ function initEditor(){
         }
       }
        else if(action==='delete') deleteSelectedEditorRoom();
-       else if(action==='move-floor-up') moveEditorRoomFloor(editorRoom(editor.selectedId),1);
-       else if(action==='move-floor-down') moveEditorRoomFloor(editorRoom(editor.selectedId),-1);
+      else if(action==='move-floor-up') moveEditorRoomFloor(editorRoom(editor.selectedId),1);
+      else if(action==='move-floor-down') moveEditorRoomFloor(editorRoom(editor.selectedId),-1);
+      else if(action==='add-stair'){
+        const room=ctx && ctx.room;
+        hideEditorMenu();
+        if(room) beginAddStair(room);
+      }
       else if(action==='lock'){ const r=editorRoom(editor.selectedId); if(r){ r.locked=!r.locked; hideEditorMenu(); editorRequestForge(); } }
       else if(action==='connect'){
         const r=ctx && ctx.room;
         if(r){
-          if(editor.connectFrom && editor.connectFrom!==r.id){ toggleEditorLink(editor.connectFrom, r.id); editor.connectFrom=null; hideEditorMenu(); editorRequestForge(); }
+          if(editor.connectFrom && editor.connectFrom!==r.id){
+            const source=editorRoom(editor.connectFrom), crossFloor=source && Math.abs((source.floor||0)-(r.floor||0))===1;
+            if(crossFloor){
+              editor.connectFrom=null; hideEditorMenu();
+              alert('跨层连接请使用顶部“＋ 楼梯”。选择房间后会直接在房间内部放置楼梯。');
+            } else { toggleEditorLink(editor.connectFrom, r.id); editor.connectFrom=null; hideEditorMenu(); editorRequestForge(); }
+          }
           else { editor.connectFrom=r.id; editor.selectedId=r.id; hideEditorMenu(); drawEditor(); }
         }
       }
@@ -5229,6 +5860,9 @@ function initEditor(){
       else if(action==='boss'){ hideEditorMenu(); setSelectedRole('boss'); }
       else if(action==='secret'){ hideEditorMenu(); setSelectedRole('secret'); }
       else if(action==='assign-room-group'){ hideEditorMenu(); openRoomGroupAssignment(); }
+      else if(ctx && ctx.link && action==='rotate-stair'){ hideEditorMenu(); editor.selectedLinkKey=editorLinkKey(ctx.link.a,ctx.link.b); rotateSelectedStair90(); }
+      else if(ctx && ctx.link && action==='toggle-stair-lock'){ hideEditorMenu(); editor.selectedLinkKey=editorLinkKey(ctx.link.a,ctx.link.b); toggleSelectedStairLock(); }
+      else if(ctx && ctx.link && action==='delete-stair'){ deleteEditorStair(ctx.link); }
       else if(ctx && ctx.link && action==='add-bend'){
         if(!Array.isArray(ctx.link.bends)) ctx.link.bends=[];
         const i=Math.min(ctx.link.bends.length, Math.max(0, ctx.hit ? ctx.hit.seg : ctx.link.bends.length));
@@ -5262,10 +5896,12 @@ function initEditor(){
     if((e.code==='Delete' || e.code==='Backspace') && editor.selectedId!==null){ e.preventDefault(); deleteSelectedEditorRoom(); }
     else if((e.code==='Delete' || e.code==='Backspace') && editor.selectedLinkKey){
       const l=editor.links.find(q=>editorLinkKey(q.a,q.b)===editor.selectedLinkKey);
-      if(l && Array.isArray(l.bends) && l.bends.length){ e.preventDefault(); l.bends=[]; drawEditor(); forgeFromEditor(false); }
+      if(l && editorStairForLink(l)){ e.preventDefault(); deleteEditorStair(l); }
+      else if(l && Array.isArray(l.bends) && l.bends.length){ e.preventDefault(); l.bends=[]; drawEditor(); forgeFromEditor(false); }
     }
     if(e.code==='Escape'){
-      if(el.editorMenu && el.editorMenu.classList.contains('on')) hideEditorMenu();
+      if(stairToolActive()){ e.preventDefault(); cancelAddStair({returnToSource:true}); }
+      else if(el.editorMenu && el.editorMenu.classList.contains('on')) hideEditorMenu();
       else if(editState.ortho) exitEditMode();
     }
   });
@@ -5283,12 +5919,18 @@ function initEditor(){
   el.editorMenu._ctx = null;
   el.editorCanvas.addEventListener('contextmenu', e=>{
     e.preventDefault();
+    if(editor.tool==='stair-source'){ cancelAddStair({returnToSource:true}); return; }
     const p=editorPointer(e);
+    if(editor.tool==='stair-preview'){
+      const previewHit=editorLinkAt(p);
+      if(previewHit?.stair) showEditorLinkMenu(e,'stair',{link:previewHit.link,hit:previewHit.hit});
+      return;
+    }
     const handle=editorLinkHandleAt(p);
     const routeHit=editorLinkAt(p);
     const h=editorHit(p);
     if(handle){ showEditorLinkMenu(e, handle.kind, handle); return; }
-    if(routeHit){ showEditorLinkMenu(e, 'link', {link:routeHit.link, hit:routeHit.hit}); return; }
+    if(routeHit){ showEditorLinkMenu(e, routeHit.stair?'stair':'link', {link:routeHit.link, hit:routeHit.hit}); return; }
     if(h) showEditorMenu(e,h); else showEditorBlankMenu(e,p);
   });
   el.editorCanvas.addEventListener('pointerdown', e=>{
@@ -5299,11 +5941,26 @@ function initEditor(){
       return;
     }
     const p=editorPointer(e);
+    if(editor.tool==='stair-source'){
+      const stairHit=editorHit(p);
+      if(stairHit) beginAddStair(stairHit.room);
+      else drawEditor();
+      return;
+    }
     const handle = editorLinkHandleAt(p);
     if(handle){
       const l=handle.link, key=editorLinkKey(l.a,l.b);
       editor.selectedId=null; editor.selectedLinkKey=key;
-      if(handle.kind==='bend') editor.drag={mode:'routeBend', link:l, bendIndex:handle.bendIndex};
+      if(handle.kind==='stairRotate'){
+        const stair=editorStairForLink(l);
+        if(!stair || !l.stair){ editor.drag=null; drawEditor(); return; }
+        const roomStarts=[...new Set([stair.fromRoomId,stair.toRoomId])].map(id=>editorRoom(id)).filter(Boolean).map(room=>({room,start:{...room}}));
+        editor.drag={mode:'stairRotate',link:l,stair,start:p,stairStart:{...stair,
+          anchor:stair.anchor?{...stair.anchor}:null,previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null},
+          visualStart:{...l.stair,lower:{...l.stair.lower},upper:{...l.stair.upper},lowerApproach:{...l.stair.lowerApproach},upperApproach:{...l.stair.upperApproach}},
+          roomStarts,routeSnapshots:captureAdaptiveRoutes(),rotated:null};
+      }
+      else if(handle.kind==='bend') editor.drag={mode:'routeBend', link:l, bendIndex:handle.bendIndex};
       else editor.drag={mode:'routeDoor', link:l, which:handle.which, startRoom:handle.which==='a'?l.a:l.b};
       drawEditor();
       return;
@@ -5312,7 +5969,15 @@ function initEditor(){
     if(routeHit){
       const l=routeHit.link, key=editorLinkKey(l.a,l.b);
       editor.selectedId=null; editor.selectedLinkKey=key;
-      if(routeHit.stair){ editor.drag=null; drawEditor(); return; }
+      if(routeHit.stair){
+        const stair=editorStairForLink(l);
+        if(!stair || !l.stair){ editor.drag=null; drawEditor(); return; }
+         editor.drag={mode:'stairMove',link:l,stair,start:p,stairStart:{
+           lower:{...l.stair.lower},turn:l.stair.turn?{...l.stair.turn}:null,upper:{...l.stair.upper},lowerApproach:{...l.stair.lowerApproach},upperApproach:{...l.stair.upperApproach},
+          anchor:{...(stair.previewAnchor || stair.anchor || l.stair.lower)}
+        },delta:{x:0,y:0}};
+        drawEditor(); return;
+      }
       const pts=ensureEditableRoute(l).map(q=>({x:q.x,y:q.y,side:q.side}));
       const movedPoints=[pts[routeHit.hit.seg],pts[routeHit.hit.seg+1]];
       editor.drag={mode:'routeSegment', link:l, seg:routeHit.hit.seg, start:p, routeStart:pts,
@@ -5320,6 +5985,7 @@ function initEditor(){
       drawEditor();
       return;
     }
+    if(editor.tool==='stair-preview'){ editor.drag=null; drawEditor(); return; }
     const h=editorHit(p);
     if(!h){
       editor.selectedId = null;
@@ -5329,7 +5995,9 @@ function initEditor(){
     } else {
       editor.selectedId = h.room.id;
       editor.selectedLinkKey = null;
-      editor.drag = {mode:h.mode || 'move', room:h.room, start:p, roomStart:{...h.room}, routeSnapshots:captureAdaptiveRoutes(h.room.id)};
+      const pairedRoom=h.room.stairRoomPairId ? editor.rooms.find(item=>item!==h.room && item.stairRoomPairId===h.room.stairRoomPairId) : null;
+      editor.drag = {mode:h.mode || 'move', room:h.room, start:p, roomStart:{...h.room}, pairedRoom,
+        pairedRoomStart:pairedRoom?{...pairedRoom}:null, routeSnapshots:captureAdaptiveRoutes(pairedRoom?null:h.room.id), stairPlacements:captureAttachedStairPlacements(h.room.id)};
       drawEditor();
     }
   });
@@ -5338,6 +6006,36 @@ function initEditor(){
     e.preventDefault(); const p=editorPointer(e);
     if(editor.drag.mode==='pan'){ editor.panX = editor.drag.panX + e.clientX-editor.drag.px; editor.panY = editor.drag.panY + e.clientY-editor.drag.py; drawEditor(); return; }
     if(editor.drag.mode==='draw') editor.drag.draft=editorNormalizeRect(editor.drag.start,p);
+    else if(editor.drag.mode==='stairRotate'){
+      const drag=editor.drag, rotated=stairRotationFromPointer(drag.stairStart,drag.visualStart,p);
+      if(!rotated){ drawEditor(); return; }
+      drag.rotated=rotated;
+      let roomAdapted=false;
+      for(const snapshot of drag.roomStarts){
+        Object.assign(snapshot.room,snapshot.start);
+        const adapted=adaptRoomToRotatedStair(snapshot.start,drag.stair,rotated);
+        if(adapted.x!==snapshot.start.x || adapted.y!==snapshot.start.y || adapted.w!==snapshot.start.w || adapted.h!==snapshot.start.h) roomAdapted=true;
+        Object.assign(snapshot.room,adapted);
+      }
+      drag.link.stair=stairVisualForRotation(drag.visualStart,drag.stair,rotated);
+      drag.stair.previewAnchor={...rotated.anchor};
+      drag.stair.previewDirection=rotated.direction;
+      drag.stair.previewLength=rotated.length;
+      drag.stair.roomAdapted=roomAdapted;
+      drag.stair.invalid=false; drag.stair.error=''; editor.stairError='';
+      drawEditor(); return;
+    }
+    else if(editor.drag.mode==='stairMove'){
+      const drag=editor.drag, dx=editorSnap(p.x-drag.start.x), dy=editorSnap(p.y-drag.start.y), s=drag.stairStart;
+      drag.delta={x:dx,y:dy};
+       drag.link.stair={...drag.link.stair,
+         lower:{x:s.lower.x+dx,y:s.lower.y+dy},turn:s.turn?{x:s.turn.x+dx,y:s.turn.y+dy}:null,upper:{x:s.upper.x+dx,y:s.upper.y+dy},
+        lowerApproach:{x:s.lowerApproach.x+dx,y:s.lowerApproach.y+dy},upperApproach:{x:s.upperApproach.x+dx,y:s.upperApproach.y+dy}};
+      drag.stair.previewAnchor={x:s.anchor.x+dx,y:s.anchor.y+dy};
+      drag.stair.previewDirection=drag.stair.previewDirection || drag.stair.direction || drag.link.stair.direction;
+      drag.stair.invalid=false; drag.stair.error=''; editor.stairError='';
+      drawEditor(); return;
+    }
     else if(editor.drag.mode==='routeBend'){
       const l=editor.drag.link, b=l && l.bends && l.bends[editor.drag.bendIndex];
       if(b){ const sp=snapEditorControlPoint(p,[b]); b.x=sp.x; b.y=sp.y; updateRouteOverlay(); }
@@ -5365,13 +6063,44 @@ function initEditor(){
     else if(editor.drag.mode==='move'){
       const r=editor.drag.room, s=editor.drag.roomStart;
       r.x=editorSnap(s.x + p.x-editor.drag.start.x); r.y=editorSnap(s.y + p.y-editor.drag.start.y);
-    } else editorResizeRoom(editor.drag.room, editor.drag.roomStart, p, editor.drag.mode);
+      if(editor.drag.pairedRoom && editor.drag.pairedRoomStart){
+        editor.drag.pairedRoom.x=editor.drag.pairedRoomStart.x+(r.x-s.x);
+        editor.drag.pairedRoom.y=editor.drag.pairedRoomStart.y+(r.y-s.y);
+      }
+      moveAttachedStairPlacements(editor.drag.stairPlacements,{x:r.x-s.x,y:r.y-s.y});
+    } else {
+      editorResizeRoom(editor.drag.room, editor.drag.roomStart, p, editor.drag.mode);
+      if(editor.drag.pairedRoom){
+        const source=editor.drag.room, paired=editor.drag.pairedRoom;
+        paired.x=source.x; paired.y=source.y; paired.w=source.w; paired.h=source.h;
+      }
+    }
     if(editor.drag.room) applyAdaptiveRoutes(editor.drag.routeSnapshots);
     drawEditor();
   });
   const end = e=>{
     if(!editor.drag) return;
     if(editor.drag.mode==='pan'){ editor.drag=null; drawEditor(); return; }
+    if(editor.drag.mode==='stairRotate'){
+      const {stair,rotated,roomStarts,routeSnapshots}=editor.drag;
+      if(!rotated){ editor.drag=null; drawEditor(); return; }
+      stair.mode='locked'; stair.manualPreview=!!stair.pending;
+      stair.previewAnchor={...rotated.anchor}; stair.previewDirection=rotated.direction; stair.previewLength=rotated.length;
+      if(!stair.pending){ stair.anchor={...rotated.anchor}; stair.direction=rotated.direction; stair.length=rotated.length; }
+      stair.invalid=false; stair.error=''; editor.stairError='';
+      for(const snapshot of roomStarts) pendingFloorEdits.add(snapshot.room.floor||0);
+      applyAdaptiveRoutes(routeSnapshots);
+      editor.drag=null; drawEditor(); forgeFromEditor(false); return;
+    }
+    if(editor.drag.mode==='stairMove'){
+      const {stair,stairStart,delta}=editor.drag;
+      const anchor={x:stairStart.anchor.x+(delta?.x||0),y:stairStart.anchor.y+(delta?.y||0)};
+      stair.mode='locked'; stair.manualPreview=!!stair.pending; stair.previewAnchor=anchor;
+      stair.previewDirection=stair.previewDirection || stair.direction;
+      if(!stair.pending){ stair.anchor={...anchor}; stair.direction=stair.previewDirection; }
+      stair.invalid=false; stair.error=''; editor.stairError='';
+      editor.drag=null; drawEditor(); forgeFromEditor(false); return;
+    }
     if(editor.drag.mode==='routeBend' || editor.drag.mode==='routeDoor' || editor.drag.mode==='routeSegment'){
       const l=editor.drag.link;
       if(editor.drag.mode==='routeDoor'){
@@ -5421,15 +6150,8 @@ function maybeAskSecretRooms(d){
 }
 function generateWithFloorAlignment(params,activeFloor){
   const initial=generateDungeon(params);
-  if(initial.valid || !params.editorEnabled || params.floorCount<=1) return {d:initial,shift:null};
-  const stairRelated=(initial.generationErrors || []).some(error=>/stair|connector|unreachable|楼层|楼梯/i.test(String(error)));
-  if(!stairRelated) return {d:initial,shift:null};
-  for(const shift of FLOOR_ALIGNMENT_OFFSETS){
-    const translated=translateFloorLayout(params.editorRooms,params.editorLinks,activeFloor,shift.x,shift.y);
-    const candidateParams={...params,editorRooms:translated.rooms,editorLinks:translated.links};
-    const candidate=generateDungeon(candidateParams);
-    if(candidate.valid) return {d:candidate,shift,translated};
-  }
+  /* Editing is authoritative: stair conflicts remain visible for the user to
+     resolve. Never translate an entire floor behind their back. */
   return {d:initial,shift:null};
 }
 function forge(animate, useEditorLayout=false){
@@ -5459,7 +6181,7 @@ function forge(animate, useEditorLayout=false){
     roomGroups:roomGroups.map(group=>({...group})),
     editorEnabled:useEditorLayout && editor.dirty,
      editorRooms:(useEditorLayout && editor.dirty) ? editor.rooms.map(r=>({...r, shape:'rect', floor:r.floor||0})) : [],
-    editorLinks:(useEditorLayout && editor.dirty) ? editor.links.map(l=>({...l})) : [],
+    editorLinks:(useEditorLayout && editor.dirty) ? editor.links.map(l=>({...l,stairSpec:stairSpecForGenerator(l)})) : [],
     blockedLinks:(useEditorLayout && editor.dirty) ? [...editor.blockedLinks] : [],
     secretRooms:(useEditorLayout && editor.dirty) ? [...editor.secretRooms] : []
   };
@@ -5468,6 +6190,32 @@ function forge(animate, useEditorLayout=false){
   if(aligned.shift){
     editor.rooms=aligned.translated.rooms;
     editor.links=aligned.translated.links;
+  }
+  const stairFailures=Array.isArray(d.stairFailures)?d.stairFailures:[];
+  const stairFailure=useEditorLayout && !d.valid && editor.stairs.length>0 && stairFailures.length>0;
+  if(stairFailure){
+    const failureByStair=new Map(stairFailures.filter(failure=>failure?.stairId).map(failure=>[failure.stairId,failure]));
+    const reason=stairFailures[0]?.reason || '楼梯位置与其他楼梯或无关房间冲突';
+    if(lastValidEditorState){
+      // Keep the editor overlay and rendered dungeon atomic. A rejected stair
+      // edit must not leave new 2D room frames floating over the previous 3D
+      // scene; restore the complete last generated editor snapshot instead.
+      restoreEditorState(lastValidEditorState);
+      editor.stairError='楼梯修改未提交，已恢复：'+reason;
+      for(const stair of editor.stairs){ stair.invalid=false; stair.error=''; }
+      updateFloorUI();
+    } else {
+      editor.stairError=reason;
+      for(const stair of editor.stairs){
+        const failure=failureByStair.get(stair.id);
+        stair.invalid=!!failure;
+        stair.error=failure?.reason || '';
+      }
+    }
+    pendingFloorEdits.clear();
+    drawEditor();
+    syncStairToolUI();
+    return;
   }
   if(useEditorLayout && !d.valid && lastValidEditorState){
     const reason=(d.generationErrors && d.generationErrors[0]) || '楼层连接无法通过连通性验证';
@@ -5485,7 +6233,8 @@ function forge(animate, useEditorLayout=false){
   syncEditorGeneratedRooms(d);
   applyAdaptiveRoutes(adaptiveRouteSnapshots);
   syncEditorLinksFromDungeon(d);
-  if(d.valid) lastValidEditorState=captureEditorState();
+  editor.stairError='';
+  if(d.valid && editor.tool!=='stair-preview') lastValidEditorState=captureEditorState();
   /* D is null only for the first build. Parameter changes and editor drags
      rebuild geometry while preserving the camera pose. */
   buildScene(d, D === null);
@@ -5514,6 +6263,7 @@ function forge(animate, useEditorLayout=false){
     animating = true; animT = 0;
     for(const k in meshes) meshes[k].userData.settled = false;
     setFxRamp(0);
+    applyReveal(0);
   } else finishAnim();
 }
 
@@ -5524,7 +6274,7 @@ function liveUpdate(time, tt){
     if(!fm || !fm.userData.set.n) continue;
     const fu = fm.userData, s = fu.set;
     for(let i=0;i<s.n;i++){
-      const k = clamp01((tt - s.delay[i]) / fu.dur);
+      const k = instanceRevealProgress(fu,s,i,tt);
       const g = Math.max(0.0001, k>=1 ? 1 : easeOutBack(k)*Math.min(1,k*8));
       const fl = 0.86 + 0.22*Math.sin(time*11 + i*2.7)*Math.sin(time*5.3 + i*1.31);
       _q.set(0,0,0,1);
@@ -5537,7 +6287,7 @@ function liveUpdate(time, tt){
   const cm = meshes.crystal;
   if(cm && cm.userData.set.n){ const cu = cm.userData, s = cu.set;
     for(let i=0;i<s.n;i++){
-      const k = clamp01((tt - s.delay[i]) / cu.dur);
+      const k = instanceRevealProgress(cu,s,i,tt);
       const g = Math.max(0.0001, k>=1 ? 1 : easeOutBack(k)*Math.min(1,k*8));
       _q.setFromAxisAngle(_Y, s.ry[i] + time*0.9);
       _p.set(s.px[i], s.py[i] + 0.08*Math.sin(time*2.1 + i*1.7), s.pz[i]);
@@ -5579,7 +6329,7 @@ function tick(){
     applyReveal(animT);
     if(animT > animEnd + 0.35) finishAnim();
   }
-  liveUpdate(elapsed, animating ? animT - 2.3 : Infinity);
+  liveUpdate(elapsed, animating ? animT : Infinity);
   renderer.info.reset();
   renderFrame();
   fpsFrames++; fpsTime += dt;

@@ -49,6 +49,21 @@ test('advanced display switches stay internal and have no visible UI', async () 
   }
 });
 
+test('build animation is a presentation-only staged reveal', async () => {
+  const [html, main] = await Promise.all([
+    readFile(new URL('index.html', root), 'utf8'),
+    readFile(new URL('src/main.js', root), 'utf8')
+  ]);
+  for (const stage of ['layout', 'graph', 'structure', 'rooms', 'atmosphere']) {
+    assert.match(html, new RegExp(`data-stage=["']${stage}["']`));
+  }
+  assert.match(main, /function createBuildTimeline\(depthSpan\)/);
+  assert.match(main, /function configureRevealSchedules\(sceneMeshes,timeline\)/);
+  assert.match(main, /function instanceRevealProgress\(u, s, i, t\)/);
+  assert.match(main, /function finishAnim\(\)[\s\S]*settleAll\(\)/);
+  assert.doesNotMatch(main, /animT\s*-\s*2\.3/);
+});
+
 test('the main control panel keeps high-frequency controls in compact rows', async () => {
   const styles = await readFile(new URL('src/ui/styles.css', root), 'utf8');
   assert.match(styles, /\.hero-controls\{[^}]*grid-template-columns:minmax\(0,1fr\) 88px/);
@@ -149,7 +164,8 @@ test('room count is stored and generated per floor', async () => {
   assert.match(main, /function resizeEditorFloorRooms\(floor,targetCount\)/);
   assert.match(main, /resizeEditorFloorRooms\(floor,roomCountsByFloor\[floor\]\)/);
   assert.match(main, /function generateWithFloorAlignment\(params,activeFloor\)/);
-  assert.match(main, /translateFloorLayout\(params\.editorRooms,params\.editorLinks,activeFloor/);
+  assert.doesNotMatch(main, /translateFloorLayout\(/);
+  assert.match(main, /Never translate an entire floor behind their back/);
   assert.match(main, /preserveUneditedFloors\(previousDungeon,d,editedFloors\)/);
 });
 
@@ -181,13 +197,108 @@ test('stair visualization consumes the generated landing and opening contract', 
     readFile(new URL('src/main.js', root), 'utf8'),
     readFile(new URL('src/generation/multifloor.js', root), 'utf8')
   ]);
-  for (const field of ['lowerApproach', 'upperApproach', 'stepCount', 'treadDepth', 'landingDepth', 'openingCells', 'clearVolume']) {
+  for (const field of ['lowerApproach', 'upperApproach', 'turn', 'secondDirection', 'firstFlightSteps', 'secondFlightSteps', 'stepCount', 'treadDepth', 'landingDepth', 'openingCells', 'sharedFootprintCells', 'sharedFootprintKind', 'clearVolume']) {
     assert.match(generation, new RegExp(field));
   }
   assert.match(main, /function drawEditorStair/);
   assert.match(main, /connector\.stepCount/);
+  assert.match(main, /if\(connector\.turn\)/);
+  assert.match(main, /\[l\.stair\.lower,l\.stair\.turn,l\.stair\.upper\]/);
   assert.match(main, /slabOpening/);
   assert.match(main, /routeHit\.stair/);
+});
+
+test('the editor places stairs directly in rooms and rotates them by 90 degrees', async () => {
+  const [html, main, styles] = await Promise.all([
+    readFile(new URL('index.html', root), 'utf8'),
+    readFile(new URL('src/main.js', root), 'utf8'),
+    readFile(new URL('src/ui/styles.css', root), 'utf8')
+  ]);
+  assert.match(html, /id="editorAddStair"[^>]*>＋ 楼梯</);
+  assert.match(html, /data-action="add-stair" data-menu="room">添加楼梯</);
+  assert.doesNotMatch(html, /data-action="add-stair-up"|data-action="add-stair-down"/);
+  assert.match(html, /id="editorStairCycle"[^>]*hidden>旋转 90°</);
+  assert.match(html, /data-action="rotate-stair"[^>]*>旋转楼梯 90°</);
+  assert.match(html, /id="editorStairConfirm"/);
+  assert.match(html, /data-action="delete-stair"/);
+  assert.match(main, /editorAddStair:\$\('editorAddStair'\)/);
+  assert.match(main, /async function beginAddStair\(source=null,preferredDelta=1\)/);
+  assert.match(main, /action==='add-stair'/);
+  assert.match(main, /添加楼梯至第 \$\{targetFloor\+1\} 层/);
+  assert.match(main, /function completeAddStair\(target,\{draftSnapshot=null\}=\{\}\)/);
+  assert.match(main, /kind:'stairs',stairId:stair\.id/);
+  assert.match(main, /editor\.stairs\.push\(stair\)/);
+  assert.match(main, /editor\.tool='stair-preview'/);
+  assert.match(main, /function confirmStairPreview\(\)/);
+  assert.match(main, /function rotateSelectedStair90\(\)/);
+  assert.match(main, /rotateStairPlacement90\(stair,link\?\.stair\)/);
+  assert.match(main, /adaptRoomToRotatedStair\(room,stair,rotated\)/);
+  assert.match(main, /applyAdaptiveRoutes\(routeSnapshots\)/);
+  assert.match(main, /function stairRotationHandle\(stair\)/);
+  assert.match(main, /kind:'stairRotate'/);
+  assert.match(main, /mode:'stairRotate'/);
+  assert.match(main, /stairRotationFromPointer\(drag\.stairStart,drag\.visualStart,p\)/);
+  assert.match(main, /stairVisualForRotation\(drag\.visualStart,drag\.stair,rotated\)/);
+  assert.match(main, /g\.fillText\('↻',handle\.x,handle\.y\+\.5\)/);
+  assert.doesNotMatch(main, /function cycleStairCandidate\(\)/);
+  assert.match(main, /if\(stairHit\) beginAddStair\(stairHit\.room\)/);
+  assert.doesNotMatch(main, /editor\.tool==='stair-target'/);
+  assert.match(main, /cancelAddStair\(\{returnToSource:true\}\)/);
+  assert.match(main, /matchingStairRooms\(room,editor\.rooms,targetFloor\)/);
+  assert.match(main, /if\(matches\.length\)\{\s*completeAddStair\(matches\[0\],\{draftSnapshot:sourceFloorSnapshot\}\)/);
+  for (const id of ['editorPromptDialog', 'editorPromptTitle', 'editorPromptMessage', 'editorPromptFromFloor', 'editorPromptToFloor', 'editorPromptConfirm', 'editorPromptCancel']) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+    assert.match(main, new RegExp(`${id}:\\$\\('${id}'\\)`));
+  }
+  assert.match(main, /function openEditorPrompt\(/);
+  assert.match(main, /title:'创建匹配楼梯间？'/);
+  assert.match(main, /confirmLabel:'创建并预览'/);
+  assert.doesNotMatch(main, /confirm\('目标楼层没有与当前区域重叠/);
+  assert.match(styles, /\.editor-prompt-dialog\{/);
+  assert.match(main, /pairedStairRoomPlacement\(room,editor\.rooms,targetFloor\)/);
+  assert.match(main, /editor\.rooms\.push\(sourceStairRoom,targetStairRoom\)/);
+  assert.match(main, /completeAddStair\(targetStairRoom,\{draftSnapshot:sourceFloorSnapshot\}\)/);
+  assert.match(main, /跨层连接请使用顶部“＋ 楼梯”/);
+  assert.match(styles, /\.mini-btn\.editor-stair-btn\.on/);
+});
+
+test('stair context controls stay inside the stair menu scope', async () => {
+  const main = await readFile(new URL('src/main.js', root), 'utf8');
+  const stairMenu = main.match(/function showEditorLinkMenu\(e, kind, ctx\)\{([\s\S]*?)\n\}/)?.[1] || '';
+  const roomGroups = main.match(/function initRoomGroups\(\)\{([\s\S]*?)\n\}/)?.[1] || '';
+  assert.match(stairMenu, /if\(kind==='stair'\)/);
+  assert.match(stairMenu, /editorStairForLink\(ctx\.link\)/);
+  assert.doesNotMatch(roomGroups, /\bkind\b|\bctx\.link\b/);
+});
+
+test('stairs are stable independent editor objects with locking and conflict feedback', async () => {
+  const [main,generation] = await Promise.all([
+    readFile(new URL('src/main.js', root), 'utf8'),
+    readFile(new URL('src/generation/multifloor.js', root), 'utf8')
+  ]);
+  assert.match(main, /stairs:\[\]/);
+  assert.match(main, /function editorStairForLink\(link\)/);
+  assert.match(main, /function stairSpecForGenerator\(link\)/);
+  assert.match(main, /mode:'stable-auto'/);
+  assert.match(main, /mode='locked'/);
+  assert.match(main, /mode:'stairMove'/);
+  assert.match(main, /function captureAttachedStairPlacements\(roomId\)/);
+  assert.match(main, /moveAttachedStairPlacements\(editor\.drag\.stairPlacements/);
+  assert.match(main, /function deleteEditorStair\(link\)/);
+  assert.match(main, /stairRemovalDisconnectsRooms/);
+  assert.match(main, /关键楼梯/);
+  assert.match(main, /stairFailure/);
+  assert.match(main, /failureByStair/);
+  assert.match(main, /stair\.invalid=!!failure/);
+  assert.match(main, /Keep the editor overlay and rendered dungeon atomic/);
+  assert.match(main, /restoreEditorState\(lastValidEditorState\)/);
+  assert.doesNotMatch(main, /translateFloorLayout\(/);
+  assert.match(generation, /const hasStableAnchor/);
+  assert.match(generation, /candidateIndex/);
+  assert.match(generation, /stairSpec\?\.anchor/);
+  assert.match(generation, /function roomAccessCell/);
+  assert.match(generation, /Structural priority/);
+  assert.match(generation, /allowStructureAdaptation/);
 });
 
 test('all-floor and exploded views build complete art for every floor', async () => {
@@ -247,7 +358,7 @@ test('edited routes remain adaptive when rooms move or regenerate', async () => 
   assert.match(main, /e\.hasCustomDoorA = !!editorLink\.doorA/);
   assert.match(main, /function captureAdaptiveRoutes\(roomId=null\)/);
   assert.match(main, /function applyAdaptiveRoutes\(snapshots\)/);
-  assert.match(main, /routeSnapshots:captureAdaptiveRoutes\(h\.room\.id\)/);
+  assert.match(main, /routeSnapshots:captureAdaptiveRoutes\(pairedRoom\?null:h\.room\.id\)/);
   assert.match(main, /if\(editor\.drag\.room\) applyAdaptiveRoutes\(editor\.drag\.routeSnapshots\)/);
   assert.match(main, /syncEditorGeneratedRooms\(d\);\s*applyAdaptiveRoutes\(adaptiveRouteSnapshots\);/);
 });

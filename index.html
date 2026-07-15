@@ -46,6 +46,14 @@
         <div id="dsub">生成中…</div>
       </div>
 
+      <ol class="pipe" id="pipe" aria-label="场景建造阶段">
+        <li data-stage="layout">布局</li>
+        <li data-stage="graph">连通</li>
+        <li data-stage="structure">建造</li>
+        <li data-stage="rooms">房间</li>
+        <li data-stage="atmosphere">点亮</li>
+      </ol>
+
       <div class="sec hero-controls">
         <label><span class="lab"><span>种子</span></span>
           <div class="row">
@@ -159,7 +167,7 @@
 
     <div class="sec editor-sec collapsed">
         <input type="checkbox" id="tEditor" checked hidden>
-        <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
+        <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn editor-stair-btn" id="editorAddStair" type="button" aria-pressed="false">＋ 楼梯</button><button class="mini-btn" id="editorStairCycle" type="button" hidden>旋转 90°</button><button class="mini-btn stair-confirm" id="editorStairConfirm" type="button" hidden>确认楼梯</button><button class="mini-btn" id="editorStairCancel" type="button" hidden>取消</button><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
         <div class="editor-canvas-wrap">
           <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="2D 区域编辑器"></canvas>
           <aside id="roomInspector" class="room-inspector" hidden>
@@ -180,6 +188,7 @@
       <button data-action="lock" data-menu="room">锁定/解锁</button>
       <button data-action="move-floor-up" data-menu="room">移动到上一层</button>
       <button data-action="move-floor-down" data-menu="room">移动到下一层</button>
+      <button data-action="add-stair" data-menu="room">添加楼梯</button>
       <button data-action="connect" data-menu="room">连接路径到这里</button>
       <button data-action="entrance" data-menu="room">设为起点</button>
       <button data-action="boss" data-menu="room">设为终点</button>
@@ -190,9 +199,35 @@
       <button data-action="narrower" data-menu="link">路径变窄</button>
       <button data-action="wider" data-menu="link">路径变宽</button>
       <button data-action="delete-link" data-menu="link">删除路径</button>
+      <button data-action="rotate-stair" data-menu="stair">旋转楼梯 90°</button>
+      <button data-action="toggle-stair-lock" data-menu="stair">锁定/稳定自动</button>
+      <button data-action="delete-stair" data-menu="stair">删除楼梯</button>
       <button data-action="delete-bend" data-menu="bend">删除转折点</button>
       <button data-action="reset-door" data-menu="door">重置门槽点</button>
     </div>
+
+    <dialog id="editorPromptDialog" class="room-group-dialog editor-prompt-dialog">
+      <form method="dialog">
+        <div class="room-group-dialog-head">
+          <div><small id="editorPromptEyebrow">楼梯匹配</small><h2 id="editorPromptTitle">创建匹配楼梯间？</h2></div>
+          <button class="dialog-close" type="submit" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div class="editor-prompt-content">
+          <div class="editor-prompt-icon" aria-hidden="true">↕</div>
+          <p id="editorPromptMessage">目标楼层没有与当前区域重叠、可用于楼梯井的房间。</p>
+        </div>
+        <div class="editor-prompt-flow" aria-label="楼梯连接楼层">
+          <span id="editorPromptFromFloor">第 1 层<small>当前层</small></span>
+          <i aria-hidden="true">→</i>
+          <span id="editorPromptToFloor">第 2 层<small>目标层</small></span>
+        </div>
+        <p class="editor-prompt-hint" id="editorPromptHint">将自动在上下层创建一对重叠楼梯间，然后进入楼梯预览。</p>
+        <div class="editor-prompt-actions">
+          <button class="mini-btn" id="editorPromptCancel" type="submit" value="cancel">暂不创建</button>
+          <button class="btn primary" id="editorPromptConfirm" type="submit" value="confirm">创建并预览</button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog id="customSettingDialog" class="room-group-dialog custom-setting-dialog">
       <form id="customSettingForm" method="dialog">
@@ -277,7 +312,7 @@
       <span class="preview-mode-title"><small>CAMERA</small><b>视角预览</b></span>
       <button id="thirdPersonPreview" type="button" aria-pressed="false"><i>3P</i><span><b>第三人称</b><small>观察角色与空间</small></span></button>
       <button id="firstPersonPreview" type="button" aria-pressed="false"><i>1P</i><span><b>第一人称</b><small>检查室内尺度</small></span></button>
-      <button id="editModeBtn" type="button" title="进入布局编辑模式（E）"><i>✎</i><span><b>编辑布局</b><small>调整区域与路径</small></span><kbd>E</kbd></button>
+      <button id="editModeBtn" type="button" title="进入布局编辑模式（E）"><i aria-hidden="true">✎</i><span><b>编辑布局</b><small>调整区域与路径</small></span><kbd>E</kbd></button>
       <button id="previewExit" type="button" hidden>退出预览 <kbd>Esc</kbd></button>
     </nav>
 
