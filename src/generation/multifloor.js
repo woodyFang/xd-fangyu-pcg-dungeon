@@ -458,13 +458,15 @@ function doorNormalForSide(side) {
     : { x: 0, y: -1 };
 }
 
-function resolveWallDoor(layer, W, H, room, preferred, fallback, width) {
+function resolveWallDoor(layer, W, H, room, preferred, fallback, width, allowSideFallback = false) {
   if (!room || !layer) return null;
   const validSides = ['n', 's', 'w', 'e'];
   const requestedSide = validSides.includes(preferred?.side) ? preferred.side
     : (validSides.includes(fallback?.side) ? fallback.side : null);
   if (!requestedSide) return null;
-  const sides = [requestedSide];
+  const sides = allowSideFallback
+    ? [requestedSide, ...validSides.filter(side => side !== requestedSide)]
+    : [requestedSide];
   const span = widthOffsets(Math.max(1, Math.min(3, Math.round(width || 1))));
   const preferredTangent = side => {
     const value = side === 'n' || side === 's' ? preferred?.x : preferred?.y;
@@ -478,7 +480,9 @@ function resolveWallDoor(layer, W, H, room, preferred, fallback, width) {
       const cell = idx2(W, nx, ny);
       const hardStair=layer.stairMask?.[cell] || layer.stairClearance?.[cell]
         || layer.stairLanding?.[cell] || layer.slabOpening?.[cell];
-      const openSurface=layer.grid[cell]===DEFAULT_TILES.VOID;
+      const reusedDoorway = depth===1 && layer.corridor[cell]
+        && layer.doorway[idx2(W, x, y)];
+      const openSurface=layer.grid[cell]===DEFAULT_TILES.VOID || reusedDoorway;
       if(layer.roomId[cell]>=0 || hardStair || !openSurface) return false;
     }
     return true;
@@ -1556,8 +1560,8 @@ export function buildMultiFloorLayout({
         ? { x: Math.round(edge.bx), y: Math.round(edge.by), side: edge.bside || defaultGoal.side }
         : defaultGoal;
       const width = Math.max(1, Math.min(3, Math.round(edge.visualWidth || (edge.isCritical ? 3 : 2))));
-      const start = resolveWallDoor(layer, W, H, roomA, requestedStart, defaultStart, width);
-      const goal = resolveWallDoor(layer, W, H, roomB, requestedGoal, defaultGoal, width);
+      const start = resolveWallDoor(layer, W, H, roomA, requestedStart, defaultStart, width, !edge.hasCustomDoorA);
+      const goal = resolveWallDoor(layer, W, H, roomB, requestedGoal, defaultGoal, width, !edge.hasCustomDoorB);
       if (!start || !goal) {
         errors.push(`edge ${edge.id} has no legal wall door`);
         continue;
