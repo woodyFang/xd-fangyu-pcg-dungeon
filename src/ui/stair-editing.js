@@ -1,3 +1,10 @@
+import {
+  STAIR_DIRECTIONS,
+  normalizeStairStyle,
+  stairShape,
+  stairTurnPlatformMetrics
+} from '../domain/stair-contract.js';
+
 export function adjacentFloorTargets(floor, floorCount) {
   const current = Math.round(Number(floor));
   const count = Math.max(1, Math.round(Number(floorCount) || 1));
@@ -11,6 +18,25 @@ export function chooseStairTargetFloor(floor, floorCount, preferredDelta = 1) {
   const targets = adjacentFloorTargets(floor, floorCount);
   const preferred = Math.round(Number(floor)) + Math.sign(preferredDelta || 1);
   return targets.includes(preferred) ? preferred : (targets[0] ?? null);
+}
+
+export function directStairPlacement(point, style = 'l-turn', length = 8) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+  const normalizedStyle = style === 'straight' ? 'straight' : 'l-turn';
+  const run = Math.max(4, Math.round(Number(length) || 8));
+  const x = Math.round(point.x);
+  const y = Math.round(point.y);
+  if (normalizedStyle === 'straight') {
+    return { anchor: { x: x - Math.round(run / 2), y }, direction: 'east', length: run, style: normalizedStyle };
+  }
+  const firstRun = Math.max(3, Math.floor(run / 2));
+  const secondRun = Math.max(3, run - firstRun);
+  return {
+    anchor: { x: x - Math.round(firstRun / 2), y: y - Math.round(secondRun / 2) },
+    direction: 'east',
+    length: run,
+    style: normalizedStyle
+  };
 }
 
 export function stairPairError(source, target) {
@@ -119,28 +145,8 @@ export function translateStairPlacement(stair, visual, delta) {
   return { anchor, previewAnchor, visual: movedVisual };
 }
 
-const STAIR_DIRECTIONS = {
-  east: { x: 1, y: 0, next: 'south' },
-  south: { x: 0, y: 1, next: 'west' },
-  west: { x: -1, y: 0, next: 'north' },
-  north: { x: 0, y: -1, next: 'east' }
-};
-
-function stairLShape(directionName, length, anchor) {
-  const first=STAIR_DIRECTIONS[directionName];
-  if(!first || !anchor) return null;
-  const firstRun=Math.max(3,Math.floor(length/2));
-  const secondRun=Math.max(3,length-firstRun);
-  const secondName=first.next;
-  const second=STAIR_DIRECTIONS[secondName];
-  const lower={...anchor};
-  const turn={x:lower.x+first.x*firstRun,y:lower.y+first.y*firstRun};
-  const upper={x:turn.x+second.x*secondRun,y:turn.y+second.y*secondRun};
-  return {lower,turn,upper,first,second,firstRun,secondRun,secondName};
-}
-
 function stairShapeCenter(shape) {
-  const points=[shape.lower,shape.turn,shape.upper];
+  const points=[shape.lower,shape.turn,shape.upper].filter(Boolean);
   return {
     x:(Math.min(...points.map(point=>point.x))+Math.max(...points.map(point=>point.x)))/2,
     y:(Math.min(...points.map(point=>point.y))+Math.max(...points.map(point=>point.y)))/2
@@ -157,11 +163,12 @@ export function rotateStairPlacement90(stair, visual) {
   const length = Math.max(1, Math.round(stair?.previewLength || stair?.length
     || (lower && upper ? Math.hypot(upper.x - lower.x, upper.y - lower.y) : 8)));
   if (!lower) return null;
-  const currentShape=visual?.turn
+  const style=normalizeStairStyle(stair?.previewStyle || stair?.style || visual?.style);
+  const currentShape=style==='l-turn' && visual?.turn
     ? {lower,turn:visual.turn,upper}
-    : stairLShape(currentName,length,lower);
+    : stairShape(style,currentName,length,lower);
   const center=stairShapeCenter(currentShape);
-  const nextAtOrigin=stairLShape(nextName,length,{x:0,y:0});
+  const nextAtOrigin=stairShape(style,nextName,length,{x:0,y:0});
   const nextCenter=stairShapeCenter(nextAtOrigin);
   return {
     anchor: {
@@ -169,7 +176,8 @@ export function rotateStairPlacement90(stair, visual) {
       y: Math.round(center.y-nextCenter.y)
     },
     direction: nextName,
-    length
+    length,
+    style
   };
 }
 
@@ -181,9 +189,10 @@ export function stairRotationFromPointer(stair, visual, pointer) {
   const current = STAIR_DIRECTIONS[currentName] || STAIR_DIRECTIONS.east;
   const length = Math.max(1, Math.round(stair?.previewLength || stair?.length
     || (upper ? Math.hypot(upper.x - lower.x, upper.y - lower.y) : 8)));
-  const currentShape=visual?.turn
+  const style=normalizeStairStyle(stair?.previewStyle || stair?.style || visual?.style);
+  const currentShape=style==='l-turn' && visual?.turn
     ? {lower,turn:visual.turn,upper}
-    : stairLShape(currentName,length,lower);
+    : stairShape(style,currentName,length,lower);
   const center=stairShapeCenter(currentShape);
   const dx = pointer.x - center.x;
   const dy = pointer.y - center.y;
@@ -191,7 +200,7 @@ export function stairRotationFromPointer(stair, visual, pointer) {
   const direction = Math.abs(dx) >= Math.abs(dy)
     ? (dx >= 0 ? 'east' : 'west')
     : (dy >= 0 ? 'south' : 'north');
-  const nextAtOrigin=stairLShape(direction,length,{x:0,y:0});
+  const nextAtOrigin=stairShape(style,direction,length,{x:0,y:0});
   const nextCenter=stairShapeCenter(nextAtOrigin);
   return {
     anchor: {
@@ -199,7 +208,31 @@ export function stairRotationFromPointer(stair, visual, pointer) {
       y: Math.round(center.y-nextCenter.y)
     },
     direction,
-    length
+    length,
+    style
+  };
+}
+
+export function changeStairStyle(stair, visual, requestedStyle) {
+  const style=normalizeStairStyle(requestedStyle);
+  const currentStyle=normalizeStairStyle(stair?.previewStyle || stair?.style || visual?.style);
+  const direction=stair?.previewDirection || stair?.direction || visual?.direction || 'east';
+  const lower=visual?.lower || stair?.previewAnchor || stair?.anchor;
+  const upper=visual?.upper;
+  if(!lower || !STAIR_DIRECTIONS[direction]) return null;
+  const length=Math.max(1,Math.round(stair?.previewLength || stair?.length
+    || (upper ? Math.hypot(upper.x-lower.x,upper.y-lower.y) : 8)));
+  const currentShape=currentStyle==='l-turn' && visual?.turn
+    ? {lower,turn:visual.turn,upper}
+    : stairShape(currentStyle,direction,length,lower);
+  const center=stairShapeCenter(currentShape);
+  const nextAtOrigin=stairShape(style,direction,length,{x:0,y:0});
+  const nextCenter=stairShapeCenter(nextAtOrigin);
+  return {
+    anchor:{x:Math.round(center.x-nextCenter.x),y:Math.round(center.y-nextCenter.y)},
+    direction,
+    length,
+    style
   };
 }
 
@@ -208,10 +241,12 @@ export function stairVisualForRotation(visual, stair, rotated) {
   if (!visual || !direction || !rotated?.anchor) return visual || null;
   const length = Math.max(1, Math.round(rotated.length || stair?.previewLength || stair?.length || 8));
   const landingDepth = Math.max(1, Math.round(stair?.previewLandingDepth || stair?.landingDepth || 2));
-  const shape=stairLShape(rotated.direction,length,rotated.anchor);
+  const style=normalizeStairStyle(rotated.style || stair?.previewStyle || stair?.style || visual?.style);
+  const shape=stairShape(style,rotated.direction,length,rotated.anchor);
   const {lower,turn,upper,second,secondName,firstRun,secondRun}=shape;
   return {
     ...visual,
+    style,
     lower,
     turn,
     upper,
@@ -232,11 +267,18 @@ export function adaptRoomToRotatedStair(room, stair, rotated) {
   if (!room || !direction || !rotated?.anchor) return room ? { ...room } : null;
   const length = Math.max(1, Math.round(rotated.length || stair?.previewLength || stair?.length || 8));
   const landingDepth = Math.max(1, Math.round(stair?.previewLandingDepth || stair?.landingDepth || 2));
-  const stairWidth = Math.max(1, Math.round(stair?.previewWidth || stair?.width || 2));
-  const shape=stairLShape(rotated.direction,length,rotated.anchor);
+  const visualWidth = Math.max(1, Number(stair?.previewWidth || stair?.width || 2));
+  const stairWidth = Math.max(1, Math.ceil(visualWidth));
+  const lateralCenterOffset=Number.isFinite(Number(stair?.previewLateralCenterOffset))
+    ? Number(stair.previewLateralCenterOffset)
+    : (Number.isFinite(Number(stair?.lateralCenterOffset)) ? Number(stair.lateralCenterOffset) : null);
+  const style=normalizeStairStyle(rotated.style || stair?.previewStyle || stair?.style);
+  const shape=stairShape(style,rotated.direction,length,rotated.anchor);
   const lowerApproach={x:shape.lower.x-direction.x*landingDepth,y:shape.lower.y-direction.y*landingDepth};
   const upperApproach={x:shape.upper.x+shape.second.x*landingDepth,y:shape.upper.y+shape.second.y*landingDepth};
-  const firstOffset = stairWidth <= 1 ? 0 : (stairWidth === 2 ? 0 : -Math.floor(stairWidth / 2));
+  const firstOffset = lateralCenterOffset===null
+    ? -Math.floor((stairWidth-1)/2)
+    : Math.round(lateralCenterOffset-(stairWidth-1)/2);
   const lastOffset = firstOffset + stairWidth - 1;
   const segmentCorners=(start,end,segmentDirection)=>{
     const perpendicular={x:-segmentDirection.y,y:segmentDirection.x};
@@ -245,10 +287,39 @@ export function adaptRoomToRotatedStair(room, stair, rotated) {
       y:point.y+perpendicular.y*offset
     })));
   };
-  const corners=[
-    ...segmentCorners(lowerApproach,shape.turn,shape.first),
-    ...segmentCorners(shape.turn,upperApproach,shape.second)
-  ];
+  let corners;
+  if(shape.turn){
+    const platform=stairTurnPlatformMetrics({
+      ...shape,width:visualWidth,lateralCenterOffset,
+      directionVector:shape.first,secondDirectionVector:shape.second
+    });
+    const half=visualWidth/2;
+    const visualSegmentCorners=(start,end,segmentDirection)=>{
+      const perpendicular={x:-segmentDirection.y,y:segmentDirection.x};
+      return [start,end].flatMap(point=>[-half,half].map(offset=>({
+        x:point.x+perpendicular.x*offset,
+        y:point.y+perpendicular.y*offset
+      })));
+    };
+    const firstApproach={
+      x:platform.first.start.x-shape.first.x*landingDepth,
+      y:platform.first.start.y-shape.first.y*landingDepth
+    };
+    const secondApproach={
+      x:platform.second.end.x+shape.second.x*landingDepth,
+      y:platform.second.end.y+shape.second.y*landingDepth
+    };
+    corners=[
+      ...visualSegmentCorners(firstApproach,platform.entry,shape.first),
+      ...visualSegmentCorners(platform.exit,secondApproach,shape.second),
+      {x:platform.center.x-half,y:platform.center.y-half},
+      {x:platform.center.x+half,y:platform.center.y-half},
+      {x:platform.center.x+half,y:platform.center.y+half},
+      {x:platform.center.x-half,y:platform.center.y+half}
+    ];
+  }else{
+    corners=segmentCorners(lowerApproach,upperApproach,shape.first);
+  }
   const minX=Math.min(...corners.map(point=>point.x)), maxX=Math.max(...corners.map(point=>point.x));
   const minY=Math.min(...corners.map(point=>point.y)), maxY=Math.max(...corners.map(point=>point.y));
   const center={x:(minX+maxX)/2,y:(minY+maxY)/2};
@@ -265,9 +336,61 @@ export function adaptRoomToRotatedStair(room, stair, rotated) {
   // Normal rooms fit the actual tread and landing cells, without an invisible
   // side buffer. A stair already inside the room may therefore sit flush with
   // one wall without making the room frame grow away from the rendered room.
-  const halfWidth = Math.max(room.w / 2, room.x-minX, maxX-room.x);
-  const halfHeight = Math.max(room.h / 2, room.y-minY, maxY-room.y);
+  const halfWidth = Math.max(room.w / 2, room.x-minX+.5, maxX-room.x+.5);
+  const halfHeight = Math.max(room.h / 2, room.y-minY+.5, maxY-room.y+.5);
   return { ...room, w: Math.ceil(halfWidth * 2), h: Math.ceil(halfHeight * 2) };
+}
+
+export function stairWidthFromPointer(stair, visual, pointer, {min=1,max=5,step=0.25,handleGap=1}={}) {
+  const start=visual?.lower || stair?.previewAnchor || stair?.anchor;
+  const end=visual?.turn || visual?.upper;
+  if(!start || !end || !pointer) return null;
+  const dx=end.x-start.x, dy=end.y-start.y, length=Math.hypot(dx,dy);
+  if(length<0.001) return null;
+  const perpendicular={x:-dy/length,y:dx/length};
+  const center={x:(start.x+end.x)/2,y:(start.y+end.y)/2};
+  const distance=Math.abs((pointer.x-center.x)*perpendicular.x+(pointer.y-center.y)*perpendicular.y);
+  const rawWidth=Math.max(0,distance-handleGap)*2;
+  const snapped=Math.round(rawWidth/step)*step;
+  return Number(Math.max(min,Math.min(max,snapped)).toFixed(4));
+}
+
+export function stairWidthResizeFromPointer(stair, visual, pointer, {min=1,max=5,step=0.25,handleGap=1,startPointer=null}={}) {
+  const start=visual?.lower || stair?.previewAnchor || stair?.anchor;
+  const end=visual?.turn || visual?.upper;
+  if(!start || !end || !pointer) return null;
+  const dx=end.x-start.x,dy=end.y-start.y,length=Math.hypot(dx,dy);
+  if(length<0.001) return null;
+  const perpendicular={x:-dy/length,y:dx/length};
+  const startWidth=Number(visual?.width || stair?.previewWidth || stair?.width || 2);
+  const startOffset=Number.isFinite(Number(visual?.lateralCenterOffset))
+    ? Number(visual.lateralCenterOffset)
+    : (Number.isFinite(Number(stair?.previewLateralCenterOffset))
+      ? Number(stair.previewLateralCenterOffset)
+      : (Number.isFinite(Number(stair?.lateralCenterOffset)) ? Number(stair.lateralCenterOffset) : 0));
+  const rawCenter={
+    x:(start.x+end.x)/2,
+    y:(start.y+end.y)/2
+  };
+  const fixedEdge={
+    x:rawCenter.x+perpendicular.x*(startOffset-startWidth/2),
+    y:rawCenter.y+perpendicular.y*(startOffset-startWidth/2)
+  };
+  // Real canvas drags use their pointer-down position as the baseline. This
+  // keeps the resize responsive even when the user grabs the enlarged hit
+  // area a few pixels away from the exact handle centre. Direct callers may
+  // still provide only the current pointer and use the absolute edge formula.
+  const dragDelta=startPointer
+    ? (pointer.x-startPointer.x)*perpendicular.x+(pointer.y-startPointer.y)*perpendicular.y
+    : null;
+  const pointerDistance=(pointer.x-fixedEdge.x)*perpendicular.x+(pointer.y-fixedEdge.y)*perpendicular.y;
+  const rawWidth=Math.max(0,dragDelta===null ? pointerDistance-handleGap : startWidth+dragDelta);
+  const snapped=Math.round(rawWidth/step)*step;
+  const width=Number(Math.max(min,Math.min(max,snapped)).toFixed(4));
+  return {
+    width,
+    lateralCenterOffset:Number((startOffset+(width-startWidth)/2).toFixed(4))
+  };
 }
 
 export function stairRemovalDisconnectsRooms(rooms, links, removedLink) {

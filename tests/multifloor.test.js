@@ -7,8 +7,10 @@ import {
   classifyEdgesByFloor,
   compactRoomsByFloor,
   createLayerData,
+  rectangularCellEnvelope,
   routeAStar,
-  structuralHash
+  structuralHash,
+  validateDungeon3D
 } from '../src/generation/multifloor.js';
 
 const TILES = { VOID: 0, FLOOR: 1, WALL: 2, POOL: 3 };
@@ -29,6 +31,30 @@ function room(id, cx, cy, floor = 0) {
 function clone(value) {
   return structuredClone(value);
 }
+
+function assertRectangularCells(cells, W) {
+  const cellSet=new Set(cells);
+  const xs=cells.map(cell=>cell%W);
+  const ys=cells.map(cell=>Math.floor(cell/W));
+  const minX=Math.min(...xs),maxX=Math.max(...xs);
+  const minY=Math.min(...ys),maxY=Math.max(...ys);
+  assert.equal(cells.length,(maxX-minX+1)*(maxY-minY+1));
+  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+    assert.ok(cellSet.has(y*W+x),`missing stairwell envelope cell ${x},${y}`);
+  }
+}
+
+test('an L-shaped stair service area becomes one complete rectangular envelope', () => {
+  const W=12,H=10;
+  const lShape=[2*W+3,2*W+4,3*W+4,4*W+4];
+  const envelope=rectangularCellEnvelope(lShape,W,H);
+  assert.deepEqual(envelope,[
+    2*W+3,2*W+4,
+    3*W+3,3*W+4,
+    4*W+3,4*W+4
+  ]);
+  assertRectangularCells(envelope,W);
+});
 
 test('createLayerData creates isolated typed arrays for every floor', () => {
   const lower = createLayerData(0, 12, 10);
@@ -127,6 +153,40 @@ test('custom door constraints still use adaptive A* routing', () => {
   assert.ok(edge.route.length>=3);
 });
 
+test('doors snap to a real wall boundary and final arches use the resolved sockets', () => {
+  const W=40, H=24;
+  const rooms=[room(0,8,10,0),room(1,28,10,0)];
+  const edges=[{
+    id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,
+    hasCustomDoorA:true,ax:8,ay:10,aside:'n',
+    hasCustomDoorB:true,bx:28,by:10,bside:'s'
+  }];
+  const result=buildMultiFloorLayout({W,H,floorCount:1,rooms,edges,entrance:0,tiles:TILES,legacy:{}});
+  assert.equal(result.valid,true,result.errors.join('; '));
+  const edge=result.edges[0], arches=result.layers[0].arches;
+  assert.deepEqual({x:edge.ax,y:edge.ay,side:edge.aside},{x:8,y:6,side:'n'});
+  assert.deepEqual({x:edge.bx,y:edge.by,side:edge.bside},{x:28,y:14,side:'s'});
+  assert.deepEqual(arches.map(arch=>({roomId:arch.roomId,x:arch.anchorX,y:arch.anchorY,side:arch.side})),[
+    {roomId:0,x:8,y:6,side:'n'},
+    {roomId:1,x:28,y:14,side:'s'}
+  ]);
+  assert.deepEqual(edge.route[1],{x:8,y:4});
+  assert.deepEqual(edge.route[edge.route.length-2],{x:28,y:16});
+});
+
+test('a blocked configured wall rejects the door instead of switching sides', () => {
+  const rooms=[room(0,10,10,0),room(1,14,10,0)];
+  const edges=[{
+    id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,
+    hasCustomDoorA:true,ax:14,ay:10,aside:'e',
+    hasCustomDoorB:true,bx:10,by:10,bside:'w'
+  }];
+  const result=buildMultiFloorLayout({W:30,H:24,floorCount:1,rooms,edges,entrance:0,tiles:TILES,legacy:{}});
+  assert.equal(result.valid,false);
+  assert.ok(result.errors.includes('edge 0 has no legal wall door'));
+  assert.equal(result.layers[0].arches.length,0);
+});
+
 test('critical path floor assignment is contiguous and reaches the requested top floor', () => {
   const rooms = Array.from({ length: 7 }, (_, id) => room(id, 10 + id * 10, 10));
   const parent = Int32Array.from([-1, 0, 1, 2, 3, 4, 5]);
@@ -208,7 +268,13 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
     assert.equal(connector.stepCount, 16);
     assert.equal(connector.stepRise, 0.25);
     assert.equal(connector.treadDepth, 0.5);
-    assert.ok(connector.openingCells.length >= (connector.length - 2) * connector.width);
+    assert.equal(connector.openingPolicy,'headroom-tight');
+    assert.ok(connector.requiredHeadroom>0 && connector.requiredHeadroom<connector.rise);
+    assert.ok(connector.openingCells.length>0);
+    assert.ok(connector.openingCells.length<connector.stairFootprintCells.length);
+    assert.deepEqual(new Set(connector.headroomCells),new Set(connector.openingCells));
+    assert.ok(connector.openingBoundaryEdges.length>0);
+    assert.ok(connector.openingAccessEdges.length>0);
     assert.ok(connector.turn);
     assert.equal(connector.firstRun + connector.secondRun, connector.length);
     assert.equal(connector.firstFlightSteps + connector.secondFlightSteps, connector.stepCount);
@@ -220,20 +286,43 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
     }
     assert.equal(lowerLayer.stairLanding[connector.lower.y * 76 + connector.lower.x], 1);
     assert.equal(upperLayer.stairLanding[connector.upper.y * 76 + connector.upper.x], 1);
-    for (const cell of connector.openingCells) {
+    for (const cell of connector.stairFootprintCells) {
       assert.equal(lowerLayer.stairMask[cell], 1);
       assert.equal(lowerLayer.stairClearance[cell], 1);
       assert.equal(lowerLayer.roomId[cell], -1);
+    }
+    for (const cell of connector.openingCells) {
       assert.equal(upperLayer.slabOpening[cell], 1);
       assert.equal(upperLayer.stairClearance[cell], 1);
       assert.equal(upperLayer.roomId[cell], -1);
       assert.equal(upperLayer.grid[cell], TILES.VOID);
+    }
+    const edgeKey=edge=>[edge.x1,edge.y1,edge.x2,edge.y2].join(',');
+    const accessKeys=new Set(connector.openingAccessEdges.map(edgeKey));
+    const guardKeys=new Set(connector.openingGuardSegments.map(edgeKey));
+    const wallKeys=new Set(connector.openingWallSegments.map(edgeKey));
+    for(const edge of connector.openingBoundaryEdges){
+      const key=edgeKey(edge);
+      if(edge.access){
+        assert.ok(accessKeys.has(key));
+        assert.equal(guardKeys.has(key),false);
+      }else if(edge.neighborCell>=0 && upperLayer.grid[edge.neighborCell]===TILES.FLOOR){
+        assert.ok(guardKeys.has(key),`missing opening guard ${key}`);
+      }else if(edge.neighborCell>=0 && upperLayer.grid[edge.neighborCell]===TILES.WALL){
+        assert.ok(wallKeys.has(key),`missing opening wall ownership ${key}`);
+      }
     }
   }
   for (const roomData of rooms) {
     const cell = roomData.floor * 76 * 40 + roomData.cy * 76 + roomData.cx;
     assert.ok(result.bfs3[cell] >= 0);
   }
+  const tamperedConnectors=result.connectors.map(connector=>structuredClone(connector));
+  tamperedConnectors[0].secondRun+=1;
+  const tamperedValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:tamperedConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(tamperedValidation.invalidConnectors.includes(tamperedConnectors[0].id));
 });
 
 test('stable stair specs preserve their anchor and reject conflicting locked placement', () => {
@@ -276,6 +365,7 @@ test('stacked rooms use one shared stairwell footprint on both floors', () => {
   const connector=result.connectors[0];
   assert.equal(connector.sharedFootprintKind,'room-overlap');
   assert.ok(connector.sharedFootprintCells.length>connector.openingCells.length);
+  assertRectangularCells(connector.sharedFootprintCells,52);
   for(const cell of connector.sharedFootprintCells){
     assert.equal(result.layers[0].stairwellMask[cell],1);
     assert.equal(result.layers[1].stairwellMask[cell],1);
@@ -284,6 +374,52 @@ test('stacked rooms use one shared stairwell footprint on both floors', () => {
     assert.equal(result.layers[0].stairMask[cell],1);
     assert.equal(result.layers[1].slabOpening[cell],1);
   }
+});
+
+test('a locked straight stair preserves quarter-tile width and reserves enough cells on both floors', () => {
+  const lower={...room(0,24,25,0),w:26,h:20};
+  const upper={...room(1,24,25,1),w:26,h:20};
+  const result=buildMultiFloorLayout({
+    W:60,H:50,floorCount:2,rooms:[lower,upper],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-straight-wide',mode:'locked',style:'straight',anchor:{x:20,y:25},direction:'east',width:3.25,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  const connector=result.connectors[0];
+  assert.equal(connector.style,'straight');
+  assert.equal(connector.turn,null);
+  assert.equal(connector.width,3.25);
+  assert.deepEqual(connector.upper,{x:28,y:25});
+  assert.equal(connector.firstRun,8);
+  assert.equal(connector.secondRun,0);
+  assert.equal(connector.firstFlightSteps,connector.stepCount);
+  assert.equal(connector.secondFlightSteps,0);
+  assert.ok(connector.openingCells.length>0);
+  assert.ok(connector.openingCells.length<connector.stairFootprintCells.length);
+  for(const cell of connector.sharedFootprintCells){
+    assert.equal(result.layers[0].stairwellMask[cell],1);
+    assert.equal(result.layers[1].stairwellMask[cell],1);
+  }
+});
+
+test('a locked stair grows its raster footprint only toward the dragged width side', () => {
+  const lower={...room(0,24,25,0),w:26,h:20};
+  const upper={...room(1,24,25,1),w:26,h:20};
+  const result=buildMultiFloorLayout({
+    W:60,H:50,floorCount:2,rooms:[lower,upper],
+    edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
+      id:'stair-stable-center',mode:'locked',style:'straight',anchor:{x:20,y:25},direction:'east',
+      width:2.25,lateralCenterOffset:.625,length:8,landingDepth:2
+    }}],entrance:0,tiles:TILES,legacy:{}
+  });
+  assert.equal(result.valid,true,result.errors.join('\n'));
+  assert.equal(result.connectors[0].width,2.25);
+  const connector=result.connectors[0];
+  assert.equal(connector.lateralCenterOffset,.625);
+  const shaftRows=connector.openingCells.map(cell=>Math.floor(cell/60));
+  assert.equal(Math.min(...shaftRows),25);
+  assert.equal(Math.max(...shaftRows),27);
 });
 
 test('a locked stair may replace the room centre and reshapes both floor structures', () => {
@@ -321,7 +457,9 @@ test('a locked stair can sit flush against a room wall without carving side clea
   assert.equal(connector.sideClearance,0);
   const footprintRows=connector.sharedFootprintCells.map(cell=>Math.floor(cell/52));
   assert.equal(Math.min(...footprintRows),12);
-  assert.equal(Math.max(...footprintRows),18);
+  // The independent W x W turn landing extends one row past the old shared
+  // bend point; its complete generated envelope must be reserved as well.
+  assert.equal(Math.max(...footprintRows),19);
   assert.equal(result.layers[0].grid[11*52+24],TILES.WALL);
 });
 
@@ -338,11 +476,25 @@ test('a user-locked stair reshapes unrelated room cells on both floors instead o
   });
   assert.equal(result.valid,true,result.errors.join('\n'));
   assert.equal(result.stairFailures.length,0);
+  const connector=result.connectors[0];
   const centre=20*64+28;
   assert.equal(result.layers[0].stairMask[centre],1);
   assert.equal(result.layers[0].roomId[centre],-1);
   assert.equal(result.layers[1].slabOpening[centre],1);
   assert.equal(result.layers[1].roomId[centre],-1);
+  assert.deepEqual(connector.structureAdaptationRoutes.map(route=>[route.floor,route.roomId]),[[0,2],[1,3]]);
+  const exactUpperMutation=new Set(connector.openingCells);
+  for(let cell=0;cell<result.layers[1].stairLanding.length;cell++){
+    if(result.layers[1].stairLanding[cell]) exactUpperMutation.add(cell);
+  }
+  const preservedWalls=connector.sharedFootprintCells.filter(cell=>
+    !exactUpperMutation.has(cell) && result.layers[1].grid[cell]===TILES.WALL);
+  assert.ok(preservedWalls.length>0,'the stairwell envelope must preserve unrelated upper-floor walls');
+  assert.ok(connector.openingGuardSegments.length>0);
+  const guardKeys=new Set(connector.openingGuardSegments.map(edge=>[edge.x1,edge.y1,edge.x2,edge.y2].join(',')));
+  for(const edge of connector.openingAccessEdges){
+    assert.equal(guardKeys.has([edge.x1,edge.y1,edge.x2,edge.y2].join(',')),false);
+  }
 });
 
 test('multifloor generation is deterministic', () => {

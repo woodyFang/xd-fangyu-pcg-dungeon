@@ -116,7 +116,7 @@
           </div>
 
           <div class="layer-section">
-            <span class="layer-section-title">当前编辑层 <em>逐层参数与 2D 编辑目标</em></span>
+            <span class="layer-section-title">当前编辑层 <em>逐层参数与场景编辑目标</em></span>
             <label class="layer-select-row" for="floorSelect">
               <span>选择楼层</span>
               <select id="floorSelect" aria-label="选择当前编辑楼层">
@@ -167,9 +167,9 @@
 
     <div class="sec editor-sec collapsed">
         <input type="checkbox" id="tEditor" checked hidden>
-        <span class="lab editor-title"><span id="editorTitleText">2D 区域编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn editor-stair-btn" id="editorAddStair" type="button" aria-pressed="false">＋ 楼梯</button><button class="mini-btn" id="editorStairCycle" type="button" hidden>旋转 90°</button><button class="mini-btn stair-confirm" id="editorStairConfirm" type="button" hidden>确认楼梯</button><button class="mini-btn" id="editorStairCancel" type="button" hidden>取消</button><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
+        <span class="lab editor-title"><span id="editorTitleText">场景布局编辑器</span><b id="editorStatus">同步中</b><button class="mini-btn editor-stair-btn" id="editorAddStair" type="button" aria-pressed="false">＋ 楼梯</button><select class="editor-stair-style" id="editorStairStyle" aria-label="楼梯样式" title="先选择楼梯，再切换样式" hidden><option value="" disabled>楼梯样式</option><option value="l-turn">L 型楼梯</option><option value="straight">直跑楼梯</option></select><button class="mini-btn" id="editorStairCycle" type="button" hidden>旋转 90°</button><button class="mini-btn stair-confirm" id="editorStairConfirm" type="button" hidden>确认楼梯</button><button class="mini-btn" id="editorStairCancel" type="button" hidden>取消</button><button class="mini-btn" id="editorCollapse" type="button">折叠</button><button class="mini-btn" id="editorFullscreen" type="button">全屏</button><button class="mini-btn" id="editorExit" type="button">完成 ✓</button></span>
         <div class="editor-canvas-wrap">
-          <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="2D 区域编辑器"></canvas>
+          <canvas id="editorCanvas" class="editor-canvas" width="620" height="460" aria-label="场景布局编辑器"></canvas>
           <aside id="roomInspector" class="room-inspector" hidden>
             <span>已选区域 <b id="roomInspectorName">—</b></span>
             <label for="roomGroupSelect">房间组</label>
@@ -205,29 +205,6 @@
       <button data-action="delete-bend" data-menu="bend">删除转折点</button>
       <button data-action="reset-door" data-menu="door">重置门槽点</button>
     </div>
-
-    <dialog id="editorPromptDialog" class="room-group-dialog editor-prompt-dialog">
-      <form method="dialog">
-        <div class="room-group-dialog-head">
-          <div><small id="editorPromptEyebrow">楼梯匹配</small><h2 id="editorPromptTitle">创建匹配楼梯间？</h2></div>
-          <button class="dialog-close" type="submit" value="cancel" aria-label="关闭">×</button>
-        </div>
-        <div class="editor-prompt-content">
-          <div class="editor-prompt-icon" aria-hidden="true">↕</div>
-          <p id="editorPromptMessage">目标楼层没有与当前区域重叠、可用于楼梯井的房间。</p>
-        </div>
-        <div class="editor-prompt-flow" aria-label="楼梯连接楼层">
-          <span id="editorPromptFromFloor">第 1 层<small>当前层</small></span>
-          <i aria-hidden="true">→</i>
-          <span id="editorPromptToFloor">第 2 层<small>目标层</small></span>
-        </div>
-        <p class="editor-prompt-hint" id="editorPromptHint">将自动在上下层创建一对重叠楼梯间，然后进入楼梯预览。</p>
-        <div class="editor-prompt-actions">
-          <button class="mini-btn" id="editorPromptCancel" type="submit" value="cancel">暂不创建</button>
-          <button class="btn primary" id="editorPromptConfirm" type="submit" value="confirm">创建并预览</button>
-        </div>
-      </form>
-    </dialog>
 
     <dialog id="customSettingDialog" class="room-group-dialog custom-setting-dialog">
       <form id="customSettingForm" method="dialog">

@@ -132,6 +132,7 @@
   .editor-sec.collapsed .editor-title > b,
   .editor-sec.collapsed #editorFullscreen,
   .editor-sec.collapsed #editorAddStair,
+  .editor-sec.collapsed #editorStairStyle,
   .editor-sec.collapsed #editorStairCycle,
   .editor-sec.collapsed #editorStairConfirm,
   .editor-sec.collapsed #editorStairCancel,
@@ -147,6 +148,10 @@
   }
   .mini-btn:hover{color:var(--ink);border-color:#3a3f56}
   .mini-btn.editor-stair-btn.on{color:#17120c;border-color:#ffd36a;background:#ffd36a;box-shadow:0 0 0 2px rgba(255,211,106,.16)}
+  .editor-stair-style{height:36px;min-width:110px;padding:0 28px 0 10px;color:#ffe3a3;background:#141722;border:1px solid #6f5830;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+  .editor-stair-style:hover,.editor-stair-style:focus{border-color:#ffd36a;outline:none}
+  .editor-stair-style:disabled{opacity:.62;cursor:not-allowed;color:#9aa3b7;border-color:#3b4356}
+  .editor-stair-style[hidden]{display:none}
   .mini-btn.stair-confirm{color:#dfffea;border-color:#4cae78;background:rgba(76,174,120,.14)}
   .mini-btn:disabled{opacity:.32;cursor:not-allowed;color:var(--dim);border-color:var(--line)}
   .editor-canvas-wrap{position:relative;margin:12px 0 0;flex:1;min-height:0;display:flex}
@@ -263,17 +268,6 @@
   .room-group-dialog-actions{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;align-items:center;margin-top:12px;padding-top:14px;border-top:1px solid #282e40}
   .room-group-dialog-actions .danger{color:#ff9789;border-color:#56302f}
   .room-group-dialog-actions .btn{min-height:36px;padding:8px 13px}
-  .editor-prompt-dialog{width:min(470px,calc(100vw - 28px));overflow:hidden}
-  .editor-prompt-content{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:12px;padding:13px;color:#c6ccda;background:#0c1018;border:1px solid #282f40;border-radius:10px}
-  .editor-prompt-content p{font-size:12px;line-height:1.65}
-  .editor-prompt-icon{display:grid;width:42px;height:42px;place-items:center;color:#ffc06f;background:color-mix(in srgb,var(--ember) 14%,#151925);border:1px solid color-mix(in srgb,var(--ember) 30%,#30364a);border-radius:10px;font-size:20px}
-  .editor-prompt-flow{display:grid;grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr);align-items:center;gap:8px;margin-top:12px}
-  .editor-prompt-flow span{display:grid;gap:3px;padding:10px 12px;color:#eef1f6;background:#171b27;border:1px solid #343b4f;border-radius:9px;font-size:12px;font-weight:650;text-align:center}
-  .editor-prompt-flow span small{color:#7f889b;font-size:9px;font-weight:400}
-  .editor-prompt-flow i{color:var(--ember);font-size:17px;font-style:normal;text-align:center}
-  .editor-prompt-hint{margin-top:10px;color:#838c9f;font-size:10.5px;line-height:1.6}
-  .editor-prompt-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:15px;padding-top:14px;border-top:1px solid #282e40}
-  .editor-prompt-actions .mini-btn,.editor-prompt-actions .btn{min-height:36px;padding:8px 14px}
   .custom-setting-dialog{width:min(590px,calc(100vw - 28px))}
   .custom-setting-intro{margin:-5px 0 2px;padding:10px 11px;color:#8f98ab;background:#0c1018;border:1px solid #252b3b;border-radius:8px;font-size:10.5px;line-height:1.55}
   .custom-setting-source-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:17px;padding-top:15px;border-top:1px solid #282e40;color:#c2c8d5;font-size:11px;letter-spacing:.04em}

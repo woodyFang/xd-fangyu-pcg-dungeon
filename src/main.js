@@ -22,11 +22,21 @@ import {
 import { normalizeFloorValues, updateFloorValue } from './ui/floor-settings.js';
 import { snapRouteControlPoint } from './ui/route-snapping.js';
 import { simplifyRoutePoints } from './ui/route-path.js';
-import { adaptRoomToRotatedStair, chooseStairTargetFloor, matchingStairRooms, pairedStairRoomPlacement, rotateStairPlacement90, stairPairError, stairRemovalDisconnectsRooms, stairRotationFromPointer, stairVisualForRotation, translateStairPlacement } from './ui/stair-editing.js';
+import { adaptRoomToRotatedStair, changeStairStyle, chooseStairTargetFloor, directStairPlacement, rotateStairPlacement90, stairPairError, stairRemovalDisconnectsRooms, stairRotationFromPointer, stairVisualForRotation, stairWidthResizeFromPointer, translateStairPlacement } from './ui/stair-editing.js';
 import { preserveUneditedFloors } from './generation/floor-preservation.js';
 import { adaptRouteBends } from './generation/adaptive-route.js';
 import { corridorCenterOffset, dungeonEditorOffset, dungeonLayerShift, editorToGridPoint } from './generation/coordinate-space.js';
 import { createDungeonPreview } from './gameplay/camera-preview.js';
+import {
+  compileStairAssetRecipe,
+  railPostFractions,
+  stairLandingCenterY,
+  stairRailSegments,
+  stairRunCenter,
+  stairTreadAssetPlan,
+  stairTurnPlatformMetrics
+} from './render/stair-style.js';
+import { compileThemeAuthority, resolveThemePaletteKey, themePaletteKeys } from './render/theme-authority.js';
 
 /* ================================================================
    DUNGEON FORGE — procedural dungeon generator core + showcase
@@ -184,9 +194,6 @@ const PALETTES = {
   }
 };
 const SETTING_KEYS = ['dungeon','hospital'];
-const PALETTE_KEYS = Object.keys(PALETTES);
-const DUNGEON_PALETTE_KEYS = ['ancient','molten','frost','grim','verdant'];
-const HOSPITAL_PALETTE_KEYS = ['sterile','abandoned','emergency'];
 const CUSTOM_SETTING_STORAGE='dungeon.customSettings.v1';
 let customSettings=[];
 let editingCustomSettingId=null;
@@ -228,10 +235,17 @@ function saveCustomSettings(){
 loadCustomSettings();
 function themeSpec(settingKey, paletteKey){
   const setting = SETTINGS[settingKey] || SETTINGS.dungeon;
-  const palette = PALETTES[paletteKey] || PALETTES.ancient;
+  const themeAuthority=compileThemeAuthority(settingKey,setting);
+  const resolvedPaletteKey=resolveThemePaletteKey(themeAuthority,paletteKey);
+  const palette = PALETTES[resolvedPaletteKey] || PALETTES.ancient;
   return {
     ...palette,
-    settingKey, paletteKey, kit:setting.kit,
+    settingKey, paletteKey:resolvedPaletteKey, kit:setting.kit,
+    sceneKit:themeAuthority.sceneKit,
+    themeAuthority,
+    themeId:settingKey,
+    themePrompt:setting.prompt || '',
+    themeHasReference:!!setting.imageData,
     settingLabel:setting.label, paletteLabel:palette.label,
     label:setting.label + ' · ' + palette.label,
     nameA:setting.nameA || palette.nameA,
@@ -308,7 +322,7 @@ function assignEdgeRoute(e){
   const pts = first==='h' ? [{x:ax,y:ay},{x:bx,y:ay},{x:bx,y:by}] : [{x:ax,y:ay},{x:ax,y:by},{x:bx,y:by}];
   e.route = simplifyRoutePoints(pts);
 }
-function roomDoorPoint(A, B, margin=1){
+function roomDoorPoint(A, B, margin=0){
   const dx = B.cx - A.cx, dy = B.cy - A.cy;
   const hw = Math.max(1, A.w/2 - margin), hh = Math.max(1, A.h/2 - margin);
   let x=A.cx, y=A.cy, side='e';
@@ -425,7 +439,7 @@ function generateDungeon(params){
 function tryGenerate(seed, params){
   const rng = makeRng(seed);
   const TH = themeSpec(params.settingKey, params.paletteKey);
-  const isHospital = TH.kit === 'hospital';
+  const isHospital = TH.sceneKit === 'hospital';
 
   /* -- 1. scatter / editor layout -- */
   const rooms = initialRoomsFromParams(rng, params);
@@ -1214,7 +1228,7 @@ function tryGenerate(seed, params){
         if(grid[c]!==FLOOR || occ[c] || doorway[c] || lakeMask[c]) continue;
         const rid = roomId[c];
         const diff = rid>=0 ? rooms[rid].difficulty : 0.5;
-        let p = decorDensityForRoomId(rid) * 0.045 * (1.25 - 0.6*diff);
+        let p = decorDensityForRoomId(rid) * 0.045 * (1.25 - 0.6*diff) * TH.themeAuthority.decorWeight;
         if(corridor[c]) p *= 0.45;
         if(rng.chance(p)) props.push({kind:'debris',x,y,rot:rng.f(0,6.28),scale:rng.f(0.6,1.35),roomId:rid,floor:rooms[rid]?.floor||0,v:rng.i(0,2)});
       }
@@ -1278,7 +1292,7 @@ function tryGenerate(seed, params){
       }
     }
   }
-  if(TH.kit === 'hospital'){
+  if(TH.sceneKit === 'hospital'){
     const clearForHospital = (x,y,rid)=>{
       if(!inB(x,y)) return false;
       const c = idx(x,y);
@@ -1310,7 +1324,7 @@ function tryGenerate(seed, params){
       const roomy = area >= 95;
       const addSupportProps = (items)=>{
         for(const item of items){
-          if(item.when !== undefined && !rng.chance(item.when)) continue;
+          if(item.when !== undefined && !rng.chance(Math.min(.98,item.when*TH.themeAuthority.decorWeight))) continue;
           tryHospitalFloor(r, item.kind, item.rot ?? (rng.chance(0.5)?0:Math.PI/2), item.scale ?? rng.f(0.82,1.0), item.tries ?? 70);
         }
       };
@@ -1403,17 +1417,18 @@ function tryGenerate(seed, params){
       if(roomId[fc] < 0 || doorway[fc]) continue;
       const density=decorDensityForRoomId(roomId[fc]);
       const placement=decorPlacement(x,y,d[0],d[1]);
+      const themeDensity=Math.min(1,density*TH.themeAuthority.decorWeight);
       let close=false;
       for(const s of signs) if(Math.max(Math.abs(s.x-x),Math.abs(s.y-y))<6){ close=true; break; }
-      if(!close && rng.chance(0.18 + 0.14*density)){
+      if(!close && rng.chance(0.18 + 0.14*themeDensity)){
         signs.push({x,y}); props.push({kind:'wallLight',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.85,1.05)});
-      } else if(!close && rng.chance(0.16 + 0.16*density)){
+      } else if(!close && rng.chance(0.16 + 0.16*themeDensity)){
         signs.push({x,y}); props.push({kind:'wallChart',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.85,1.05)});
-      } else if(!close && rng.chance(0.12 + 0.12*density)){
+      } else if(!close && rng.chance(0.12 + 0.12*themeDensity)){
         signs.push({x,y}); props.push({kind:'noticeBoard',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.82,1.0)});
-      } else if(!close && rng.chance(0.08 + 0.08*density)){
+      } else if(!close && rng.chance(0.08 + 0.08*themeDensity)){
         signs.push({x,y}); props.push({kind:'clock',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:rng.f(0.75,0.9)});
-      } else if(!close && rng.chance(0.1 + 0.1*density)){
+      } else if(!close && rng.chance(0.1 + 0.1*themeDensity)){
         signs.push({x,y}); props.push({kind:'hospitalSign',x,y,dx:d[0],dy:d[1],...placement,rot:0,scale:0.9});
       }
     }
@@ -1586,7 +1601,7 @@ scene.add(dirL);
 
 /* -------- shared temp objects -------- */
 const _p=new THREE.Vector3(), _q=new THREE.Quaternion(), _s=new THREE.Vector3(),
-      _m=new THREE.Matrix4(), _c=new THREE.Color(), _Y=new THREE.Vector3(0,1,0),
+      _m=new THREE.Matrix4(), _c=new THREE.Color(), _X=new THREE.Vector3(1,0,0), _Y=new THREE.Vector3(0,1,0),
       _E=new THREE.Euler();
 const V3 = (x,y,z)=> new THREE.Vector3(x,y,z);
 
@@ -2516,6 +2531,120 @@ function buildLiquidMesh(cells, wx, wz, y){
   return new THREE.Mesh(g, liquidMat);
 }
 
+function stairPointToWorld(point,wx,wz){ return V3(wx(point.x),point.y,wz(point.z)); }
+function addStairRailBeam(root,start,end,kit,material,geos,profile=kit.railProfile){
+  const direction=end.clone().sub(start), length=direction.length();
+  if(length<.01) return null;
+  const round=profile==='round';
+  const mesh=new THREE.Mesh(round?geos.roundBeam:geos.squareBeam,material);
+  mesh.position.copy(start).add(end).multiplyScalar(.5);
+  mesh.quaternion.setFromUnitVectors(round?_Y:_X,direction.normalize());
+  if(round) mesh.scale.set(kit.railThickness,length,kit.railThickness);
+  else mesh.scale.set(length,kit.railThickness,kit.railThickness);
+  mesh.castShadow=true; mesh.receiveShadow=true;
+  root.add(mesh);
+  return mesh;
+}
+function addStairRailPost(root,base,kit,material,geos){
+  const top=base.clone(); top.y+=kit.railHeight;
+  const postKit={...kit,railThickness:kit.postThickness};
+  const post=addStairRailBeam(root,base,top,postKit,material,geos,kit.railProfile);
+  if(kit.rail.postStyle?.startsWith('stone-')){
+    const details=[
+      {y:base.y+(kit.rail.plinthHeight||.1)/2,size:kit.rail.plinthSize||kit.postThickness*1.2,height:kit.rail.plinthHeight||.1},
+      {y:top.y-(kit.rail.capitalHeight||.12)/2,size:kit.rail.capitalSize||kit.postThickness*1.25,height:kit.rail.capitalHeight||.12}
+    ];
+    for(const detail of details){
+      const mesh=new THREE.Mesh(geos.detail,material);
+      mesh.position.set(base.x,detail.y,base.z);
+      mesh.scale.set(detail.size,detail.height,detail.size);
+      mesh.castShadow=true; mesh.receiveShadow=true;
+      root.add(mesh);
+    }
+  }
+  return post;
+}
+function addThemedStairRails(root,connector,totalRise,lowerY,kit,material,geos,wx,wz){
+  const offset=(connector.width||2)/2+kit.railThickness*.55;
+  const segments=stairRailSegments(connector,totalRise,lowerY,offset);
+  const postKeys=new Set();
+  for(const segment of segments){
+    const start=stairPointToWorld({...segment.start,y:segment.start.y+kit.railHeight},wx,wz);
+    const end=stairPointToWorld({...segment.end,y:segment.end.y+kit.railHeight},wx,wz);
+    addStairRailBeam(root,start,end,kit,material,geos);
+    for(const t of railPostFractions(segment,kit.postSpacing)){
+      const point={
+        x:segment.start.x+(segment.end.x-segment.start.x)*t,
+        y:segment.start.y+(segment.end.y-segment.start.y)*t+.02,
+        z:segment.start.z+(segment.end.z-segment.start.z)*t
+      };
+      const key=`${point.x.toFixed(3)},${point.y.toFixed(3)},${point.z.toFixed(3)}`;
+      if(postKeys.has(key)) continue;
+      postKeys.add(key);
+      addStairRailPost(root,stairPointToWorld(point,wx,wz),kit,material,geos);
+    }
+  }
+}
+
+function addThemedOpeningRails(root,connector,upperY,kit,material,geos,wx,wz){
+  const segments=connector.openingGuardSegments || [];
+  const postKeys=new Set();
+  for(const segment of segments){
+    const baseStart={x:segment.x1,y:upperY+.02,z:segment.y1};
+    const baseEnd={x:segment.x2,y:upperY+.02,z:segment.y2};
+    const railStart=stairPointToWorld({...baseStart,y:baseStart.y+kit.railHeight},wx,wz);
+    const railEnd=stairPointToWorld({...baseEnd,y:baseEnd.y+kit.railHeight},wx,wz);
+    addStairRailBeam(root,railStart,railEnd,kit,material,geos);
+    const length=Math.hypot(baseEnd.x-baseStart.x,baseEnd.z-baseStart.z);
+    const divisions=Math.max(1,Math.ceil(length/Math.max(.25,kit.postSpacing)));
+    for(let i=0;i<=divisions;i++){
+      const t=i/divisions;
+      const point={
+        x:baseStart.x+(baseEnd.x-baseStart.x)*t,
+        y:baseStart.y,
+        z:baseStart.z+(baseEnd.z-baseStart.z)*t
+      };
+      const key=`${point.x.toFixed(3)},${point.y.toFixed(3)},${point.z.toFixed(3)}`;
+      if(postKeys.has(key)) continue;
+      postKeys.add(key);
+      addStairRailPost(root,stairPointToWorld(point,wx,wz),kit,material,geos);
+    }
+  }
+}
+
+function addProceduralStairLandingFrame(root,platform,surfaceY,kit,material,geos,wx,wz){
+  if(kit.landing.edgeFrame===false) return;
+  const border=Math.min(platform.visualSpan*.18,Math.max(.035,kit.landing.borderWidth||0));
+  const height=Math.min(.06,Math.max(.015,kit.landing.borderHeight||.025));
+  if(border<=0 || platform.visualSpan<=border*2) return;
+  const half=platform.visualSpan/2-border/2;
+  const inner=Math.max(.05,platform.visualSpan-border*2);
+  const y=surfaceY-height/2+.018;
+  const bars=[
+    {x:platform.center.x,z:platform.center.y-half,sx:platform.visualSpan,sz:border},
+    {x:platform.center.x,z:platform.center.y+half,sx:platform.visualSpan,sz:border},
+    {x:platform.center.x-half,z:platform.center.y,sx:border,sz:inner},
+    {x:platform.center.x+half,z:platform.center.y,sx:border,sz:inner}
+  ];
+  for(const bar of bars){
+    const mesh=new THREE.Mesh(geos.detail,material);
+    mesh.position.set(wx(bar.x),y,wz(bar.z));
+    mesh.scale.set(bar.sx,height,bar.sz);
+    mesh.castShadow=true; mesh.receiveShadow=true;
+    root.add(mesh);
+  }
+  if(kit.landing.centerPanel){
+    const inset=Math.min(platform.visualSpan*.32,Math.max(border,kit.landing.centerInset||border));
+    const span=Math.max(.08,platform.visualSpan-inset*2);
+    const panelHeight=Math.min(height,Math.max(.015,kit.landing.centerHeight||.025));
+    const panel=new THREE.Mesh(geos.detail,material);
+    panel.position.set(wx(platform.center.x),surfaceY-panelHeight/2+.017,wz(platform.center.y));
+    panel.scale.set(span,panelHeight,span);
+    panel.castShadow=true; panel.receiveShadow=true;
+    root.add(panel);
+  }
+}
+
 function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShells=true){
   if(!Array.isArray(dungeon.layers) || dungeon.layers.length<=1) return;
   const floorHeight=dungeon.floorHeight || FLOOR_HEIGHT;
@@ -2538,12 +2667,24 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     roughness:.92,metalness:0,
     transparent:!solidContext,opacity:solidContext?1:.14,depthWrite:solidContext
   });
-  const stairMat=new THREE.MeshStandardMaterial({color:TH.cap,roughness:.82,metalness:.03});
+  const stairKitBase=compileStairAssetRecipe(TH,{seed:dungeon.seed});
+  const stairMat=new THREE.MeshStandardMaterial({color:stairKitBase.treadColor,...stairKitBase.material.body});
+  const stairCapMat=new THREE.MeshStandardMaterial({color:stairKitBase.treadCapColor,...stairKitBase.material.trim});
+  const stairLandingMat=new THREE.MeshStandardMaterial({color:stairKitBase.landingColor,...stairKitBase.material.landing});
+  const stairRailMat=new THREE.MeshStandardMaterial({color:stairKitBase.railColor,...stairKitBase.material.rail});
+  const stairAccentMat=new THREE.MeshStandardMaterial({color:stairKitBase.markingColor,emissive:stairKitBase.markingColor,emissiveIntensity:.08,...stairKitBase.material.marking});
+  const stairRailGeos={
+    squareBeam:new THREE.BoxGeometry(1,1,1),
+    roundBeam:new THREE.CylinderGeometry(1,1,1,10),
+    marking:new THREE.BoxGeometry(1,1,1),
+    detail:new THREE.BoxGeometry(1,1,1)
+  };
+  levelGeos.push(stairRailGeos.squareBeam,stairRailGeos.roundBeam,stairRailGeos.marking,stairRailGeos.detail);
   const connectorLinkMat=new THREE.MeshStandardMaterial({
     color:TH.accent,emissive:TH.accent,emissiveIntensity:.24,
     roughness:.42,metalness:.04,transparent:true,opacity:.34,depthWrite:false
   });
-  levelMats.push(ghostMat,ghostWallMat,stairMat,connectorLinkMat);
+  levelMats.push(ghostMat,ghostWallMat,stairMat,stairCapMat,stairLandingMat,stairRailMat,stairAccentMat,connectorLinkMat);
   const exploded=floorViewMode==='explode';
   const spacing=exploded?EXPLODED_FLOOR_SPACING:1;
   const visibleFloor=floor=>floorViewMode==='all' || exploded || (floorViewMode==='neighbors' && Math.abs(floor-activeFloor)<=1);
@@ -2575,6 +2716,7 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
   for(const connector of dungeon.connectors || []){
     const touchesActive=connector.fromFloor===activeFloor || connector.toFloor===activeFloor;
     if(floorViewMode==='current' ? !touchesActive : (!visibleFloor(connector.fromFloor) && !visibleFloor(connector.toFloor))) continue;
+    const stairKit=compileStairAssetRecipe(TH,{seed:dungeon.seed,connectorId:connector.id});
     const lowerY=(connector.fromFloor-activeFloor)*floorHeight*spacing;
     const totalRise=(connector.rise || floorHeight)*spacing;
     if(exploded){
@@ -2602,6 +2744,11 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
       root.add(nodes);
       continue;
     }
+    const openingFloorVisible=connector.toFloor===activeFloor
+      || (floorViewMode!=='current' && visibleFloor(connector.toFloor));
+    if(openingFloorVisible){
+      addThemedOpeningRails(root,connector,lowerY+totalRise,stairKit,stairRailMat,stairRailGeos,wx,wz);
+    }
     if(connector.turn){
       const steps=connector.stepCount || Math.max(8,Math.round(floorHeight/.25));
       const firstSteps=connector.firstFlightSteps || Math.floor(steps/2);
@@ -2610,47 +2757,51 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
       const secondRun=connector.secondRun || Math.max(3,(connector.length||8)-firstRun);
       const d1=connector.directionVector || {x:1,y:0};
       const d2=connector.secondDirectionVector || {x:-d1.y,y:d1.x};
+      const turnPlatform=stairTurnPlatformMetrics(connector);
+      const firstOrigin=turnPlatform.first.start;
+      const secondOrigin=turnPlatform.second.start;
+      const landingThickness=.16;
       const stepGeo=new THREE.BoxGeometry(1,1,1);
-      const landingGeo=new THREE.BoxGeometry(1,.16,1);
-      const rimGeo=new THREE.BoxGeometry(1,.56,1);
-      levelGeos.push(stepGeo,landingGeo,rimGeo);
+      const landingGeo=new THREE.BoxGeometry(1,landingThickness,1);
+      levelGeos.push(stepGeo,landingGeo);
       const sm=new THREE.InstancedMesh(stepGeo,stairMat,steps);
+      const caps=new THREE.InstancedMesh(stairRailGeos.detail,stairCapMat,steps);
+      const markings=stairKit.edgeMarking ? new THREE.InstancedMesh(stairRailGeos.marking,stairAccentMat,steps) : null;
       const setStep=(index,origin,direction,along,depth,top)=>{
         const x=origin.x+direction.x*along, z=origin.y+direction.y*along;
         _p.set(wx(x),lowerY+top/2,wz(z)); _q.identity();
         _s.set(direction.x ? depth : connector.width,top,direction.x ? connector.width : depth);
         _m.compose(_p,_q,_s); sm.setMatrixAt(index,_m);
+        const plan=stairTreadAssetPlan(stairKit,index,connector.width,depth);
+        const perpendicular={x:-direction.y,y:direction.x};
+        const capAlong=along+plan.alongOffset;
+        const capX=origin.x+direction.x*capAlong+perpendicular.x*plan.lateralOffset;
+        const capZ=origin.y+direction.y*capAlong+perpendicular.y*plan.lateralOffset;
+        _p.set(wx(capX),lowerY+top-plan.capHeight/2+.012,wz(capZ));
+        _s.set(direction.x ? plan.capDepth : plan.capWidth,plan.capHeight,direction.x ? plan.capWidth : plan.capDepth);
+        _m.compose(_p,_q,_s); caps.setMatrixAt(index,_m);
+        if(markings){
+          const edgeAlong=along+depth/2-plan.markingInset;
+          _p.set(wx(origin.x+direction.x*edgeAlong),lowerY+top+.022,wz(origin.y+direction.y*edgeAlong));
+          _s.set(direction.x ? plan.markingDepth : plan.markingSpan,plan.markingHeight,direction.x ? plan.markingSpan : plan.markingDepth);
+          _m.compose(_p,_q,_s); markings.setMatrixAt(index,_m);
+        }
       };
       const tread1=firstRun/Math.max(1,firstSteps), tread2=secondRun/Math.max(1,secondSteps);
-      for(let i=0;i<firstSteps;i++) setStep(i,connector.lower,d1,(i+.5)*tread1,tread1,totalRise*(i+1)/steps);
-      for(let i=0;i<secondSteps;i++) setStep(firstSteps+i,connector.turn,d2,(i+.5)*tread2,tread2,totalRise*(firstSteps+i+1)/steps);
+      for(let i=0;i<firstSteps;i++) setStep(i,firstOrigin,d1,(i+.5)*tread1,tread1,totalRise*(i+1)/steps);
+      for(let i=0;i<secondSteps;i++) setStep(firstSteps+i,secondOrigin,d2,(i+.5)*tread2,tread2,totalRise*(firstSteps+i+1)/steps);
       sm.castShadow=true; sm.receiveShadow=true; root.add(sm);
+      caps.castShadow=true; caps.receiveShadow=true; root.add(caps);
+      if(markings){ markings.castShadow=false; markings.receiveShadow=true; root.add(markings); }
 
-      const landingDepth=connector.landingDepth || 2;
-      const landings=new THREE.InstancedMesh(landingGeo,stairMat,3);
-      const setLanding=(index,point,direction,length,y,width=connector.width)=>{
-        _p.set(wx(point.x),y,wz(point.y)); _q.identity();
-        _s.set(direction.x?length:width,1,direction.x?width:length);
-        _m.compose(_p,_q,_s); landings.setMatrixAt(index,_m);
-      };
-      setLanding(0,{x:connector.lower.x-d1.x*landingDepth/2,y:connector.lower.y-d1.y*landingDepth/2},d1,landingDepth+1,lowerY-.01);
-      setLanding(1,connector.turn,d1,connector.width+1,lowerY+totalRise*firstSteps/steps-.01,connector.width+1);
-      setLanding(2,{x:connector.upper.x+d2.x*landingDepth/2,y:connector.upper.y+d2.y*landingDepth/2},d2,landingDepth+1,lowerY+totalRise-.01);
-      landings.castShadow=true; landings.receiveShadow=true; root.add(landings);
-
-      const rims=new THREE.InstancedMesh(rimGeo,stairMat,4);
-      const setRim=(index,a,b,direction,side,y)=>{
-        const perpendicular={x:-direction.y,y:direction.x};
-        const offset=(connector.width/2+.12)*side;
-        _p.set(wx((a.x+b.x)/2+perpendicular.x*offset),y,wz((a.y+b.y)/2+perpendicular.y*offset)); _q.identity();
-        _s.set(direction.x ? Math.hypot(b.x-a.x,b.y-a.y) : .14,1,direction.x ? .14 : Math.hypot(b.x-a.x,b.y-a.y));
-        _m.compose(_p,_q,_s); rims.setMatrixAt(index,_m);
-      };
-      setRim(0,connector.lower,connector.turn,d1,1,lowerY+totalRise*.5+.28);
-      setRim(1,connector.lower,connector.turn,d1,-1,lowerY+totalRise*.5+.28);
-      setRim(2,connector.turn,connector.upper,d2,1,lowerY+totalRise+.28);
-      setRim(3,connector.turn,connector.upper,d2,-1,lowerY+totalRise+.28);
-      rims.castShadow=true; root.add(rims);
+      const landingSurfaceY=lowerY+totalRise*firstSteps/steps;
+      const turnLanding=new THREE.Mesh(landingGeo,stairLandingMat);
+      turnLanding.position.set(wx(turnPlatform.center.x),stairLandingCenterY(landingSurfaceY,landingThickness),wz(turnPlatform.center.y));
+      turnLanding.scale.set(turnPlatform.visualSpan,1,turnPlatform.visualSpan);
+      turnLanding.castShadow=true; turnLanding.receiveShadow=true; root.add(turnLanding);
+      addProceduralStairLandingFrame(root,turnPlatform,landingSurfaceY,stairKit,
+        stairKit.landing.accentBorder?stairAccentMat:stairCapMat,stairRailGeos,wx,wz);
+      addThemedStairRails(root,connector,totalRise,lowerY,stairKit,stairRailMat,stairRailGeos,wx,wz);
       continue;
     }
     const steps=connector.stepCount || Math.max(8,Math.round(floorHeight/.25));
@@ -2658,30 +2809,35 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     const run=connector.length || Math.max(1,Math.hypot(connector.upper.x-connector.lower.x,connector.upper.y-connector.lower.y));
     const treadDepth=connector.treadDepth || run/steps;
     const stepGeo=new THREE.BoxGeometry(alongX ? treadDepth : connector.width, 1, alongX ? connector.width : treadDepth);
-    const landingDepth=connector.landingDepth || 2;
-    const landingGeo=new THREE.BoxGeometry(alongX ? landingDepth+1 : connector.width, .16, alongX ? connector.width : landingDepth+1);
-    const rimGeo=new THREE.BoxGeometry(alongX ? run : .14, .56, alongX ? .14 : run);
-    levelGeos.push(stepGeo,landingGeo,rimGeo);
+    levelGeos.push(stepGeo);
     const sm=new THREE.InstancedMesh(stepGeo,stairMat,steps);
+    const caps=new THREE.InstancedMesh(stairRailGeos.detail,stairCapMat,steps);
+    const markings=stairKit.edgeMarking ? new THREE.InstancedMesh(stairRailGeos.marking,stairAccentMat,steps) : null;
     const dx=(connector.upper.x-connector.lower.x)/run, dz=(connector.upper.y-connector.lower.y)/run;
+    const centeredLower=stairRunCenter(connector.lower,{x:dx,y:dz},connector.width,connector.lateralCenterOffset);
     for(let i=0;i<steps;i++){
       const along=(i+.5)*treadDepth;
-      const x=connector.lower.x+dx*along, z=connector.lower.y+dz*along;
+      const x=centeredLower.x+dx*along, z=centeredLower.y+dz*along;
       const stepTop=totalRise*(i+1)/steps;
       _p.set(wx(x),lowerY+stepTop/2,wz(z)); _q.identity(); _s.set(1,stepTop,1); _m.compose(_p,_q,_s); sm.setMatrixAt(i,_m);
+      const plan=stairTreadAssetPlan(stairKit,i,connector.width,treadDepth);
+      const perpendicular={x:-dz,y:dx};
+      const capAlong=along+plan.alongOffset;
+      _p.set(wx(centeredLower.x+dx*capAlong+perpendicular.x*plan.lateralOffset),lowerY+stepTop-plan.capHeight/2+.012,
+        wz(centeredLower.y+dz*capAlong+perpendicular.y*plan.lateralOffset));
+      _s.set(alongX ? plan.capDepth : plan.capWidth,plan.capHeight,alongX ? plan.capWidth : plan.capDepth);
+      _m.compose(_p,_q,_s); caps.setMatrixAt(i,_m);
+      if(markings){
+        const edgeAlong=along+treadDepth/2-plan.markingInset;
+        _p.set(wx(centeredLower.x+dx*edgeAlong),lowerY+stepTop+.018,wz(centeredLower.y+dz*edgeAlong));
+        _s.set(alongX ? plan.markingDepth : plan.markingSpan,plan.markingHeight,alongX ? plan.markingSpan : plan.markingDepth);
+        _m.compose(_p,_q,_s); markings.setMatrixAt(i,_m);
+      }
     }
     sm.castShadow=true; sm.receiveShadow=true; root.add(sm);
-    const landings=new THREE.InstancedMesh(landingGeo,stairMat,2);
-    _q.identity(); _s.set(1,1,1);
-    _p.set(wx(connector.lower.x-dx*landingDepth/2),lowerY-.01,wz(connector.lower.y-dz*landingDepth/2)); _m.compose(_p,_q,_s); landings.setMatrixAt(0,_m);
-    _p.set(wx(connector.upper.x+dx*landingDepth/2),lowerY+totalRise-.01,wz(connector.upper.y+dz*landingDepth/2)); _m.compose(_p,_q,_s); landings.setMatrixAt(1,_m);
-    landings.castShadow=true; landings.receiveShadow=true; root.add(landings);
-    const rims=new THREE.InstancedMesh(rimGeo,stairMat,2);
-    const sideX=-dz*(connector.width/2+.12), sideZ=dx*(connector.width/2+.12);
-    const midX=(connector.lower.x+connector.upper.x)/2, midZ=(connector.lower.y+connector.upper.y)/2;
-    _p.set(wx(midX+sideX),lowerY+totalRise+.28,wz(midZ+sideZ)); _m.compose(_p,_q,_s); rims.setMatrixAt(0,_m);
-    _p.set(wx(midX-sideX),lowerY+totalRise+.28,wz(midZ-sideZ)); _m.compose(_p,_q,_s); rims.setMatrixAt(1,_m);
-    rims.castShadow=true; root.add(rims);
+    caps.castShadow=true; caps.receiveShadow=true; root.add(caps);
+    if(markings){ markings.castShadow=false; markings.receiveShadow=true; root.add(markings); }
+    addThemedStairRails(root,connector,totalRise,lowerY,stairKit,stairRailMat,stairRailGeos,wx,wz);
   }
 }
 
@@ -2735,7 +2891,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
       if(nx<0||ny<0||nx>=W||ny>=H || grid[idx(nx,ny)]===WALL) walls8++;
     }
     const rid = roomId[c];
-    if(TH.kit === 'hospital'){
+    if(TH.sceneKit === 'hospital'){
       base.set(corridor[c] ? 0x93aaa5 : 0xcbd6d2);
       if(rid>=0 && rooms[rid].type===TYPE.BOSS) base.lerp(tint.set(0xe2ebe7), 0.12);
       if(rid>=0 && rooms[rid].type===TYPE.ENTRANCE) base.lerp(tint.set(0xb7ccc7), 0.10);
@@ -2756,7 +2912,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     floorColorsHeat.push(heatA.clone().lerp(heatB, Math.min(1,diff)).multiplyScalar(0.55 + 0.45*(1-0.09*Math.min(walls8,4))).getHex());
     fs.add(wx(x), cellRng.f(-0.02,0.008), wz(y), 1,1,1, 0, floorColorsBase[floorColorsBase.length-1], Math.max(0,bfs[c])*dStep);
   }
-  meshes.floor = TH.kit === 'hospital'
+  meshes.floor = TH.sceneKit === 'hospital'
     ? buildMesh(fs, GEO.hospitalFloor, matHospitalFloor, 'tile', 0.34, 2)
     : buildMesh(fs, GEO.floor, matStone, 'tile', 0.34, 2);
 
@@ -2809,22 +2965,22 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   };
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
     if(grid[idx(x,y)]!==WALL || isDoorWallCut(x,y)) continue;
-    const h = TH.kit === 'hospital' ? 2.25 + cellRng.f(-0.08,0.08) : 2.0 + cellRng.f(-0.25,0.25);
+    const h = TH.themeAuthority.wallHeight + cellRng.f(-TH.themeAuthority.wallVariation,TH.themeAuthority.wallVariation);
     const dl = nearFloorBfs(x,y)*dStep + 0.30;
-    if(TH.kit === 'hospital'){
+    if(TH.sceneKit === 'hospital'){
       wcol.set(0xaebdb8).multiplyScalar(cellRng.f(0.99,1.02));
     } else {
       wcol.set(TH.wall).multiplyScalar(cellRng.f(0.9,1.08));
     }
     ws.add(wx(x),0,wz(y), 1,h,1, 0, wcol.getHex(), dl);
-    if(TH.kit === 'hospital') wcol.set(0xd0d9d5).multiplyScalar(cellRng.f(0.995,1.02));
+    if(TH.sceneKit === 'hospital') wcol.set(0xd0d9d5).multiplyScalar(cellRng.f(0.995,1.02));
     else wcol.set(TH.cap).multiplyScalar(cellRng.f(0.92,1.1));
-    cs.add(wx(x),h,wz(y), 1,1,1, 0, wcol.getHex(), dl+0.12);
+    cs.add(wx(x),h,wz(y), TH.themeAuthority.capScale,1,TH.themeAuthority.capScale, 0, wcol.getHex(), dl+0.12);
   }
-  meshes.wall = TH.kit === 'hospital'
+  meshes.wall = TH.sceneKit === 'hospital'
     ? buildMesh(ws, GEO.hospitalWall, matHospitalWall, 'rise', 0.42, 1)
     : buildMesh(ws, GEO.wall, matStone, 'rise', 0.42, 1);
-  meshes.wallCap = TH.kit === 'hospital'
+  meshes.wallCap = TH.sceneKit === 'hospital'
     ? buildMesh(cs, GEO.hospitalWallCap, matHospitalTrim, 'pop', 0.3, 1)
     : buildMesh(cs, GEO.wallCap, matStone, 'pop', 0.3, 1);
 
@@ -3070,7 +3226,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     const pose=doorFramePose(a), X=pose.X, Z=pose.Z;
     const half = a.len/2 + 0.15;
     const dlA = nearFloorBfs(pose.bfsX, pose.bfsY)*dStep + 0.7;
-    if(TH.kit === 'hospital'){
+    if(TH.sceneKit === 'hospital'){
       const col = lerpC(TH.wall, 0xe8f3ef, 0.35);
       const signC = accC;
       if(pose.horizontal){
@@ -3542,11 +3698,8 @@ const el = { seed:$('seed'), dice:$('dice'), forge:$('forge'),
   floorAddNext:$('floorAddNext'), floorAdd:$('floorAdd'), floorRemove:$('floorRemove'),
   tGraph:$('tGraph'), tHeat:$('tHeat'), tAnim:$('tAnim'), tPost:$('tPost'),
   tEditor:$('tEditor'), editorCanvas:$('editorCanvas'), editorStatus:$('editorStatus'), editorFullscreen:$('editorFullscreen'), editorCollapse:$('editorCollapse'), editorAddStair:$('editorAddStair'),
-  editorStairCycle:$('editorStairCycle'), editorStairConfirm:$('editorStairConfirm'), editorStairCancel:$('editorStairCancel'),
+  editorStairStyle:$('editorStairStyle'), editorStairCycle:$('editorStairCycle'), editorStairConfirm:$('editorStairConfirm'), editorStairCancel:$('editorStairCancel'),
   editorMenu:$('editorMenu'), editorExit:$('editorExit'), editorTitleText:$('editorTitleText'), editModeBtn:$('editModeBtn'),
-  editorPromptDialog:$('editorPromptDialog'), editorPromptEyebrow:$('editorPromptEyebrow'), editorPromptTitle:$('editorPromptTitle'),
-  editorPromptMessage:$('editorPromptMessage'), editorPromptFromFloor:$('editorPromptFromFloor'), editorPromptToFloor:$('editorPromptToFloor'),
-  editorPromptHint:$('editorPromptHint'), editorPromptConfirm:$('editorPromptConfirm'), editorPromptCancel:$('editorPromptCancel'),
   roomGroupAdd:$('roomGroupAdd'), roomGroupList:$('roomGroupList'), roomGroupEmpty:$('roomGroupEmpty'),
   roomGroupDialog:$('roomGroupDialog'), roomGroupForm:$('roomGroupForm'), roomGroupDialogTitle:$('roomGroupDialogTitle'),
   roomGroupName:$('roomGroupName'), roomGroupPrompt:$('roomGroupPrompt'), roomGroupImage:$('roomGroupImage'),
@@ -3622,16 +3775,23 @@ function updateFloorUI(){
   if(el.vDecor) el.vDecor.textContent=decorDensity+'%';
   syncStairToolUI();
 }
-function stairToolActive(){ return editor.tool==='stair-source' || editor.tool==='stair-preview'; }
+function stairToolActive(){ return editor.tool==='stair-place' || editor.tool==='stair-preview'; }
 function syncStairToolUI(){
   if(!el.editorAddStair) return;
   const active=stairToolActive();
   const preview=editor.tool==='stair-preview';
+  const placing=editor.tool==='stair-place';
   el.editorAddStair.classList.toggle('on',active);
   el.editorAddStair.setAttribute('aria-pressed',String(active));
-  el.editorAddStair.textContent=preview ? '楼梯预览' : (active ? '取消楼梯' : '＋ 楼梯');
+  el.editorAddStair.textContent=preview ? '楼梯预览' : (placing ? '点击放置楼梯' : '＋ 楼梯');
   el.editorAddStair.disabled=editor.floorCount<2;
   const stair=selectedEditorStair();
+  if(el.editorStairStyle){
+    el.editorStairStyle.hidden=!overlayOn() && !(preview || stair);
+    el.editorStairStyle.disabled=!(stair || placing);
+    el.editorStairStyle.value=stair ? (stair.previewStyle || stair.style || 'l-turn') : (placing ? editor.stairPlacementStyle : '');
+    el.editorStairStyle.title=stair ? '切换当前楼梯样式' : (placing ? '选择待放置的楼梯样式' : '请先在场景中选择一座楼梯');
+  }
   if(el.editorStairCycle){ el.editorStairCycle.hidden=!(preview || stair); el.editorStairCycle.disabled=!stair; }
   if(el.editorStairConfirm){ el.editorStairConfirm.hidden=!preview; el.editorStairConfirm.disabled=!!stair?.invalid || !stair?.previewAnchor; }
   if(el.editorStairCancel) el.editorStairCancel.hidden=!preview;
@@ -3741,18 +3901,25 @@ let settingSel = 'dungeon', paletteSel = 'ancient';
 function setSettingSel(t){
   settingSel = t;
   document.querySelectorAll('#settingChips .chip,#customSettingChips .chip').forEach(ch=>ch.classList.toggle('on', ch.dataset.s===t));
+  const authority=compileThemeAuthority(t,SETTINGS[t] || SETTINGS.dungeon);
+  setPaletteSel(resolveThemePaletteKey(authority,paletteSel));
 }
 function setPaletteSel(t){
-  paletteSel = t;
-  document.querySelectorAll('#paletteChips .chip').forEach(ch=>ch.classList.toggle('on', ch.dataset.p===t));
+  const settingKey=SETTINGS[settingSel] ? settingSel : 'dungeon';
+  const authority=compileThemeAuthority(settingKey,SETTINGS[settingKey]);
+  paletteSel = resolveThemePaletteKey(authority,t);
+  document.querySelectorAll('#paletteChips .chip').forEach(ch=>{
+    const compatible=authority.paletteKeys.includes(ch.dataset.p);
+    ch.hidden=!compatible;
+    ch.setAttribute('aria-hidden',compatible?'false':'true');
+    ch.classList.toggle('on', ch.dataset.p===paletteSel);
+  });
 }
 function resolveSetting(){
   return SETTINGS[settingSel] ? settingSel : 'dungeon';
 }
 function palettePoolForSetting(settingKey){
-  if(settingKey==='hospital') return HOSPITAL_PALETTE_KEYS;
-  if(settingKey==='dungeon') return DUNGEON_PALETTE_KEYS;
-  return PALETTE_KEYS;
+  return themePaletteKeys(compileThemeAuthority(settingKey,SETTINGS[settingKey] || SETTINGS.dungeon));
 }
 function resolvePalette(){
   return PALETTES[paletteSel] ? paletteSel : 'ancient';
@@ -3943,7 +4110,7 @@ let loopRatesByFloor=[DEFAULT_LOOP_RATE,DEFAULT_LOOP_RATE];
 let decorDensitiesByFloor=[DEFAULT_DECOR_DENSITY,DEFAULT_DECOR_DENSITY];
 const pendingFloorEdits=new Set();
 let lastValidEditorState=null;
-const editor = { tool:'select', rooms:[], links:[], stairs:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, stairFrom:null, stairTargetFloor:null, stairDraftSnapshot:null, stairError:'', drag:null, scale:6, panX:0, panY:0, nextId:1, nextStairId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:2, currentFloor:0 };
+const editor = { tool:'select', rooms:[], links:[], stairs:[], blockedLinks:[], secretRooms:[], selectedId:null, selectedLinkKey:null, connectFrom:null, stairFrom:null, stairTargetFloor:null, stairDraftSnapshot:null, stairPlacementStyle:'l-turn', stairError:'', drag:null, scale:6, panX:0, panY:0, nextId:1, nextStairId:1, deb:null, full:false, collapsed:true, panelWidth:null, panelHeight:null, dirty:false, floorCount:2, currentFloor:0 };
 const ROOM_GROUP_STORAGE='dungeon.roomGroups.v1';
 const ROOM_GROUP_COLORS=['#5fd1c7','#7fd4ff','#e8973f','#9b6cf0','#d9a441','#59d68f','#ff7468','#d88ad8'];
 let roomGroups=[];
@@ -4215,7 +4382,7 @@ function exitEditMode(){
   hideEditorMenu();
   editState.ortho = false;
   sec.classList.remove('overlay', 'pre');
-  if(el.editorTitleText) el.editorTitleText.textContent = '2D 区域编辑器';
+  if(el.editorTitleText) el.editorTitleText.textContent = '场景布局编辑器';
   if(el.editModeBtn) el.editModeBtn.classList.remove('hidden');
   document.body.classList.remove('layout-edit-active');
   setPanelCollapsed(true);
@@ -4248,7 +4415,7 @@ function tickEditTransition(dt){
     }
   }
 }
-function editorDoorPoint(A, B, margin=1){
+function editorDoorPoint(A, B, margin=0){
   return roomDoorPoint({cx:A.x, cy:A.y, w:A.w, h:A.h}, {cx:B.x, cy:B.y, w:B.w, h:B.h}, margin);
 }
 function sceneEdgePoint(e, key){
@@ -4358,12 +4525,12 @@ function defaultLinkRoute(A,B){
   assignEdgeRoute(e);
   return edgeRoutePoints(e);
 }
-function linkWidth(l){ return Math.max(1, Math.min(6, Number.isFinite(l && l.width) ? l.width : 2)); }
+function linkWidth(l){ return Math.max(1, Math.min(3, Number.isFinite(l && l.width) ? l.width : 2)); }
 function clampDoorOffset(v){ return Math.max(-0.82, Math.min(0.82, Number.isFinite(v) ? v : 0)); }
 function pointToDoorSpec(room, p){
   const x0=room.x-room.w/2, x1=room.x+room.w/2, y0=room.y-room.h/2, y1=room.y+room.h/2;
-  const dists=[{side:'n',d:Math.abs(p.y-y0)},{side:'s',d:Math.abs(p.y-y1)},{side:'w',d:Math.abs(p.x-x0)},{side:'e',d:Math.abs(p.x-x1)}].sort((a,b)=>a.d-b.d);
-  const side=dists[0].side;
+  const side=['n','s','w','e'].includes(p?.side) ? p.side
+    : [{side:'n',d:Math.abs(p.y-y0)},{side:'s',d:Math.abs(p.y-y1)},{side:'w',d:Math.abs(p.x-x0)},{side:'e',d:Math.abs(p.x-x1)}].sort((a,b)=>a.d-b.d)[0].side;
   if(side==='n' || side==='s') return {side, offset:clampDoorOffset((p.x-room.x)/(room.w/2 || 1))};
   return {side, offset:clampDoorOffset((p.y-room.y)/(room.h/2 || 1))};
 }
@@ -4515,18 +4682,48 @@ function normalizeLinkBends(l, da=linkDoorPoint(l,'a'), db=linkDoorPoint(l,'b'))
 }
 function stairRotationHandle(stair){
   if(!stair?.lower || !stair?.upper) return null;
-  const segmentStart=stair.turn || stair.lower;
-  const dx=stair.upper.x-segmentStart.x, dy=stair.upper.y-segmentStart.y, length=Math.max(1,Math.hypot(dx,dy));
+  const segments=stairEditorSegments(stair);
+  const last=segments[segments.length-1];
+  if(!last) return null;
+  const upper=last.end;
+  const dx=last.end.x-last.start.x, dy=last.end.y-last.start.y, length=Math.max(1,Math.hypot(dx,dy));
   const perpendicular={x:-dy/length,y:dx/length};
-  const corner={x:stair.upper.x+perpendicular.x*(stair.width||2)/2,y:stair.upper.y+perpendicular.y*(stair.width||2)/2};
+  const corner={x:upper.x+perpendicular.x*(stair.width||2)/2,y:upper.y+perpendicular.y*(stair.width||2)/2};
   const distance=Math.max(1.8,(stair.width||2)/2+1.4);
-  const points=[stair.lower,stair.turn,stair.upper].filter(Boolean);
+  const platform=stairTurnPlatformMetrics(stair);
+  const points=segments.flatMap(segment=>[segment.start,segment.end]).concat(platform?.center || []).filter(Boolean);
   return {
-    point:{x:stair.upper.x+perpendicular.x*distance,y:stair.upper.y+perpendicular.y*distance},
+    point:{x:upper.x+perpendicular.x*distance,y:upper.y+perpendicular.y*distance},
     corner,
     center:{x:(Math.min(...points.map(point=>point.x))+Math.max(...points.map(point=>point.x)))/2,
       y:(Math.min(...points.map(point=>point.y))+Math.max(...points.map(point=>point.y)))/2}
   };
+}
+function stairWidthHandle(stair){
+  if(!stair?.lower || !(stair.turn || stair.upper)) return null;
+  const firstSegment=stairEditorSegments(stair)[0];
+  if(!firstSegment) return null;
+  const start=firstSegment.start, end=firstSegment.end;
+  const dx=end.x-start.x, dy=end.y-start.y, length=Math.max(.001,Math.hypot(dx,dy));
+  const direction={x:dx/length,y:dy/length};
+  const perpendicular={x:-dy/length,y:dx/length};
+  const center={x:(start.x+end.x)/2,y:(start.y+end.y)/2};
+  const halfWidth=(stair.width||2)/2;
+  return {
+    point:{x:center.x+perpendicular.x*(halfWidth+1),y:center.y+perpendicular.y*(halfWidth+1)},
+    edge:{x:center.x+perpendicular.x*halfWidth,y:center.y+perpendicular.y*halfWidth},
+    center,
+    perpendicular
+  };
+}
+function stairWidthHandleGlyph(){
+  // This is an interaction hint, not a world-axis indicator. Keep it stable
+  // when the stair or camera view rotates; the handle geometry still follows
+  // the stair's local width axis.
+  return '↔';
+}
+function formatStairWidth(width){
+  return Number(width || 2).toFixed(2);
 }
 function editorLinkHandleAt(p){
   /* handles are only drawn for the selected link, so only that link's handles
@@ -4537,11 +4734,18 @@ function editorLinkHandleAt(p){
   if(!l) return null;
   const tol=Math.max(1.4, 9/editor.scale);
   if(l.stair){
+    const stairHandles=[];
     const rotation=stairRotationHandle(l.stair);
     if(rotation){
       const d=Math.hypot(p.x-rotation.point.x,p.y-rotation.point.y);
-      if(d<=Math.max(tol,12/editor.scale)) return {kind:'stairRotate',link:l,point:rotation.point,center:rotation.center,d};
+      if(d<=Math.max(tol,14/editor.scale)) stairHandles.push({kind:'stairRotate',link:l,point:rotation.point,center:rotation.center,d});
     }
+    const widthHandle=stairWidthHandle(l.stair);
+    if(widthHandle){
+      const d=Math.hypot(p.x-widthHandle.point.x,p.y-widthHandle.point.y);
+      if(d<=Math.max(tol,18/editor.scale)) stairHandles.push({kind:'stairWidth',link:l,...widthHandle,d});
+    }
+    if(stairHandles.length) return stairHandles.sort((a,b)=>a.d-b.d || (a.kind==='stairWidth'?-1:1))[0];
   }
   let best=null;
   for(const h of linkHandles(l)){
@@ -4582,7 +4786,9 @@ function editorLinkAt(p){
     const af=A.floor||0, bf=B.floor||0;
     if(af!==bf){
       if((af!==editor.currentFloor && bf!==editor.currentFloor) || !l.stair) continue;
-      const hit=hitRouteSegment(p,[l.stair.lower,l.stair.turn,l.stair.upper].filter(Boolean),Math.max(l.stair.width/2,8/editor.scale));
+      const segments=stairEditorSegments(l.stair);
+      const route=segments.flatMap((segment,index)=>index?[segment.start,segment.end]:[segment.start,segment.end]);
+      const hit=hitRouteSegment(p,route,Math.max(l.stair.width/2,8/editor.scale));
       if(hit && (!best || hit.d<best.hit.d)) best={link:l,hit,stair:true};
       continue;
     }
@@ -4706,7 +4912,7 @@ function ensureEditorStairForLink(link){
   if(!roomA || !roomB || Math.abs((roomA.floor||0)-(roomB.floor||0))!==1) return null;
   const lower=(roomA.floor||0)<(roomB.floor||0)?roomA:roomB, upper=lower===roomA?roomB:roomA;
   stair={id:'stair-'+editor.nextStairId++,fromRoomId:lower.id,toRoomId:upper.id,fromFloor:lower.floor||0,toFloor:upper.floor||0,
-    mode:'stable-auto',anchor:null,direction:null,width:2,length:null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:false,invalid:false,error:''};
+    mode:'stable-auto',style:'l-turn',anchor:null,direction:null,width:2,length:null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:false,invalid:false,error:''};
   editor.stairs.push(stair); link.stairId=stair.id; link.kind='stairs';
   return stair;
 }
@@ -4774,11 +4980,15 @@ function stairSpecForGenerator(link){
   return {
     id:stair.id,
     mode:stair.mode || 'stable-auto',
+    style:stair.previewStyle || stair.style || 'l-turn',
     anchor:stair.pending && !stair.manualPreview ? null : (stair.pending ? {...stair.previewAnchor} : (stair.anchor ? {...stair.anchor} : null)),
     direction:stair.pending && !stair.manualPreview ? null : (stair.pending ? stair.previewDirection : stair.direction),
-    width:stair.width || 2,
-    length:stair.length || undefined,
-    landingDepth:stair.landingDepth || 2,
+    width:stair.previewWidth || stair.width || 2,
+    lateralCenterOffset:Number.isFinite(stair.previewLateralCenterOffset)
+      ? stair.previewLateralCenterOffset
+      : (Number.isFinite(stair.lateralCenterOffset) ? stair.lateralCenterOffset : undefined),
+    length:stair.previewLength || stair.length || undefined,
+    landingDepth:stair.previewLandingDepth || stair.landingDepth || 2,
     candidateIndex:stair.candidateIndex || 0
   };
 }
@@ -4802,106 +5012,60 @@ function cancelAddStair({returnToSource=false}={}){
   if(returnToSource && source && (source.floor||0)!==editor.currentFloor) setEditorFloor(source.floor||0);
   else drawEditor();
 }
-function openEditorPrompt({eyebrow='楼梯匹配',title,message,fromFloor,toFloor,hint='将自动创建匹配结构，然后进入楼梯预览。',confirmLabel='确认',cancelLabel='取消',notice=false}){
-  const dialog=el.editorPromptDialog;
-  if(!dialog) return Promise.resolve(false);
-  if(dialog.open) dialog.close('cancel');
-  el.editorPromptEyebrow.textContent=eyebrow;
-  el.editorPromptTitle.textContent=title;
-  el.editorPromptMessage.textContent=message;
-  el.editorPromptFromFloor.parentElement.hidden=notice;
-  el.editorPromptFromFloor.innerHTML=`第 ${fromFloor+1} 层<small>当前层</small>`;
-  el.editorPromptToFloor.innerHTML=`第 ${toFloor+1} 层<small>目标层</small>`;
-  el.editorPromptHint.textContent=hint;
-  el.editorPromptCancel.hidden=notice;
-  el.editorPromptCancel.textContent=cancelLabel;
-  el.editorPromptConfirm.textContent=confirmLabel;
-  dialog.returnValue='cancel';
-  dialog.showModal();
-  requestAnimationFrame(()=>el.editorPromptConfirm.focus());
-  return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true}));
+function roomContainsEditorPoint(room,point){
+  return !!room && !!point
+    && point.x>=room.x-room.w/2 && point.x<=room.x+room.w/2
+    && point.y>=room.y-room.h/2 && point.y<=room.y+room.h/2;
 }
-async function beginAddStair(source=null,preferredDelta=1){
+function targetRoomForDirectStair(source,targetFloor,point){
+  return editor.rooms.filter(room=>{
+    if(!room || room.id===source.id || (room.floor||0)!==targetFloor || !roomContainsEditorPoint(room,point)) return false;
+    const link=editor.links.find(item=>editorLinkKey(item.a,item.b)===editorLinkKey(source.id,room.id));
+    return !link;
+  }).sort((a,b)=>(a.stairRoom===b.stairRoom?0:(a.stairRoom?-1:1)) || a.w*a.h-b.w*b.h || a.id-b.id)[0] || null;
+}
+function placeDirectStair(room,point,preferredDelta=1){
+  const targetFloor=chooseStairTargetFloor(room.floor||0,editor.floorCount,preferredDelta);
+  if(targetFloor===null){ alert('当前区域没有可连接的相邻楼层。'); return false; }
+  const placement=directStairPlacement(point,editor.stairPlacementStyle,8);
+  if(!placement) return false;
+  const draftSnapshot=captureEditorState();
+  let target=targetRoomForDirectStair(room,targetFloor,point);
+  if(!target){
+    const pairId='direct-stair-'+editor.nextStairId;
+    target={id:editor.nextId++,x:editorSnap(point.x),y:editorSnap(point.y),w:10,h:10,
+      floor:targetFloor,shape:'rect',locked:true,roleHint:null,roomGroupId:room.roomGroupId || null,stairRoom:true,stairRoomPairId:pairId};
+    editor.rooms.push(target);
+  }
+  editor.stairFrom=room.id;
+  editor.stairTargetFloor=targetFloor;
+  roomCountsByFloor[targetFloor]=editor.rooms.filter(item=>(item.floor||0)===targetFloor).length;
+  pendingFloorEdits.add(room.floor||0);
+  pendingFloorEdits.add(targetFloor);
+  updateFloorUI();
+  return completeAddStair(target,{draftSnapshot,placement});
+}
+function beginAddStair(source=null,preferredDelta=1,point=null){
   if(editor.floorCount<2){ alert('至少需要两层才能添加楼梯。'); return false; }
-  const room=source || editorRoom(editor.selectedId);
-  if(!room || (room.floor||0)!==editor.currentFloor){
+  if(!source || (source.floor||0)!==editor.currentFloor){
     editor.stairFrom=null;
     editor.stairTargetFloor=null;
-    editor.tool='stair-source';
+    editor.stairError='';
+    editor.tool='stair-place';
     editor.selectedId=null;
     editor.selectedLinkKey=null;
+    editor.connectFrom=null;
     hideEditorMenu();
     syncStairToolUI();
     drawEditor();
     return true;
   }
-  const targetFloor=chooseStairTargetFloor(room.floor||0,editor.floorCount,preferredDelta);
-  if(targetFloor===null){ alert('当前区域没有可连接的相邻楼层。'); return false; }
-  const sourceFloorSnapshot=captureEditorState();
-  editor.stairFrom=room.id;
-  editor.stairTargetFloor=targetFloor;
-  editor.tool='stair-source';
-  editor.selectedId=room.id;
-  editor.selectedLinkKey=null;
-  editor.connectFrom=null;
+  const placementPoint=point || {x:source.x,y:source.y};
+  if(!roomContainsEditorPoint(source,placementPoint)) return false;
   hideEditorMenu();
-  syncStairToolUI();
-  const matches=matchingStairRooms(room,editor.rooms,targetFloor).filter(target=>{
-    const link=editor.links.find(item=>editorLinkKey(item.a,item.b)===editorLinkKey(room.id,target.id));
-    return !link || !editorStairForLink(link);
-  });
-  if(matches.length){
-    completeAddStair(matches[0],{draftSnapshot:sourceFloorSnapshot});
-    return true;
-  }
-  const createMatchedRooms=!matches.length && await openEditorPrompt({
-    title:'创建匹配楼梯间？',
-    message:'目标楼层没有与当前区域重叠、可用于楼梯井的房间。',
-    fromFloor:room.floor||0,
-    toFloor:targetFloor,
-    hint:'将自动在上下层创建一对重叠楼梯间，然后进入楼梯预览。',
-    confirmLabel:'创建并预览',
-    cancelLabel:'暂不创建'
-  });
-  if(createMatchedRooms){
-    const placement=pairedStairRoomPlacement(room,editor.rooms,targetFloor);
-    if(!placement){
-      await openEditorPrompt({
-        eyebrow:'楼梯匹配失败',title:'附近没有足够空间',
-        message:'上下层附近没有足够的共享空间创建成对楼梯间。',
-        fromFloor:room.floor||0,toFloor:targetFloor,
-        hint:'请移动房间或清理附近结构后重新添加楼梯。',confirmLabel:'知道了',notice:true
-      });
-      editor.stairFrom=null; editor.stairTargetFloor=null; editor.tool='select'; editor.selectedId=room.id;
-      syncStairToolUI(); drawEditor();
-      return true;
-    }
-    const pairId='stair-room-pair-'+editor.nextStairId;
-    const sourceStairRoom={id:editor.nextId++,x:placement.x,y:placement.y,w:placement.w,h:placement.h,
-      floor:room.floor||0,shape:'rect',locked:true,roleHint:null,roomGroupId:room.roomGroupId || null,stairRoom:true,stairRoomPairId:pairId};
-    const targetStairRoom={id:editor.nextId++,x:placement.x,y:placement.y,w:placement.w,h:placement.h,
-      floor:targetFloor,shape:'rect',locked:true,roleHint:null,roomGroupId:room.roomGroupId || null,stairRoom:true,stairRoomPairId:pairId};
-    editor.rooms.push(sourceStairRoom,targetStairRoom);
-    editor.links.push({a:room.id,b:sourceStairRoom.id,bends:[],width:2,manual:true,generated:false,kind:'corridor'});
-    editor.stairFrom=sourceStairRoom.id;
-    editor.stairTargetFloor=targetFloor;
-    roomCountsByFloor[room.floor||0]=editor.rooms.filter(item=>(item.floor||0)===(room.floor||0)).length;
-    roomCountsByFloor[targetFloor]=editor.rooms.filter(item=>(item.floor||0)===targetFloor).length;
-    pendingFloorEdits.add(room.floor||0);
-    pendingFloorEdits.add(targetFloor);
-    updateFloorUI();
-    completeAddStair(targetStairRoom,{draftSnapshot:sourceFloorSnapshot});
-  } else if(!matches.length) {
-    editor.stairFrom=null;
-    editor.stairTargetFloor=null;
-    editor.tool='select';
-    editor.selectedId=room.id;
-    syncStairToolUI();
-    drawEditor();
-  }
-  return true;
+  return placeDirectStair(source,placementPoint,preferredDelta);
 }
-function completeAddStair(target,{draftSnapshot=null}={}){
+function completeAddStair(target,{draftSnapshot=null,placement=null}={}){
   const source=editorRoom(editor.stairFrom);
   const error=stairPairError(source,target);
   if(error){ alert(error); return false; }
@@ -4921,10 +5085,20 @@ function completeAddStair(target,{draftSnapshot=null}={}){
   unblockEditorLink(source.id,target.id);
   const lower=(source.floor||0)<(target.floor||0)?source:target;
   const upper=lower===source?target:source;
+  const direct=!!placement;
   const stair={id:'stair-'+editor.nextStairId++,fromRoomId:lower.id,toRoomId:upper.id,fromFloor:lower.floor||0,toFloor:upper.floor||0,
-    mode:'stable-auto',anchor:null,direction:null,width:2,length:null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:true,invalid:false,error:''};
+    mode:direct?'locked':'stable-auto',style:placement?.style || 'l-turn',anchor:placement?{...placement.anchor}:null,direction:placement?.direction || null,
+    width:2,length:placement?.length || null,landingDepth:2,candidateIndex:0,candidateCount:0,pending:true,manualPreview:direct,
+    previewAnchor:placement?{...placement.anchor}:null,previewDirection:placement?.direction || null,previewStyle:placement?.style || 'l-turn',
+    previewWidth:2,previewLength:placement?.length || null,previewLandingDepth:2,invalid:false,error:''};
   editor.stairs.push(stair);
-  const link={a:source.id,b:target.id,bends:[],width:2,manual:true,generated:false,kind:'stairs',stairId:stair.id};
+  if(direct){
+    Object.assign(source,adaptRoomToRotatedStair(source,stair,placement));
+    Object.assign(target,adaptRoomToRotatedStair(target,stair,placement));
+  }
+  const previewVisual=direct ? stairVisualForRotation({style:placement.style,lower:{...placement.anchor},upper:{...placement.anchor},
+    fromFloor:lower.floor||0,toFloor:upper.floor||0,width:2,stepCount:12},stair,placement) : null;
+  const link={a:source.id,b:target.id,bends:[],width:2,manual:true,generated:false,kind:'stairs',stairId:stair.id,stair:previewVisual};
   editor.links.push(link);
   editor.stairFrom=null;
   editor.stairTargetFloor=null;
@@ -4944,7 +5118,9 @@ function confirmStairPreview(){
   if(!stair || !stair.pending || stair.invalid || !stair.previewAnchor){ return false; }
   stair.anchor={...stair.previewAnchor};
   stair.direction=stair.previewDirection;
+  stair.style=stair.previewStyle || stair.style || 'l-turn';
   stair.width=stair.previewWidth || stair.width;
+  stair.lateralCenterOffset=stair.previewLateralCenterOffset;
   stair.length=stair.previewLength || stair.length;
   stair.landingDepth=stair.previewLandingDepth || stair.landingDepth;
   stair.pending=false;
@@ -4978,17 +5154,58 @@ function rotateSelectedStair90(){
   stair.previewAnchor={...rotated.anchor};
   stair.previewDirection=rotated.direction;
   stair.previewLength=rotated.length;
+  stair.previewStyle=rotated.style || stair.previewStyle || stair.style || 'l-turn';
   stair.mode='locked';
   stair.manualPreview=!!stair.pending;
   if(!stair.pending){
     stair.anchor={...rotated.anchor};
     stair.direction=rotated.direction;
     stair.length=rotated.length;
+    stair.style=stair.previewStyle;
   }
   stair.invalid=false;
   stair.error='';
   stair.roomAdapted=roomAdapted;
   editor.stairError='';
+  forgeFromEditor(false);
+  return true;
+}
+function setSelectedStairStyle(requestedStyle){
+  const stair=selectedEditorStair();
+  const link=editor.selectedLinkKey ? editor.links.find(item=>editorLinkKey(item.a,item.b)===editor.selectedLinkKey) : null;
+  const changed=changeStairStyle(stair,link?.stair,requestedStyle);
+  if(!stair || !link || !changed) return false;
+  const routeSnapshots=captureAdaptiveRoutes();
+  let roomAdapted=false;
+  stair.previewStyle=changed.style;
+  for(const roomId of new Set([stair.fromRoomId,stair.toRoomId])){
+    const room=editorRoom(roomId);
+    if(!room) continue;
+    const adapted=adaptRoomToRotatedStair(room,stair,changed);
+    if(!adapted) continue;
+    if(adapted.x!==room.x || adapted.y!==room.y || adapted.w!==room.w || adapted.h!==room.h) roomAdapted=true;
+    Object.assign(room,adapted);
+    pendingFloorEdits.add(room.floor||0);
+  }
+  applyAdaptiveRoutes(routeSnapshots);
+  stair.previewAnchor={...changed.anchor};
+  stair.previewDirection=changed.direction;
+  stair.previewLength=changed.length;
+  stair.mode='locked';
+  stair.manualPreview=!!stair.pending;
+  if(!stair.pending){
+    stair.anchor={...changed.anchor};
+    stair.direction=changed.direction;
+    stair.length=changed.length;
+    stair.style=changed.style;
+  }
+  link.stair=stairVisualForRotation(link.stair,stair,changed);
+  stair.invalid=false;
+  stair.error='';
+  stair.roomAdapted=roomAdapted;
+  editor.stairError='';
+  syncStairToolUI();
+  drawEditor();
   forgeFromEditor(false);
   return true;
 }
@@ -5241,35 +5458,68 @@ function drawEditorCorridor(g, pts, color, width, selected=false){
   g.stroke();
   g.restore();
 }
+function stairEditorSegments(stair){
+  if(stair?.turn){
+    const platform=stairTurnPlatformMetrics(stair);
+    if(!platform) return [];
+    return [platform.first,platform.second].map(segment=>({
+      start:{...segment.start},end:{...segment.end},length:segment.length,direction:{...segment.direction}
+    }));
+  }
+  const raw=stair?.turn
+    ? [[stair.lower,stair.turn],[stair.turn,stair.upper]]
+    : [[stair?.lower,stair?.upper]];
+  return raw.filter(([start,end])=>start && end).map(([start,end])=>{
+    const dx=end.x-start.x,dy=end.y-start.y,length=Math.max(.001,Math.hypot(dx,dy));
+    const direction={x:dx/length,y:dy/length};
+    return {
+      start:stairRunCenter(start,direction,stair.width||2,stair.lateralCenterOffset),
+      end:stairRunCenter(end,direction,stair.width||2,stair.lateralCenterOffset),
+      length,
+      direction
+    };
+  });
+}
 function drawEditorStair(g, stair, selected=false, invalid=false){
   if(!stair || (stair.fromFloor!==editor.currentFloor && stair.toFloor!==editor.currentFloor)) return;
   const a=stair.lower, b=stair.upper, dx=b.x-a.x, dy=b.y-a.y, len=Math.max(1,Math.hypot(dx,dy));
+  const segments=stairEditorSegments(stair);
   const lower=stair.fromFloor===editor.currentFloor;
   g.save();
   g.fillStyle=invalid?'rgba(255,72,72,.24)':(lower?'rgba(232,151,63,.24)':'rgba(155,108,240,.20)');
-  g.strokeStyle=invalid?'#ff5f5f':(selected?'#ffd36a':(lower?'#e8973f':'#b58cff'));
+  const outlineColor=invalid?'#ff5f5f':(selected?'#ffd36a':(lower?'#e8973f':'#b58cff'));
+  g.strokeStyle=outlineColor;
   g.lineWidth=selected?2.5:1.6;
   if(!lower) g.setLineDash([6,4]);
-  const route=[a,stair.turn,b].filter(Boolean);
   if(stair.turn){
-    const canvasRoute=route.map(point=>editorWorldToCanvas(point.x,point.y));
     g.lineJoin='round'; g.lineCap='butt';
     g.strokeStyle=g.fillStyle;
     g.globalAlpha=.9; g.lineWidth=Math.max(4,(stair.width||2)*editor.scale);
-    g.beginPath(); canvasRoute.forEach((point,index)=>index?g.lineTo(point.x,point.y):g.moveTo(point.x,point.y)); g.stroke();
-    g.globalAlpha=1; g.strokeStyle=invalid?'#ff5f5f':(selected?'#ffd36a':(lower?'#e8973f':'#b58cff')); g.lineWidth=selected?2.5:1.6;
-    g.beginPath(); canvasRoute.forEach((point,index)=>index?g.lineTo(point.x,point.y):g.moveTo(point.x,point.y)); g.stroke();
+    for(const segment of segments){
+      const start=editorWorldToCanvas(segment.start.x,segment.start.y),end=editorWorldToCanvas(segment.end.x,segment.end.y);
+      g.beginPath(); g.moveTo(start.x,start.y); g.lineTo(end.x,end.y); g.stroke();
+    }
+    const platform=stairTurnPlatformMetrics(stair);
+    if(platform){
+      const topLeft=editorWorldToCanvas(platform.center.x-platform.visualSpan/2,platform.center.y-platform.visualSpan/2);
+      g.fillRect(topLeft.x,topLeft.y,platform.visualSpan*editor.scale,platform.visualSpan*editor.scale);
+    }
+    g.globalAlpha=1; g.strokeStyle=outlineColor; g.lineWidth=selected?2.5:1.6;
+    for(const segment of segments){
+      const start=editorWorldToCanvas(segment.start.x,segment.start.y),end=editorWorldToCanvas(segment.end.x,segment.end.y);
+      g.beginPath(); g.moveTo(start.x,start.y); g.lineTo(end.x,end.y); g.stroke();
+    }
   } else {
+    const segment=segments[0],centerA=segment?.start || a,centerB=segment?.end || b;
     const px=-dy/len*(stair.width||2)/2, py=dx/len*(stair.width||2)/2;
-    const corners=[{x:a.x+px,y:a.y+py},{x:b.x+px,y:b.y+py},{x:b.x-px,y:b.y-py},{x:a.x-px,y:a.y-py}].map(p=>editorWorldToCanvas(p.x,p.y));
+    const corners=[{x:centerA.x+px,y:centerA.y+py},{x:centerB.x+px,y:centerB.y+py},{x:centerB.x-px,y:centerB.y-py},{x:centerA.x-px,y:centerA.y-py}].map(p=>editorWorldToCanvas(p.x,p.y));
     g.beginPath(); corners.forEach((p,i)=>i?g.lineTo(p.x,p.y):g.moveTo(p.x,p.y)); g.closePath(); g.fill(); g.stroke();
   }
   g.setLineDash([]);
   const steps=Math.min(12,stair.stepCount||12);
-  const routeLengths=route.slice(0,-1).map((point,index)=>Math.hypot(route[index+1].x-point.x,route[index+1].y-point.y));
-  const totalLength=routeLengths.reduce((sum,value)=>sum+value,0) || 1;
-  for(let segment=0;segment<route.length-1;segment++){
-    const start=route[segment], end=route[segment+1], sx=end.x-start.x, sy=end.y-start.y, segmentLength=Math.max(1,routeLengths[segment]);
+  const totalLength=segments.reduce((sum,segment)=>sum+segment.length,0) || 1;
+  for(const segment of segments){
+    const start=segment.start,end=segment.end,sx=end.x-start.x,sy=end.y-start.y,segmentLength=Math.max(1,segment.length);
     const segmentSteps=Math.max(2,Math.round(steps*segmentLength/totalLength));
     const px=-sy/segmentLength*(stair.width||2)/2, py=sx/segmentLength*(stair.width||2)/2;
     for(let i=1;i<segmentSteps;i++){
@@ -5279,9 +5529,11 @@ function drawEditorStair(g, stair, selected=false, invalid=false){
     }
   }
   g.globalAlpha=1;
-  const anchor=editorWorldToCanvas(lower?a.x:b.x,lower?a.y:b.y);
+  const lowerAnchor=segments[0]?.start || a,upperAnchor=segments[segments.length-1]?.end || b;
+  const anchor=editorWorldToCanvas(lower?lowerAnchor.x:upperAnchor.x,lower?lowerAnchor.y:upperAnchor.y);
   g.fillStyle=invalid?'#ff9090':(lower?'#ffd39a':'#d0b6ff'); g.font='12px sans-serif';
-  g.fillText((invalid?'冲突 · ':'')+(lower?'上楼 → F'+(stair.toFloor+1):'下楼 → F'+(stair.fromFloor+1)),anchor.x+9,anchor.y-8);
+  const styleLabel=stair.style==='straight'?'直跑':'L 型';
+  g.fillText((invalid?'冲突 · ':'')+(lower?'上楼 → F'+(stair.toFloor+1):'下楼 → F'+(stair.fromFloor+1))+` · ${styleLabel} · 宽 ${formatStairWidth(stair.width)}`,anchor.x+9,anchor.y-8);
   if(selected){
     const rotation=stairRotationHandle(stair);
     if(rotation){
@@ -5291,6 +5543,15 @@ function drawEditorStair(g, stair, selected=false, invalid=false){
       g.beginPath(); g.arc(handle.x,handle.y,7,0,Math.PI*2); g.fill(); g.stroke();
       g.fillStyle=invalid?'#ff9090':'#ffe3a3'; g.font='11px sans-serif'; g.textAlign='center'; g.textBaseline='middle';
       g.fillText('↻',handle.x,handle.y+.5); g.textAlign='start'; g.textBaseline='alphabetic';
+    }
+    const widthHandle=stairWidthHandle(stair);
+    if(widthHandle){
+      const edge=editorWorldToCanvas(widthHandle.edge.x,widthHandle.edge.y), handle=editorWorldToCanvas(widthHandle.point.x,widthHandle.point.y);
+      g.strokeStyle=invalid?'#ff7474':'#65d8ff'; g.fillStyle='#121724'; g.lineWidth=1.8; g.setLineDash([3,3]);
+      g.beginPath(); g.moveTo(edge.x,edge.y); g.lineTo(handle.x,handle.y); g.stroke(); g.setLineDash([]);
+      g.beginPath(); g.rect(handle.x-7,handle.y-7,14,14); g.fill(); g.stroke();
+      g.fillStyle=invalid?'#ff9090':'#9be8ff'; g.font='10px sans-serif'; g.textAlign='center'; g.textBaseline='middle';
+      g.fillText(stairWidthHandleGlyph(),handle.x,handle.y+.5); g.textAlign='start'; g.textBaseline='alphabetic';
     }
   }
   g.restore();
@@ -5424,13 +5685,15 @@ function drawEditor(){
   let status = currentFloorRooms.length + ' 区域 · ' + currentFloorLinks.length + ' 条路径';
   if(link) status = '已选路径 · ' + (link.manual?'手动':'生成') + ' · ' + (Array.isArray(link.bends)?link.bends.length:0) + ' 个转折点';
   const selectedStair=editorStairForLink(link);
-  if(selectedStair) status='已选楼梯 · '+(selectedStair.mode==='locked'?'已锁定':'稳定自动')+(selectedStair.invalid?' · 冲突':'');
+  if(selectedStair){
+    status='已选楼梯 · '+((selectedStair.previewStyle || selectedStair.style)==='straight'?'直跑':'L 型')+' · 宽 '+formatStairWidth(selectedStair.previewWidth || selectedStair.width)+' · '+stairWidthHandleGlyph()+' 拖动改宽 · 0.25 步进 · '+(selectedStair.mode==='locked'?'已锁定':'稳定自动')+(selectedStair.invalid?' · 冲突':'');
+  }
   if(selected) status = (selected.locked?'已选锁定':'已选可动') + ' · 区域#' + (si+1);
   if(floatingCount) status = '有 ' + floatingCount + ' 个悬浮区域 · 可作为密室';
-  if(editor.tool==='stair-source') status='添加楼梯 · 请选择要放置楼梯的房间';
+  if(editor.tool==='stair-place') status=editor.stairError || '添加楼梯 · 点击房间内的位置直接放置';
   if(editor.tool==='stair-preview'){
     const stair=selectedEditorStair();
-    status=stair?.invalid ? '楼梯位置冲突 · 请旋转或取消' : '房间内楼梯预览 · 可旋转 90° 或确认';
+    status=stair?.invalid ? '楼梯位置冲突 · 请调整样式、宽度或旋转' : '房间内楼梯预览 · 可切换样式、拖宽或旋转';
   } else if(editor.stairError) status='楼梯冲突 · '+editor.stairError;
    el.editorStatus.textContent = 'F'+(editor.currentFloor+1)+' · ' + status;
    syncStairToolUI();
@@ -5584,7 +5847,9 @@ function syncEditorStairFromConnector(link,connector,offset){
   stair.toFloor=connector.toFloor;
   stair.previewAnchor={x:connector.lower.x-offset.x,y:connector.lower.y-offset.y};
   stair.previewDirection=connector.direction;
+  stair.previewStyle=connector.style || 'l-turn';
   stair.previewWidth=connector.width;
+  stair.previewLateralCenterOffset=connector.lateralCenterOffset;
   stair.previewLength=connector.length;
   stair.previewLandingDepth=connector.landingDepth;
   stair.candidateIndex=connector.candidateIndex || 0;
@@ -5594,7 +5859,9 @@ function syncEditorStairFromConnector(link,connector,offset){
   if(!stair.pending && !stair.anchor){
     stair.anchor={...stair.previewAnchor};
     stair.direction=stair.previewDirection;
+    stair.style=stair.previewStyle;
     stair.width=stair.previewWidth;
+    stair.lateralCenterOffset=stair.previewLateralCenterOffset;
     stair.length=stair.previewLength;
     stair.landingDepth=stair.previewLandingDepth;
   }
@@ -5618,6 +5885,7 @@ function syncEditorLinksFromDungeon(d){
     const nl = prev ? {...prev, a:ea.id, b:eb.id, kind:e.kind, connectorId:e.connectorId, generated:!prev.manual, width:linkWidth(prev)} : {a:ea.id, b:eb.id, bends:[], width:2, kind:e.kind, connectorId:e.connectorId, generated:true};
     const connector=e.kind==='stairs' ? d.connectors?.find(c=>c.id===e.connectorId) : null;
     nl.stair=connector ? {
+       style:connector.style || 'l-turn',
        fromFloor:connector.fromFloor, toFloor:connector.toFloor,
        lower:{x:connector.lower.x-offset.x,y:connector.lower.y-offset.y},
        turn:connector.turn?{x:connector.turn.x-offset.x,y:connector.turn.y-offset.y}:null,
@@ -5626,7 +5894,8 @@ function syncEditorLinksFromDungeon(d){
       upperApproach:{x:connector.upperApproach.x-offset.x,y:connector.upperApproach.y-offset.y},
        direction:connector.direction, directionVector:{...connector.directionVector},
        secondDirection:connector.secondDirection, secondDirectionVector:connector.secondDirectionVector?{...connector.secondDirectionVector}:null,
-       width:connector.width, length:connector.length, stepCount:connector.stepCount,
+       width:connector.width, lateralCenterOffset:connector.lateralCenterOffset,
+       length:connector.length, stepCount:connector.stepCount,
        firstRun:connector.firstRun, secondRun:connector.secondRun,
        firstFlightSteps:connector.firstFlightSteps, secondFlightSteps:connector.secondFlightSteps,
        landingDepth:connector.landingDepth
@@ -5636,6 +5905,12 @@ function syncEditorLinksFromDungeon(d){
        rects, in editor coords) so the preview matches the generated geometry
        instead of re-guessing doors and elbows */
     const cr = Array.isArray(e.route) && e.route.length>=2 ? clipRouteToRooms(e.route, A, B) : null;
+    if(cr && cr.length>=2 && e.kind==='corridor'){
+      const start={x:cr[0].x-offset.x,y:cr[0].y-offset.y};
+      const end={x:cr[cr.length-1].x-offset.x,y:cr[cr.length-1].y-offset.y};
+      nl.doorA=pointToDoorSpec(ea,start);
+      nl.doorB=pointToDoorSpec(eb,end);
+    }
     nl.autoRoute = cr && cr.length>=2 ? cr.map(p=>({x:p.x-offset.x, y:p.y-offset.y, side:p.side})) : null;
     nl.autoWidth = Number.isFinite(e.carvedWidth) ? e.carvedWidth : null;
     next.push(nl);
@@ -5814,6 +6089,14 @@ function initEditor(){
     if(stairToolActive()) cancelAddStair({returnToSource:true});
     else beginAddStair();
   });
+  if(el.editorStairStyle) el.editorStairStyle.addEventListener('change',()=>{
+    if(editor.tool==='stair-place' && !selectedEditorStair()){
+      editor.stairPlacementStyle=el.editorStairStyle.value || 'l-turn';
+      editor.stairError='';
+      syncStairToolUI();
+      drawEditor();
+    } else setSelectedStairStyle(el.editorStairStyle.value);
+  });
   if(el.editorStairCycle) el.editorStairCycle.addEventListener('click',rotateSelectedStair90);
   if(el.editorStairConfirm) el.editorStairConfirm.addEventListener('click',confirmStairPreview);
   if(el.editorStairCancel) el.editorStairCancel.addEventListener('click',()=>cancelAddStair());
@@ -5850,7 +6133,7 @@ function initEditor(){
             const source=editorRoom(editor.connectFrom), crossFloor=source && Math.abs((source.floor||0)-(r.floor||0))===1;
             if(crossFloor){
               editor.connectFrom=null; hideEditorMenu();
-              alert('跨层连接请使用顶部“＋ 楼梯”。选择房间后会直接在房间内部放置楼梯。');
+              alert('跨层连接请使用顶部“＋ 楼梯”，然后点击房间内希望放置楼梯的位置。');
             } else { toggleEditorLink(editor.connectFrom, r.id); editor.connectFrom=null; hideEditorMenu(); editorRequestForge(); }
           }
           else { editor.connectFrom=r.id; editor.selectedId=r.id; hideEditorMenu(); drawEditor(); }
@@ -5873,7 +6156,7 @@ function initEditor(){
       } else if(ctx && ctx.link && action==='narrower'){
         ctx.link.width=Math.max(1, linkWidth(ctx.link)-1); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
       } else if(ctx && ctx.link && action==='wider'){
-        ctx.link.width=Math.min(6, linkWidth(ctx.link)+1); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
+        ctx.link.width=Math.min(3, linkWidth(ctx.link)+1); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
       } else if(ctx && ctx.link && action==='delete-link'){
         blockEditorLink(ctx.link.a, ctx.link.b);
         editor.links=editor.links.filter(l=>l!==ctx.link);
@@ -5919,7 +6202,7 @@ function initEditor(){
   el.editorMenu._ctx = null;
   el.editorCanvas.addEventListener('contextmenu', e=>{
     e.preventDefault();
-    if(editor.tool==='stair-source'){ cancelAddStair({returnToSource:true}); return; }
+    if(editor.tool==='stair-place'){ cancelAddStair({returnToSource:true}); return; }
     const p=editorPointer(e);
     if(editor.tool==='stair-preview'){
       const previewHit=editorLinkAt(p);
@@ -5941,10 +6224,10 @@ function initEditor(){
       return;
     }
     const p=editorPointer(e);
-    if(editor.tool==='stair-source'){
+    if(editor.tool==='stair-place'){
       const stairHit=editorHit(p);
-      if(stairHit) beginAddStair(stairHit.room);
-      else drawEditor();
+      if(stairHit && roomContainsEditorPoint(stairHit.room,p)) beginAddStair(stairHit.room,1,p);
+      else { editor.stairError='请点击当前楼层房间内部'; drawEditor(); }
       return;
     }
     const handle = editorLinkHandleAt(p);
@@ -5957,8 +6240,17 @@ function initEditor(){
         const roomStarts=[...new Set([stair.fromRoomId,stair.toRoomId])].map(id=>editorRoom(id)).filter(Boolean).map(room=>({room,start:{...room}}));
         editor.drag={mode:'stairRotate',link:l,stair,start:p,stairStart:{...stair,
           anchor:stair.anchor?{...stair.anchor}:null,previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null},
-          visualStart:{...l.stair,lower:{...l.stair.lower},upper:{...l.stair.upper},lowerApproach:{...l.stair.lowerApproach},upperApproach:{...l.stair.upperApproach}},
+          visualStart:{...l.stair,lower:{...l.stair.lower},turn:l.stair.turn?{...l.stair.turn}:null,upper:{...l.stair.upper},lowerApproach:{...l.stair.lowerApproach},upperApproach:{...l.stair.upperApproach}},
           roomStarts,routeSnapshots:captureAdaptiveRoutes(),rotated:null};
+      }
+      else if(handle.kind==='stairWidth'){
+        const stair=editorStairForLink(l);
+        if(!stair || !l.stair){ editor.drag=null; drawEditor(); return; }
+        const roomStarts=[...new Set([stair.fromRoomId,stair.toRoomId])].map(id=>editorRoom(id)).filter(Boolean).map(room=>({room,start:{...room}}));
+        editor.drag={mode:'stairWidth',link:l,stair,start:p,stairStart:{...stair,
+          anchor:stair.anchor?{...stair.anchor}:null,previewAnchor:stair.previewAnchor?{...stair.previewAnchor}:null},
+          visualStart:{...l.stair,lower:{...l.stair.lower},turn:l.stair.turn?{...l.stair.turn}:null,upper:{...l.stair.upper},lowerApproach:{...l.stair.lowerApproach},upperApproach:{...l.stair.upperApproach}},
+          roomStarts,routeSnapshots:captureAdaptiveRoutes(),width:stair.previewWidth || stair.width || l.stair.width || 2};
       }
       else if(handle.kind==='bend') editor.drag={mode:'routeBend', link:l, bendIndex:handle.bendIndex};
       else editor.drag={mode:'routeDoor', link:l, which:handle.which, startRoom:handle.which==='a'?l.a:l.b};
@@ -6021,6 +6313,33 @@ function initEditor(){
       drag.stair.previewAnchor={...rotated.anchor};
       drag.stair.previewDirection=rotated.direction;
       drag.stair.previewLength=rotated.length;
+      drag.stair.previewStyle=rotated.style || drag.stair.previewStyle || drag.stair.style || 'l-turn';
+      drag.stair.roomAdapted=roomAdapted;
+      drag.stair.invalid=false; drag.stair.error=''; editor.stairError='';
+      drawEditor(); return;
+    }
+    else if(editor.drag.mode==='stairWidth'){
+      const drag=editor.drag, resized=stairWidthResizeFromPointer(drag.stairStart,drag.visualStart,p,{startPointer:drag.start});
+      if(!resized){ drawEditor(); return; }
+      const {width,lateralCenterOffset}=resized;
+      drag.width=width;
+      drag.lateralCenterOffset=lateralCenterOffset;
+      drag.stair.previewWidth=width;
+      drag.stair.previewLateralCenterOffset=lateralCenterOffset;
+      const placement={
+        anchor:{...(drag.stair.previewAnchor || drag.stair.anchor || drag.visualStart.lower)},
+        direction:drag.stair.previewDirection || drag.stair.direction || drag.visualStart.direction,
+        length:drag.stair.previewLength || drag.stair.length || drag.visualStart.length,
+        style:drag.stair.previewStyle || drag.stair.style || drag.visualStart.style || 'l-turn'
+      };
+      let roomAdapted=false;
+      for(const snapshot of drag.roomStarts){
+        Object.assign(snapshot.room,snapshot.start);
+        const adapted=adaptRoomToRotatedStair(snapshot.start,drag.stair,placement);
+        if(adapted.x!==snapshot.start.x || adapted.y!==snapshot.start.y || adapted.w!==snapshot.start.w || adapted.h!==snapshot.start.h) roomAdapted=true;
+        Object.assign(snapshot.room,adapted);
+      }
+      drag.link.stair={...drag.visualStart,width,lateralCenterOffset};
       drag.stair.roomAdapted=roomAdapted;
       drag.stair.invalid=false; drag.stair.error=''; editor.stairError='';
       drawEditor(); return;
@@ -6085,8 +6404,21 @@ function initEditor(){
       const {stair,rotated,roomStarts,routeSnapshots}=editor.drag;
       if(!rotated){ editor.drag=null; drawEditor(); return; }
       stair.mode='locked'; stair.manualPreview=!!stair.pending;
-      stair.previewAnchor={...rotated.anchor}; stair.previewDirection=rotated.direction; stair.previewLength=rotated.length;
-      if(!stair.pending){ stair.anchor={...rotated.anchor}; stair.direction=rotated.direction; stair.length=rotated.length; }
+      stair.previewAnchor={...rotated.anchor}; stair.previewDirection=rotated.direction; stair.previewLength=rotated.length; stair.previewStyle=rotated.style || stair.previewStyle || stair.style || 'l-turn';
+      if(!stair.pending){ stair.anchor={...rotated.anchor}; stair.direction=rotated.direction; stair.length=rotated.length; stair.style=stair.previewStyle; }
+      stair.invalid=false; stair.error=''; editor.stairError='';
+      for(const snapshot of roomStarts) pendingFloorEdits.add(snapshot.room.floor||0);
+      applyAdaptiveRoutes(routeSnapshots);
+      editor.drag=null; drawEditor(); forgeFromEditor(false); return;
+    }
+    if(editor.drag.mode==='stairWidth'){
+      const {stair,width,lateralCenterOffset,roomStarts,routeSnapshots}=editor.drag;
+      stair.mode='locked'; stair.manualPreview=!!stair.pending; stair.previewWidth=width;
+      stair.previewLateralCenterOffset=lateralCenterOffset;
+      if(!stair.pending){
+        stair.width=width;
+        stair.lateralCenterOffset=lateralCenterOffset;
+      }
       stair.invalid=false; stair.error=''; editor.stairError='';
       for(const snapshot of roomStarts) pendingFloorEdits.add(snapshot.room.floor||0);
       applyAdaptiveRoutes(routeSnapshots);
@@ -6513,7 +6845,7 @@ addEventListener('keydown', e=>{
       const order = SETTING_KEYS.concat(customSettings.map(record=>customSettingKey(record.id)));
       setSettingSel(order[(order.indexOf(settingSel)+1) % order.length]);
     } else {
-      const order = PALETTE_KEYS;
+      const order = palettePoolForSetting(resolveSetting());
       setPaletteSel(order[(order.indexOf(paletteSel)+1) % order.length]);
     }
     forge(true);
@@ -6532,6 +6864,7 @@ addEventListener('resize', ()=>{
 });
 
 /* -------- go -------- */
+setSettingSel(settingSel);
 renderCustomSettings();
 forge(true);
 syncEditorFromDungeon(D);
