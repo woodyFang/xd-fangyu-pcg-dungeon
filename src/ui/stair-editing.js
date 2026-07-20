@@ -1,6 +1,10 @@
 import {
   STAIR_DIRECTIONS,
+  STAIR_WIDTH,
   normalizeStairStyle,
+  snapStairGridPoint,
+  snapStairWidth,
+  stairLateralCenterOffset,
   stairShape,
   stairTurnPlatformMetrics
 } from '../domain/stair-contract.js';
@@ -24,8 +28,7 @@ export function directStairPlacement(point, style = 'l-turn', length = 8) {
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
   const normalizedStyle = style === 'straight' ? 'straight' : 'l-turn';
   const run = Math.max(4, Math.round(Number(length) || 8));
-  const x = Math.round(point.x);
-  const y = Math.round(point.y);
+  const {x,y}=snapStairGridPoint(point);
   if (normalizedStyle === 'straight') {
     return { anchor: { x: x - Math.round(run / 2), y }, direction: 'east', length: run, style: normalizedStyle };
   }
@@ -124,10 +127,10 @@ export function pairedStairRoomPlacement(source, rooms, targetFloor) {
 
 function shiftedPoint(point, delta) {
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
-  return {
+  return snapStairGridPoint({
     x: point.x + (Number.isFinite(delta?.x) ? delta.x : 0),
     y: point.y + (Number.isFinite(delta?.y) ? delta.y : 0)
-  };
+  });
 }
 
 export function translateStairPlacement(stair, visual, delta) {
@@ -341,7 +344,9 @@ export function adaptRoomToRotatedStair(room, stair, rotated) {
   return { ...room, w: Math.ceil(halfWidth * 2), h: Math.ceil(halfHeight * 2) };
 }
 
-export function stairWidthFromPointer(stair, visual, pointer, {min=1,max=5,step=0.25,handleGap=1}={}) {
+export function stairWidthFromPointer(stair, visual, pointer, {
+  min=STAIR_WIDTH.min,max=STAIR_WIDTH.max,step=STAIR_WIDTH.step,handleGap=1
+}={}) {
   const start=visual?.lower || stair?.previewAnchor || stair?.anchor;
   const end=visual?.turn || visual?.upper;
   if(!start || !end || !pointer) return null;
@@ -351,23 +356,25 @@ export function stairWidthFromPointer(stair, visual, pointer, {min=1,max=5,step=
   const center={x:(start.x+end.x)/2,y:(start.y+end.y)/2};
   const distance=Math.abs((pointer.x-center.x)*perpendicular.x+(pointer.y-center.y)*perpendicular.y);
   const rawWidth=Math.max(0,distance-handleGap)*2;
-  const snapped=Math.round(rawWidth/step)*step;
-  return Number(Math.max(min,Math.min(max,snapped)).toFixed(4));
+  return snapStairWidth(rawWidth,{min,max,step});
 }
 
-export function stairWidthResizeFromPointer(stair, visual, pointer, {min=1,max=5,step=0.25,handleGap=1,startPointer=null}={}) {
+export function stairWidthResizeFromPointer(stair, visual, pointer, {
+  min=STAIR_WIDTH.min,max=STAIR_WIDTH.max,step=STAIR_WIDTH.step,handleGap=1,startPointer=null
+}={}) {
   const start=visual?.lower || stair?.previewAnchor || stair?.anchor;
   const end=visual?.turn || visual?.upper;
   if(!start || !end || !pointer) return null;
   const dx=end.x-start.x,dy=end.y-start.y,length=Math.hypot(dx,dy);
   if(length<0.001) return null;
   const perpendicular={x:-dy/length,y:dx/length};
-  const startWidth=Number(visual?.width || stair?.previewWidth || stair?.width || 2);
-  const startOffset=Number.isFinite(Number(visual?.lateralCenterOffset))
+  const startWidth=snapStairWidth(visual?.width || stair?.previewWidth || stair?.width || 2,{min,max,step});
+  const rawStartOffset=Number.isFinite(Number(visual?.lateralCenterOffset))
     ? Number(visual.lateralCenterOffset)
     : (Number.isFinite(Number(stair?.previewLateralCenterOffset))
       ? Number(stair.previewLateralCenterOffset)
       : (Number.isFinite(Number(stair?.lateralCenterOffset)) ? Number(stair.lateralCenterOffset) : 0));
+  const startOffset=stairLateralCenterOffset(startWidth,rawStartOffset);
   const rawCenter={
     x:(start.x+end.x)/2,
     y:(start.y+end.y)/2
@@ -385,11 +392,10 @@ export function stairWidthResizeFromPointer(stair, visual, pointer, {min=1,max=5
     : null;
   const pointerDistance=(pointer.x-fixedEdge.x)*perpendicular.x+(pointer.y-fixedEdge.y)*perpendicular.y;
   const rawWidth=Math.max(0,dragDelta===null ? pointerDistance-handleGap : startWidth+dragDelta);
-  const snapped=Math.round(rawWidth/step)*step;
-  const width=Number(Math.max(min,Math.min(max,snapped)).toFixed(4));
+  const width=snapStairWidth(rawWidth,{min,max,step});
   return {
     width,
-    lateralCenterOffset:Number((startOffset+(width-startWidth)/2).toFixed(4))
+    lateralCenterOffset:stairLateralCenterOffset(width,startOffset+(width-startWidth)/2)
   };
 }
 

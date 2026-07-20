@@ -10,6 +10,7 @@ import {
   stairLateralCenterOffset,
   stairRailRuns,
   stairRailSegments,
+  stairRailProtectionSegments,
   stairColorContrast,
   stairRunCenter,
   stairTreadAssetPlan,
@@ -75,6 +76,33 @@ test('clinical stairs keep concrete surfaces non-metallic and rails metallic', (
   assert.ok(recipe.material.rail.roughness<recipe.material.body.roughness);
 });
 
+test('every stair theme requires lighting and selects a fitting fixture family', () => {
+  const base={floor:0x6f6f68,corridor:0x62625c,wall:0x55544f,cap:0x817c72,accent:'#ef9b4a',
+    torchLight:[0xffa45a,1.4,9]};
+  const dungeon=compileStairAssetRecipe({...base,kit:'dungeon'});
+  const hospital=compileStairAssetRecipe({...base,kit:'hospital'});
+  const industrial=compileStairAssetRecipe({...base,kit:'custom',settingLabel:'industrial factory'});
+  const timber=compileStairAssetRecipe({...base,kit:'custom',settingLabel:'wooden mine'});
+  assert.equal(dungeon.lighting.fixture,'torch-sconce');
+  assert.equal(dungeon.lighting.mount,'wall');
+  assert.equal(dungeon.lighting.themeAsset,'dungeon-torch');
+  assert.equal(dungeon.lighting.assetSource,'theme-prop-library');
+  assert.equal(hospital.lighting.fixture,'clinical-wall-light');
+  assert.equal(hospital.lighting.mount,'wall');
+  assert.equal(hospital.lighting.themeAsset,'hospital-wall-light');
+  assert.equal(hospital.lighting.assetSource,'theme-prop-library');
+  assert.equal(industrial.lighting.fixture,'cage-pendant');
+  assert.equal(industrial.lighting.themeAsset,'industrial-cage-pendant');
+  assert.equal(timber.lighting.fixture,'lantern-sconce');
+  assert.equal(timber.lighting.themeAsset,'timber-lantern-sconce');
+  for(const recipe of [dungeon,hospital,industrial,timber]){
+    assert.equal(recipe.lighting.required,true);
+    assert.ok(recipe.lighting.minimumFixtures>=2);
+    assert.ok(recipe.lighting.intensity>0);
+    assert.ok(recipe.lighting.distance>=5);
+  }
+});
+
 test('theme compiles into a procedural shape recipe without structural authority', () => {
   const industrial=compileStairAssetRecipe({
     kit:'custom',settingLabel:'深海工业站',themePrompt:'钢铁管道、机械平台与冷色警示灯',
@@ -96,11 +124,11 @@ test('procedural stair assets are deterministic and stay inside the contract wid
     {seed:123,connectorId:'connector-a'});
   const other=compileStairAssetRecipe({kit:'dungeon',cap:0x111111,floor:0x222222,wall:0x333333},
     {seed:123,connectorId:'connector-b'});
-  const plan=stairTreadAssetPlan(recipe,3,2.25,.35);
+  const plan=stairTreadAssetPlan(recipe,3,3,.35);
   assert.equal(recipe.variantSeed,again.variantSeed);
   assert.notEqual(recipe.variantSeed,other.variantSeed);
-  assert.ok(plan.capWidth<=2.25);
-  assert.ok(Math.abs(plan.lateralOffset)+plan.capWidth/2<=2.25/2+1e-9);
+  assert.ok(plan.capWidth<=3);
+  assert.ok(Math.abs(plan.lateralOffset)+plan.capWidth/2<=3/2+1e-9);
   assert.ok(plan.capDepth<=.35*1.2+1e-9);
 });
 
@@ -127,7 +155,7 @@ test('turn platform separates exact visual width from conservative raster occupa
     directionVector:{x:1,y:0},secondDirectionVector:{x:0,y:1}
   };
   assert.equal(stairGridSpan(2),2);
-  assert.equal(stairGridSpan(2.25),3);
+  assert.equal(stairGridSpan(2.25),2);
   assert.equal(stairLateralCenterOffset(2),.5);
   assert.equal(stairLateralCenterOffset(3),0);
   assert.deepEqual(stairRunCenter({x:4,y:6},{x:1,y:0},2),{x:4,y:6.5});
@@ -140,30 +168,30 @@ test('turn platform separates exact visual width from conservative raster occupa
   assert.equal(platform.visualSpan,2);
   assert.equal(platform.gridSpan,2);
   assert.equal(platform.offset,.5);
-  const fractional=stairTurnPlatformMetrics({...connector,width:2.25});
-  assert.deepEqual(fractional.center,{x:11.125,y:20});
-  assert.deepEqual(fractional.exit,{x:11.125,y:21.125});
-  assert.equal(fractional.visualSpan,2.25);
-  assert.equal(fractional.gridSpan,3);
-  assert.equal(fractional.offset,0);
+  const normalized=stairTurnPlatformMetrics({...connector,width:2.25});
+  assert.deepEqual(normalized.center,{x:11,y:20.5});
+  assert.deepEqual(normalized.exit,{x:11,y:21.5});
+  assert.equal(normalized.visualSpan,2);
+  assert.equal(normalized.gridSpan,2);
+  assert.equal(normalized.offset,.5);
 });
 
 test('edited stair width shifts its center so the opposite edge stays fixed', () => {
   const start=stairRunCenter({x:4,y:6},{x:1,y:0},2,.5);
-  const widened=stairRunCenter({x:4,y:6},{x:1,y:0},2.25,.625);
+  const widened=stairRunCenter({x:4,y:6},{x:1,y:0},3,1);
   assert.deepEqual(start,{x:4,y:6.5});
-  assert.deepEqual(widened,{x:4,y:6.625});
-  assert.equal(start.y-2/2,widened.y-2.25/2);
+  assert.deepEqual(widened,{x:4,y:7});
+  assert.equal(start.y-2/2,widened.y-3/2);
   const platform=stairTurnPlatformMetrics({
-    width:2.25,lateralCenterOffset:.625,lower:{x:6,y:20},turn:{x:10,y:20},upper:{x:10,y:24},firstRun:4,secondRun:4,
+    width:3,lateralCenterOffset:1,lower:{x:6,y:20},turn:{x:10,y:20},upper:{x:10,y:24},firstRun:4,secondRun:4,
     directionVector:{x:1,y:0},secondDirectionVector:{x:0,y:1}
   });
-  assert.deepEqual(platform.center,{x:11.125,y:20.625});
-  assert.deepEqual(platform.entry,{x:10,y:20.625});
-  assert.deepEqual(platform.exit,{x:11.125,y:21.75});
-  assert.equal(platform.visualSpan,2.25);
+  assert.deepEqual(platform.center,{x:11.5,y:21});
+  assert.deepEqual(platform.entry,{x:10,y:21});
+  assert.deepEqual(platform.exit,{x:11.5,y:22.5});
+  assert.equal(platform.visualSpan,3);
   assert.equal(platform.gridSpan,3);
-  assert.equal(platform.offset,.625);
+  assert.equal(platform.offset,1);
 });
 
 test('landing box center keeps its top surface aligned with the adjoining tread', () => {
@@ -234,7 +262,7 @@ test('L stair inner rails stay continuous for every orientation and edited width
     [{x:-1,y:0},{x:0,y:-1}],
     [{x:0,y:-1},{x:1,y:0}]
   ];
-  for(const width of [1,2,2.25,3,4.5]){
+  for(const width of [1,2,3,4,5]){
     for(const [first,second] of directions){
       const lower={x:20,y:20};
       const turn={x:lower.x+first.x*4,y:lower.y+first.y*4};
@@ -253,4 +281,70 @@ test('L stair inner rails stay continuous for every orientation and edited width
       assert.ok(Math.hypot(secondInner.end.x-secondInner.start.x,secondInner.end.z-secondInner.start.z)>3.8);
     }
   }
+});
+
+test('real stairwell walls replace floor-mounted guards and split mixed wall/open runs', () => {
+  const connector={
+    width:2,lower:{x:0,y:0},upper:{x:4,y:0},lateralCenterOffset:.5,
+    stairwellLowerWallSegments:[
+      {x1:0,y1:-.5,x2:1,y2:-.5,normal:{x:0,y:-1}},
+      {x1:1,y1:-.5,x2:2,y2:-.5,normal:{x:0,y:-1}}
+    ]
+  };
+  const segments=stairRailProtectionSegments(connector,4,0,1.08,{wallInset:.18});
+  const wall=segments.filter(segment=>segment.protection==='wall-handrail');
+  const guards=segments.filter(segment=>segment.protection==='guardrail');
+  assert.equal(wall.length,1);
+  assert.equal(wall[0].start.x,0);
+  assert.equal(wall[0].end.x,2);
+  assert.ok(Math.abs(wall[0].start.z-(-.32))<1e-9,'wall handrail must sit inside the wall face');
+  assert.equal(guards.length,2,'the opposite side and uncovered remainder stay guarded');
+  assert.ok(guards.some(segment=>segment.side===-1&&Math.abs(segment.start.x-2.1)<1e-9&&segment.end.x===4),
+    'the exposed guard must resume after the final wall cell clearance');
+  assert.ok(guards.some(segment=>segment.side===1&&segment.start.x===0&&segment.end.x===4));
+});
+
+test('stairs without a real wall keep complete guardrails on both sides', () => {
+  const connector={width:3,lower:{x:1,y:2},upper:{x:7,y:2}};
+  const segments=stairRailProtectionSegments(connector,4,0,1.58);
+  assert.equal(segments.length,2);
+  assert.ok(segments.every(segment=>segment.protection==='guardrail'));
+});
+
+test('a guardrail end is trimmed before it enters a perpendicular generated wall cell', () => {
+  const connector={
+    width:2,lower:{x:0,y:0},upper:{x:4,y:0},lateralCenterOffset:.5,
+    stairwellLowerWallSegments:[
+      {x1:3.5,y1:-.5,x2:3.5,y2:.5,normal:{x:1,y:0}}
+    ]
+  };
+  const segments=stairRailProtectionSegments(connector,4,0,1.08,{wallClearance:.1});
+  const blocked=segments.filter(segment=>segment.protection==='wall-blocked'&&segment.side===-1);
+  const guard=segments.find(segment=>segment.protection==='guardrail'&&segment.side===-1);
+  assert.equal(blocked.length,1);
+  assert.ok(Math.abs(guard.end.x-3.4)<1e-9,'guard beam must stop before the wall cell and its clearance');
+  assert.ok(Math.abs(blocked[0].start.x-3.4)<1e-9);
+  assert.equal(blocked[0].end.x,4);
+});
+
+test('a wall-backed stair gets a continuous finish strip without adding one to the open side', async () => {
+  const {stairWallFinishSegments}=await import('../src/render/stair-style.js');
+  const connector={
+    width:2,lower:{x:0,y:0},upper:{x:4,y:0},lateralCenterOffset:.5,
+    stairwellLowerWallSegments:[
+      {x1:0,y1:-.5,x2:1,y2:-.5,normal:{x:0,y:-1}},
+      {x1:1,y1:-.5,x2:2,y2:-.5,normal:{x:0,y:-1}}
+    ]
+  };
+  const finishes=stairWallFinishSegments(connector,4,0,1.08,{
+    wallInset:.025,finishHeight:.24,finishThickness:.06
+  });
+  assert.equal(finishes.length,1);
+  assert.equal(finishes[0].protection,'wall-finish');
+  assert.equal(finishes[0].start.x,0);
+  assert.equal(finishes[0].end.x,2);
+  assert.ok(Math.abs(finishes[0].start.z-(-.475))<1e-9,'finish must sit flush to the wall face');
+  assert.equal(finishes[0].finishHeight,.24);
+  assert.equal(finishes[0].finishThickness,.06);
+  assert.ok(finishes[0].end.y>finishes[0].start.y,'finish must follow the stair slope');
 });

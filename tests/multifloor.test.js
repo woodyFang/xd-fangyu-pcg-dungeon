@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  FLOOR_HEIGHT,
+  STAIR_REQUIRED_HEADROOM,
   assignRoomsToFloors,
   buildMultiFloorLayout,
   classifyEdgesByFloor,
@@ -62,6 +64,7 @@ test('createLayerData creates isolated typed arrays for every floor', () => {
   assert.equal(lower.grid.length, 120);
   assert.equal(lower.roomId[0], -1);
   assert.equal(lower.stairwellMask.length, 120);
+  assert.equal(lower.stairWallMask.length,120);
   lower.grid[4] = TILES.FLOOR;
   assert.equal(upper.grid[4], TILES.VOID);
 });
@@ -170,6 +173,17 @@ test('doors snap to a real wall boundary and final arches use the resolved socke
     {roomId:0,x:8,y:6,side:'n'},
     {roomId:1,x:28,y:14,side:'s'}
   ]);
+  assert.deepEqual(arches.map(arch=>({x:arch.x,y:arch.y})),[
+    {x:8,y:6},
+    {x:28,y:14}
+  ]);
+  assert.deepEqual(arches.map(arch=>({
+    wallCellX:arch.wallCellX, wallCellY:arch.wallCellY,
+    interfaceX:arch.interfaceX, interfaceY:arch.interfaceY
+  })),[
+    {wallCellX:8,wallCellY:6,interfaceX:8,interfaceY:5.5},
+    {wallCellX:28,wallCellY:14,interfaceX:28,interfaceY:14.5}
+  ]);
   assert.deepEqual(edge.route[1],{x:8,y:4});
   assert.deepEqual(edge.route[edge.route.length-2],{x:28,y:16});
 });
@@ -185,6 +199,47 @@ test('a blocked configured wall rejects the door instead of switching sides', ()
   assert.equal(result.valid,false);
   assert.ok(result.errors.includes('edge 0 has no legal wall door'));
   assert.equal(result.layers[0].arches.length,0);
+});
+
+test('constrained door sockets adapt the whole corridor to their widest common width', () => {
+  const W=44, H=28;
+  const narrow={...room(0,10,10,0),h:3};
+  const wide=room(1,32,10,0);
+  // Occupy the outer tangent cell beyond the narrow room's east door.
+  // A 4m request therefore adapts to the minimum legal 2m contract.
+  const blockerTop={...room(2,16,8,0),w:1,h:1};
+  const edges=[{
+    id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,visualWidth:4,
+    hasCustomDoorA:true,ax:14,ay:10,aside:'e',
+    hasCustomDoorB:true,bx:28,by:10,bside:'w'
+  }];
+  const result=buildMultiFloorLayout({W,H,floorCount:1,rooms:[narrow,wide,blockerTop],edges,entrance:0,tiles:TILES,legacy:{}});
+  const edge=result.edges[0];
+  assert.ok(edge.route?.length>=2,result.errors.join('; '));
+  assert.equal(edge.requestedWidth,4);
+  assert.equal(edge.widthAdapted,true);
+  assert.equal(edge.carvedWidth,2);
+  assert.equal(edge.visualWidth,2);
+  assert.deepEqual(edge.route[0],{x:14,y:10});
+  assert.equal(result.layers[0].arches.every(arch=>arch.len===2),true);
+});
+
+test('a 4m corridor creates two adjacent 2m door units with one shared mullion', () => {
+  const rooms=[room(0,10,10),room(1,30,10)];
+  const edges=[{
+    id:0,a:0,b:1,isLoop:false,isCritical:false,isManual:true,visualWidth:4,
+    hasCustomDoorA:true,ax:14,ay:10,aside:'e',
+    hasCustomDoorB:true,bx:26,by:10,bside:'w'
+  }];
+  const result=buildMultiFloorLayout({W:40,H:24,floorCount:1,rooms,edges,entrance:0,tiles:TILES,legacy:{}});
+  assert.equal(result.valid,true,result.errors.join('; '));
+  assert.equal(result.edges[0].carvedWidth,4);
+  const arches=result.layers[0].arches;
+  assert.equal(arches.length,4);
+  assert.equal(arches.every(arch=>arch.len===2 && arch.doorUnitWidth===2 && arch.doorUnitHeight===2),true);
+  assert.deepEqual(arches.map(arch=>arch.doorUnitCount),[2,2,2,2]);
+  assert.deepEqual(arches.map(arch=>arch.doorUnitIndex),[0,1,0,1]);
+  assert.deepEqual(arches.map(arch=>arch.suppressLeadingPost),[false,true,false,true]);
 });
 
 test('critical path floor assignment is contiguous and reaches the requested top floor', () => {
@@ -246,6 +301,7 @@ test('non-adjacent automatic loop edges are removed, while invalid required edge
 });
 
 test('three-floor layout creates explicit stairs and passes 3D connectivity validation', () => {
+  assert.equal(FLOOR_HEIGHT,5);
   const rooms = [room(0, 12, 18, 0), room(1, 36, 18, 1), room(2, 60, 18, 2)];
   const edges = [
     { id: 0, a: 0, b: 1, isLoop: false, isCritical: true, isManual: false },
@@ -263,18 +319,66 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
   });
   assert.equal(result.valid, true, result.errors.join('\n'));
   assert.equal(result.connectors.length, 2);
+  assert.equal(result.stairAudits.length,result.connectors.length);
+  assert.ok(result.stairAudits.every(audit=>audit.pass&&audit.traversable&&audit.reachable
+    &&audit.wallsComplete&&audit.slabsComplete));
   assert.deepEqual(result.connectors.map(c => [c.fromFloor, c.toFloor]), [[0, 1], [1, 2]]);
   for (const connector of result.connectors) {
-    assert.equal(connector.stepCount, 16);
+    assert.equal(connector.rise, FLOOR_HEIGHT);
+    assert.equal(connector.stepCount, Math.round(FLOOR_HEIGHT / 0.25));
     assert.equal(connector.stepRise, 0.25);
     assert.equal(connector.treadDepth, 0.5);
-    assert.equal(connector.openingPolicy,'headroom-tight');
-    assert.ok(connector.requiredHeadroom>0 && connector.requiredHeadroom<connector.rise);
+    assert.equal(connector.openingPolicy,'headroom-tight-upper-slab-only');
+    assert.equal(connector.requiredHeadroom,STAIR_REQUIRED_HEADROOM);
+    assert.equal(connector.requiredHeadroom,2.5);
     assert.ok(connector.openingCells.length>0);
     assert.ok(connector.openingCells.length<connector.stairFootprintCells.length);
-    assert.deepEqual(new Set(connector.headroomCells),new Set(connector.openingCells));
+    assert.deepEqual(new Set(connector.headroomCells),new Set(connector.stairFootprintCells));
+    assert.equal(connector.sweptClearanceCells.length,connector.headroomCells.length);
+    assert.deepEqual(new Set(connector.openingCells),new Set(connector.sweptClearanceCells
+      .filter(record=>record.intersectsUpperSlab).map(record=>record.cell)));
+    const openingSet=new Set(connector.openingCells);
+    const upperArrivalRecords=connector.sweptClearanceCells
+      .filter(record=>record.treadElevation>=connector.rise-1e-9);
+    assert.ok(upperArrivalRecords.length>0,'the L stair reaches the upper floor plane');
+    const arrivalUpperLayer=result.layers[connector.toFloor];
+    for(const record of upperArrivalRecords){
+      assert.equal(record.intersectsUpperSlab,false,'upper-floor arrival treads are landing surface, not shaft');
+      assert.equal(openingSet.has(record.cell),false,'upper-floor arrival cells retain their slab');
+      assert.equal(arrivalUpperLayer.grid[record.cell],TILES.FLOOR,'upper-floor arrival cells are solid landing floor');
+      assert.equal(arrivalUpperLayer.stairLanding[record.cell],1,'upper-floor arrival cells join the landing contract');
+    }
+    const exactContactRecords=connector.sweptClearanceCells.filter(record=>
+      record.treadElevation<connector.rise-1e-9
+      && Math.abs(record.clearanceTop-connector.rise)<=1e-9);
+    assert.ok(exactContactRecords.length>0,'the L stair includes headroom that exactly meets the slab plane');
+    for(const record of exactContactRecords){
+      assert.equal(record.intersectsUpperSlab,false,'exact slab contact does not carve an opening');
+      assert.equal(openingSet.has(record.cell),false,'strict headroom comparison retains exact-contact slab cells');
+    }
+    for(const record of connector.sweptClearanceCells){
+      assert.ok(record.clearanceTop-record.treadElevation>=connector.requiredHeadroom-1e-6);
+    }
     assert.ok(connector.openingBoundaryEdges.length>0);
     assert.ok(connector.openingAccessEdges.length>0);
+    assert.ok(connector.openingStairPassageEdges.length>0,
+      'the tight opening must leave the rising flight transition unobstructed');
+    assert.ok(connector.stairwellBoundaryEdges.length>0);
+    assert.ok(connector.stairwellLowerAccessEdges.length>0);
+    assert.ok(connector.stairwellUpperAccessEdges.length>0);
+    assert.equal(connector.wallMode,'wall-backed');
+    assert.equal(connector.wallGeneration,'stair-contract');
+    assert.equal(connector.wallHeightPolicy,'opening-span-classified');
+    assert.deepEqual(new Set(connector.floorOpeningCells),new Set(connector.openingCells));
+    assert.equal(connector.openingMetrics.cellCount,connector.openingCells.length);
+    assert.equal(connector.openingMetrics.area,connector.openingCells.length);
+    assert.equal(connector.lightingPolicy,'required-themed');
+    assert.ok(connector.minimumLightCount>=2);
+    assert.ok(connector.lightingAnchors.length>=connector.minimumLightCount);
+    for(const anchor of connector.lightingAnchors){
+      assert.ok(Number.isFinite(anchor.x)&&Number.isFinite(anchor.y));
+      assert.ok(anchor.elevationFraction>0&&anchor.elevationFraction<1);
+    }
     assert.ok(connector.turn);
     assert.equal(connector.firstRun + connector.secondRun, connector.length);
     assert.equal(connector.firstFlightSteps + connector.secondFlightSteps, connector.stepCount);
@@ -284,12 +388,75 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
       assert.equal(lowerLayer.stairwellMask[cell], 1);
       assert.equal(upperLayer.stairwellMask[cell], 1);
     }
+    assert.ok(connector.stairwellInteriorCells.length<connector.sharedFootprintCells.length);
+    for (const cell of connector.stairwellInteriorCells) {
+      assert.notEqual(lowerLayer.grid[cell],TILES.WALL);
+      assert.notEqual(upperLayer.grid[cell],TILES.WALL);
+    }
+    const shaftEdgeKey=edge=>[edge.x1,edge.y1,edge.x2,edge.y2].join(',');
+    const lowerWallKeys=new Set(connector.stairwellLowerWallSegments.map(shaftEdgeKey));
+    const upperWallKeys=new Set(connector.stairwellUpperWallSegments.map(shaftEdgeKey));
+    const lowerGuardKeys=new Set(connector.stairwellLowerGuardSegments.map(shaftEdgeKey));
+    const upperGuardKeys=new Set(connector.stairwellUpperGuardSegments.map(shaftEdgeKey));
+    const sharedFootprint=new Set(connector.sharedFootprintCells);
+    const lowerStructuralCells=new Set([
+      ...connector.doubleHeightWallCells,...connector.lowerSingleHeightWallCells
+    ]);
+    const upperStructuralCells=new Set([
+      ...connector.doubleHeightWallCells,...connector.upperSingleHeightWallCells
+    ]);
+    for(const edge of connector.stairwellBoundaryEdges){
+      const lowerExpected=!edge.lowerAccess&&edge.neighborCell>=0
+        && lowerStructuralCells.has(edge.neighborCell)&&lowerLayer.grid[edge.neighborCell]===TILES.WALL;
+      const upperExpected=!edge.upperAccess&&edge.neighborCell>=0
+        && upperStructuralCells.has(edge.neighborCell)&&upperLayer.grid[edge.neighborCell]===TILES.WALL;
+      assert.equal(lowerWallKeys.has(shaftEdgeKey(edge)),lowerExpected);
+      assert.equal(upperWallKeys.has(shaftEdgeKey(edge)),upperExpected);
+      assert.equal(lowerGuardKeys.has(shaftEdgeKey(edge)),!edge.lowerAccess&&!lowerExpected);
+      assert.equal(upperGuardKeys.has(shaftEdgeKey(edge)),!edge.upperAccess&&!upperExpected);
+      assert.equal(Number(lowerWallKeys.has(shaftEdgeKey(edge)))+Number(lowerGuardKeys.has(shaftEdgeKey(edge))),Number(!edge.lowerAccess));
+      assert.equal(Number(upperWallKeys.has(shaftEdgeKey(edge)))+Number(upperGuardKeys.has(shaftEdgeKey(edge))),Number(!edge.upperAccess));
+      if(edge.neighborCell>=0&&sharedFootprint.has(edge.neighborCell)){
+        if(!lowerStructuralCells.has(edge.neighborCell)){
+          assert.notEqual(lowerLayer.grid[edge.neighborCell],TILES.WALL,'lower transition seam must stay open');
+        }
+        if(!upperStructuralCells.has(edge.neighborCell)){
+          assert.notEqual(upperLayer.grid[edge.neighborCell],TILES.WALL,'upper transition seam must stay open');
+        }
+      }
+    }
+    const edgesByNeighbor=new Map();
+    for(const edge of connector.stairwellBoundaryEdges){
+      if(edge.neighborCell<0||!sharedFootprint.has(edge.neighborCell)) continue;
+      if(!edgesByNeighbor.has(edge.neighborCell)) edgesByNeighbor.set(edge.neighborCell,[]);
+      edgesByNeighbor.get(edge.neighborCell).push(edge);
+    }
+    const innerTurnSeamCells=[...edgesByNeighbor]
+      .filter(([,edgesAtCell])=>edgesAtCell.some(a=>edgesAtCell.some(b=>
+        a!==b&&a.normal.x===-b.normal.x&&a.normal.y===-b.normal.y)))
+      .map(([cell])=>cell);
+    assert.ok(innerTurnSeamCells.length>0,'L stair must expose its concave turn seam to this regression check');
+    for(const cell of innerTurnSeamCells){
+      assert.notEqual(lowerLayer.grid[cell],TILES.WALL,'lower inner turn seam must not contain a transverse wall');
+      assert.notEqual(upperLayer.grid[cell],TILES.WALL,'upper inner turn seam must not contain a transverse wall');
+      assert.equal(edgesByNeighbor.get(cell).some(edge=>edge.structuralSpine),false,
+        'an inner turn seam must never be classified as an exterior structural spine');
+    }
     assert.equal(lowerLayer.stairLanding[connector.lower.y * 76 + connector.lower.x], 1);
     assert.equal(upperLayer.stairLanding[connector.upper.y * 76 + connector.upper.x], 1);
+    for(const cell of connector.lowerApproachCells) assert.equal(lowerLayer.stairLanding[cell],1);
+    for(const cell of connector.upperApproachCells) assert.equal(upperLayer.stairLanding[cell],1);
+    const lowerGate=connector.lowerApproachGate.y*76+connector.lowerApproachGate.x;
+    const lowerOutside=connector.lowerApproachRouteCell.y*76+connector.lowerApproachRouteCell.x;
+    assert.deepEqual(connector.lowerRouteCells.slice(-2),[lowerOutside,lowerGate]);
+    const upperGate=connector.upperApproachGate.y*76+connector.upperApproachGate.x;
+    const upperOutside=connector.upperApproachRouteCell.y*76+connector.upperApproachRouteCell.x;
+    assert.deepEqual(connector.upperRouteCells.slice(0,2),[upperGate,upperOutside]);
     for (const cell of connector.stairFootprintCells) {
       assert.equal(lowerLayer.stairMask[cell], 1);
       assert.equal(lowerLayer.stairClearance[cell], 1);
       assert.equal(lowerLayer.roomId[cell], -1);
+      assert.equal(lowerLayer.grid[cell],TILES.FLOOR,'the lower floor continues beneath the physical stair');
     }
     for (const cell of connector.openingCells) {
       assert.equal(upperLayer.slabOpening[cell], 1);
@@ -297,19 +464,39 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
       assert.equal(upperLayer.roomId[cell], -1);
       assert.equal(upperLayer.grid[cell], TILES.VOID);
     }
+    for(const cell of connector.doubleHeightWallCells){
+      assert.equal(lowerLayer.grid[cell],TILES.WALL,'double-height wall starts on the lower floor');
+      assert.equal(upperLayer.grid[cell],TILES.WALL,'double-height wall owns the matching upper cell');
+    }
+    for(const cell of connector.lowerSingleHeightWallCells){
+      assert.equal(lowerLayer.grid[cell],TILES.WALL,'lower single-height wall is explicit');
+    }
+    for(const cell of connector.upperSingleHeightWallCells){
+      assert.equal(upperLayer.grid[cell],TILES.WALL,'upper single-height wall is explicit');
+    }
+    for(const cell of connector.lowerNoWallCells){
+      assert.notEqual(lowerLayer.grid[cell],TILES.WALL,'lower mandatory opening must never be rebuilt as wall');
+    }
+    for(const cell of connector.upperNoWallCells){
+      assert.notEqual(upperLayer.grid[cell],TILES.WALL,'upper mandatory opening must never be rebuilt as wall');
+    }
     const edgeKey=edge=>[edge.x1,edge.y1,edge.x2,edge.y2].join(',');
     const accessKeys=new Set(connector.openingAccessEdges.map(edgeKey));
+    const passageKeys=new Set(connector.openingStairPassageEdges.map(edgeKey));
     const guardKeys=new Set(connector.openingGuardSegments.map(edgeKey));
     const wallKeys=new Set(connector.openingWallSegments.map(edgeKey));
     for(const edge of connector.openingBoundaryEdges){
       const key=edgeKey(edge);
-      if(edge.access){
-        assert.ok(accessKeys.has(key));
+      if(edge.access||edge.stairPassage){
+        assert.ok(edge.access?accessKeys.has(key):passageKeys.has(key));
         assert.equal(guardKeys.has(key),false);
-      }else if(edge.neighborCell>=0 && upperLayer.grid[edge.neighborCell]===TILES.FLOOR){
-        assert.ok(guardKeys.has(key),`missing opening guard ${key}`);
+        assert.equal(wallKeys.has(key),false);
       }else if(edge.neighborCell>=0 && upperLayer.grid[edge.neighborCell]===TILES.WALL){
         assert.ok(wallKeys.has(key),`missing opening wall ownership ${key}`);
+        assert.equal(guardKeys.has(key),false);
+      }else{
+        assert.ok(guardKeys.has(key),`missing opening guard ${key}`);
+        assert.equal(wallKeys.has(key),false);
       }
     }
   }
@@ -323,6 +510,76 @@ test('three-floor layout creates explicit stairs and passes 3D connectivity vali
     layers:result.layers,rooms,connectors:tamperedConnectors,entrance:0,W:76,H:40,tiles:TILES
   });
   assert.ok(tamperedValidation.invalidConnectors.includes(tamperedConnectors[0].id));
+  const unguardedConnectors=result.connectors.map(connector=>structuredClone(connector));
+  unguardedConnectors[0].stairwellUpperWallSegments.pop();
+  const unguardedValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:unguardedConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(unguardedValidation.invalidConnectors.includes(unguardedConnectors[0].id));
+  assert.equal(unguardedValidation.stairAudits[0].wallsComplete,false);
+  const missingRailConnectors=result.connectors.map(connector=>structuredClone(connector));
+  assert.ok(missingRailConnectors[0].stairwellLowerGuardSegments.length>0);
+  missingRailConnectors[0].stairwellLowerGuardSegments.pop();
+  const missingRailValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:missingRailConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(missingRailValidation.invalidConnectors.includes(missingRailConnectors[0].id));
+  assert.equal(missingRailValidation.stairAudits[0].wallsComplete,false);
+  const blockedPassageConnectors=result.connectors.map(connector=>structuredClone(connector));
+  assert.ok(blockedPassageConnectors[0].openingStairPassageEdges.length>0);
+  blockedPassageConnectors[0].openingGuardSegments.push(
+    structuredClone(blockedPassageConnectors[0].openingStairPassageEdges[0])
+  );
+  const blockedPassageValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:blockedPassageConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(blockedPassageValidation.invalidConnectors.includes(blockedPassageConnectors[0].id));
+  assert.equal(blockedPassageValidation.stairAudits[0].wallsComplete,false,
+    'a guard beam across the headroom transition must fail stair acceptance');
+  const misroutedConnectors=result.connectors.map(connector=>structuredClone(connector));
+  misroutedConnectors[0].lowerRouteCells[misroutedConnectors[0].lowerRouteCells.length-2]-=76;
+  const misroutedValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:misroutedConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(misroutedValidation.invalidConnectors.includes(misroutedConnectors[0].id));
+  assert.equal(misroutedValidation.stairAudits[0].contractComplete,false);
+
+  const blockedRouteLayers=structuredClone(result.layers);
+  const blockedRouteCell=result.connectors[0].upperRouteCells.find(cell=>
+    blockedRouteLayers[result.connectors[0].toFloor].grid[cell]===TILES.FLOOR
+    &&!result.connectors[0].upperApproachCells.includes(cell));
+  assert.ok(Number.isInteger(blockedRouteCell));
+  blockedRouteLayers[result.connectors[0].toFloor].grid[blockedRouteCell]=TILES.WALL;
+  const blockedRouteValidation=validateDungeon3D({
+    layers:blockedRouteLayers,rooms,connectors:result.connectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.equal(blockedRouteValidation.stairAudits[0].traversable,false);
+  assert.ok(blockedRouteValidation.stairAudits[0].issues.some(issue=>issue.code==='access-route-blocked'));
+  const clippedClearance=result.connectors.map(connector=>structuredClone(connector));
+  clippedClearance[0].sweptClearanceCells[0].clearanceTop-=0.5;
+  const clippedValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:clippedClearance,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(clippedValidation.invalidConnectors.includes(clippedClearance[0].id));
+  const unlitConnectors=result.connectors.map(connector=>structuredClone(connector));
+  unlitConnectors[0].lightingAnchors.length=1;
+  const unlitValidation=validateDungeon3D({
+    layers:result.layers,rooms,connectors:unlitConnectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.ok(unlitValidation.invalidConnectors.includes(unlitConnectors[0].id));
+
+  const unexpectedHoleLayers=structuredClone(result.layers);
+  const openingSetForAudit=new Set(result.connectors[0].openingCells);
+  const unexpectedHoleCell=result.connectors[0].sharedFootprintCells.find(cell=>
+    !openingSetForAudit.has(cell)&&unexpectedHoleLayers[result.connectors[0].toFloor].grid[cell]!==TILES.VOID);
+  assert.ok(Number.isInteger(unexpectedHoleCell));
+  unexpectedHoleLayers[result.connectors[0].toFloor].slabOpening[unexpectedHoleCell]=1;
+  unexpectedHoleLayers[result.connectors[0].toFloor].grid[unexpectedHoleCell]=TILES.VOID;
+  const unexpectedHoleValidation=validateDungeon3D({
+    layers:unexpectedHoleLayers,rooms,connectors:result.connectors,entrance:0,W:76,H:40,tiles:TILES
+  });
+  assert.equal(unexpectedHoleValidation.stairAudits[0].slabsComplete,false);
+  assert.ok(unexpectedHoleValidation.stairAudits[0].issues.some(issue=>issue.code==='slab-hole-invalid'));
 });
 
 test('stable stair specs preserve their anchor and reject conflicting locked placement', () => {
@@ -370,13 +627,17 @@ test('stacked rooms use one shared stairwell footprint on both floors', () => {
     assert.equal(result.layers[0].stairwellMask[cell],1);
     assert.equal(result.layers[1].stairwellMask[cell],1);
   }
+  assert.ok(connector.stairwellInteriorCells.length<connector.sharedFootprintCells.length);
+  assert.ok(connector.stairwellLowerWallSegments.length
+    < connector.stairwellBoundaryEdges.filter(edge=>!edge.lowerAccess).length,
+  'an open room stair must not be enclosed on every non-access edge');
   for(const cell of connector.openingCells){
     assert.equal(result.layers[0].stairMask[cell],1);
     assert.equal(result.layers[1].slabOpening[cell],1);
   }
 });
 
-test('a locked straight stair preserves quarter-tile width and reserves enough cells on both floors', () => {
+test('a locked straight stair normalizes legacy fractional width to the one metre grid', () => {
   const lower={...room(0,24,25,0),w:26,h:20};
   const upper={...room(1,24,25,1),w:26,h:20};
   const result=buildMultiFloorLayout({
@@ -389,7 +650,7 @@ test('a locked straight stair preserves quarter-tile width and reserves enough c
   const connector=result.connectors[0];
   assert.equal(connector.style,'straight');
   assert.equal(connector.turn,null);
-  assert.equal(connector.width,3.25);
+  assert.equal(connector.width,3);
   assert.deepEqual(connector.upper,{x:28,y:25});
   assert.equal(connector.firstRun,8);
   assert.equal(connector.secondRun,0);
@@ -410,13 +671,13 @@ test('a locked stair grows its raster footprint only toward the dragged width si
     W:60,H:50,floorCount:2,rooms:[lower,upper],
     edges:[{id:0,a:0,b:1,isLoop:false,isCritical:true,isManual:true,stairSpec:{
       id:'stair-stable-center',mode:'locked',style:'straight',anchor:{x:20,y:25},direction:'east',
-      width:2.25,lateralCenterOffset:.625,length:8,landingDepth:2
+      width:3,lateralCenterOffset:1,length:8,landingDepth:2
     }}],entrance:0,tiles:TILES,legacy:{}
   });
   assert.equal(result.valid,true,result.errors.join('\n'));
-  assert.equal(result.connectors[0].width,2.25);
+  assert.equal(result.connectors[0].width,3);
   const connector=result.connectors[0];
-  assert.equal(connector.lateralCenterOffset,.625);
+  assert.equal(connector.lateralCenterOffset,1);
   const shaftRows=connector.openingCells.map(cell=>Math.floor(cell/60));
   assert.equal(Math.min(...shaftRows),25);
   assert.equal(Math.max(...shaftRows),27);
@@ -435,11 +696,12 @@ test('a locked stair may replace the room centre and reshapes both floor structu
   assert.equal(result.stairFailures.length,0);
   const connector=result.connectors[0];
   const centre=20*52+24;
-  assert.ok(connector.openingCells.includes(centre));
+  assert.ok(connector.stairwellInteriorCells.includes(centre));
   assert.equal(result.layers[0].stairMask[centre],1);
   assert.equal(result.layers[0].roomId[centre],-1);
-  assert.equal(result.layers[1].slabOpening[centre],1);
-  assert.equal(result.layers[1].grid[centre],TILES.VOID);
+  // At 5m floor height the mid-turn has enough headroom below the upper slab,
+  // so it remains stairwell interior without requiring a slab opening.
+  assert.equal(result.layers[1].slabOpening[centre],0);
   assert.ok(result.layers[1].bfs.some(distance=>distance>=0));
 });
 
@@ -457,9 +719,9 @@ test('a locked stair can sit flush against a room wall without carving side clea
   assert.equal(connector.sideClearance,0);
   const footprintRows=connector.sharedFootprintCells.map(cell=>Math.floor(cell/52));
   assert.equal(Math.min(...footprintRows),12);
-  // The independent W x W turn landing extends one row past the old shared
-  // bend point; its complete generated envelope must be reserved as well.
-  assert.equal(Math.max(...footprintRows),19);
+  // The independent W x W turn landing and its visible stairwell interior
+  // extend through row 20; the complete generated envelope must be reserved.
+  assert.equal(Math.max(...footprintRows),20);
   assert.equal(result.layers[0].grid[11*52+24],TILES.WALL);
 });
 
@@ -480,16 +742,17 @@ test('a user-locked stair reshapes unrelated room cells on both floors instead o
   const centre=20*64+28;
   assert.equal(result.layers[0].stairMask[centre],1);
   assert.equal(result.layers[0].roomId[centre],-1);
-  assert.equal(result.layers[1].slabOpening[centre],1);
+  assert.equal(result.layers[1].slabOpening[centre],0);
   assert.equal(result.layers[1].roomId[centre],-1);
   assert.deepEqual(connector.structureAdaptationRoutes.map(route=>[route.floor,route.roomId]),[[0,2],[1,3]]);
-  const exactUpperMutation=new Set(connector.openingCells);
-  for(let cell=0;cell<result.layers[1].stairLanding.length;cell++){
-    if(result.layers[1].stairLanding[cell]) exactUpperMutation.add(cell);
+  for(const cell of connector.stairwellInteriorCells){
+    assert.notEqual(result.layers[0].grid[cell],TILES.WALL,'lower stairwell interior must stay clear');
+    assert.notEqual(result.layers[1].grid[cell],TILES.WALL,'upper stairwell interior must stay clear');
   }
-  const preservedWalls=connector.sharedFootprintCells.filter(cell=>
-    !exactUpperMutation.has(cell) && result.layers[1].grid[cell]===TILES.WALL);
-  assert.ok(preservedWalls.length>0,'the stairwell envelope must preserve unrelated upper-floor walls');
+  const actualInterior=new Set(connector.stairwellInteriorCells);
+  const preservedFiller=connector.sharedFootprintCells.filter(cell=>
+    !actualInterior.has(cell)&&result.layers[1].grid[cell]===TILES.WALL);
+  assert.ok(preservedFiller.length>0,'rectangular filler must remain owned by the original upper structure');
   assert.ok(connector.openingGuardSegments.length>0);
   const guardKeys=new Set(connector.openingGuardSegments.map(edge=>[edge.x1,edge.y1,edge.x2,edge.y2].join(',')));
   for(const edge of connector.openingAccessEdges){

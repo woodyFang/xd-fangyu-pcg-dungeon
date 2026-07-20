@@ -146,6 +146,174 @@ export function stairRailSegments(connector, totalRise, lowerY = 0, railOffset =
   return segments;
 }
 
+function pointAlongRail(segment, distance, length) {
+  const t=Math.max(0,Math.min(1,distance/Math.max(.001,length)));
+  return {
+    x:segment.start.x+(segment.end.x-segment.start.x)*t,
+    y:segment.start.y+(segment.end.y-segment.start.y)*t,
+    z:segment.start.z+(segment.end.z-segment.start.z)*t
+  };
+}
+
+function wallCoverageIntervals(segment, wallEdges, matchDistance) {
+  const dx=segment.end.x-segment.start.x,dz=segment.end.z-segment.start.z;
+  const length=Math.hypot(dx,dz);
+  if(length<.01) return [];
+  const direction={x:dx/length,z:dz/length};
+  const intervals=[];
+  for(const edge of wallEdges){
+    const ex=edge.x2-edge.x1,ez=edge.y2-edge.y1;
+    const edgeLength=Math.hypot(ex,ez);
+    if(edgeLength<.01 || Math.abs(direction.x*ez-direction.z*ex)/edgeLength>.02) continue;
+    const fromStart={x:edge.x1-segment.start.x,z:edge.y1-segment.start.z};
+    const perpendicularDistance=Math.abs(fromStart.x*direction.z-fromStart.z*direction.x);
+    if(perpendicularDistance>matchDistance) continue;
+    const a=fromStart.x*direction.x+fromStart.z*direction.z;
+    const b=(edge.x2-segment.start.x)*direction.x+(edge.y2-segment.start.z)*direction.z;
+    const start=Math.max(0,Math.min(a,b)),end=Math.min(length,Math.max(a,b));
+    if(end-start>.01) intervals.push({start,end,edge});
+  }
+  intervals.sort((a,b)=>a.start-b.start);
+  const merged=[];
+  for(const interval of intervals){
+    const previous=merged.at(-1);
+    if(previous && interval.start<=previous.end+.02
+        && interval.edge.normal?.x===previous.edge.normal?.x
+        && interval.edge.normal?.y===previous.edge.normal?.y){
+      previous.end=Math.max(previous.end,interval.end);
+    }else merged.push({...interval});
+  }
+  return merged;
+}
+
+function wallCellIntervals(segment,wallEdges,clearance){
+  const dx=segment.end.x-segment.start.x,dz=segment.end.z-segment.start.z;
+  const length=Math.hypot(dx,dz);
+  if(length<.01) return [];
+  const direction={x:dx/length,z:dz/length};
+  const intervals=[];
+  const seen=new Set();
+  for(const edge of wallEdges){
+    const normal=edge.normal || {x:0,y:0};
+    const center={x:(edge.x1+edge.x2)/2+normal.x*.5,z:(edge.y1+edge.y2)/2+normal.y*.5};
+    const key=`${center.x.toFixed(3)},${center.z.toFixed(3)}`;
+    if(seen.has(key)) continue;
+    seen.add(key);
+    let start=0,end=length,hit=true;
+    for(const axis of ['x','z']){
+      const min=center[axis]-.5-clearance,max=center[axis]+.5+clearance;
+      const origin=segment.start[axis],velocity=direction[axis];
+      if(Math.abs(velocity)<1e-9){
+        if(origin<min || origin>max) hit=false;
+        continue;
+      }
+      const a=(min-origin)/velocity,b=(max-origin)/velocity;
+      start=Math.max(start,Math.min(a,b));
+      end=Math.min(end,Math.max(a,b));
+    }
+    if(hit && end-start>.01) intervals.push({start,end,edge});
+  }
+  intervals.sort((a,b)=>a.start-b.start);
+  const merged=[];
+  for(const interval of intervals){
+    const previous=merged.at(-1);
+    if(previous&&interval.start<=previous.end+.02) previous.end=Math.max(previous.end,interval.end);
+    else merged.push({...interval});
+  }
+  return merged;
+}
+
+function wallMountedRailSegment(segment, interval, length, wallInset) {
+  const normal=interval.edge.normal || {x:0,y:0};
+  const start=pointAlongRail(segment,interval.start,length);
+  const end=pointAlongRail(segment,interval.end,length);
+  const edgePoint={x:interval.edge.x1,z:interval.edge.y1};
+  const shift=point=>{
+    const distance=(edgePoint.x-point.x)*normal.x+(edgePoint.z-point.z)*normal.y;
+    return {
+      ...point,
+      x:point.x+normal.x*(distance-wallInset),
+      z:point.z+normal.y*(distance-wallInset)
+    };
+  };
+  return {
+    ...segment,
+    kind:`${segment.kind}-wall-handrail`,
+    protection:'wall-handrail',
+    wallNormal:{...normal},
+    wallInset,
+    start:shift(start),
+    end:shift(end)
+  };
+}
+
+/**
+ * Resolves the mutually exclusive stair-side protection contract. Real lower
+ * stairwell walls own their covered intervals; exposed intervals keep the full
+ * floor-mounted guardrail. Wall-owned intervals are moved inside the stairwell
+ * and never receive posts, so widening or rotating a stair cannot bury a
+ * balustrade inside the generated wall cells.
+ */
+export function stairRailProtectionSegments(connector,totalRise,lowerY=0,railOffset=(connector?.width || 1)/2,{
+  wallMatchDistance=.65,
+  wallInset=.18,
+  wallClearance=.1
+}={}){
+  const rails=stairRailSegments(connector,totalRise,lowerY,railOffset);
+  const wallEdges=connector?.stairwellLowerWallSegments || [];
+  if(!wallEdges.length) return rails.map(segment=>({...segment,protection:'guardrail'}));
+  const resolved=[];
+  for(const segment of rails){
+    const length=Math.hypot(segment.end.x-segment.start.x,segment.end.z-segment.start.z);
+    const wallIntervals=wallCoverageIntervals(segment,wallEdges,wallMatchDistance);
+    const blockedIntervals=wallCellIntervals(segment,wallEdges,wallClearance);
+    const boundaries=[0,length,...wallIntervals.flatMap(interval=>[interval.start,interval.end]),
+      ...blockedIntervals.flatMap(interval=>[interval.start,interval.end])]
+      .sort((a,b)=>a-b).filter((value,index,values)=>index===0||value-values[index-1]>.005);
+    for(let index=0;index<boundaries.length-1;index++){
+      const startDistance=boundaries[index],endDistance=boundaries[index+1];
+      if(endDistance-startDistance<=.01) continue;
+      const midpoint=(startDistance+endDistance)/2;
+      const wall=wallIntervals.find(interval=>midpoint>=interval.start-.005&&midpoint<=interval.end+.005);
+      if(wall){
+        resolved.push(wallMountedRailSegment(segment,{...wall,start:startDistance,end:endDistance},length,wallInset));
+        continue;
+      }
+      const blocked=blockedIntervals.some(interval=>midpoint>=interval.start-.005&&midpoint<=interval.end+.005);
+      resolved.push({...segment,protection:blocked?'wall-blocked':'guardrail',
+        start:pointAlongRail(segment,startDistance,length),end:pointAlongRail(segment,endDistance,length)});
+    }
+  }
+  return resolved;
+}
+
+/**
+ * Builds the finish strip where a stair flight or turn landing meets a real
+ * stairwell wall. The strip follows the walking surface, hides the tread/wall
+ * joint and stays independent from the higher wall-mounted handrail.
+ */
+export function stairWallFinishSegments(connector,totalRise,lowerY=0,railOffset=(connector?.width || 1)/2,{
+  wallMatchDistance=.65,
+  wallInset=.025,
+  wallClearance=.1,
+  finishHeight=.22,
+  finishThickness=.05,
+  surfaceLift=.015
+}={}){
+  return stairRailProtectionSegments(connector,totalRise,lowerY,railOffset,{
+    wallMatchDistance,wallInset,wallClearance
+  }).filter(segment=>segment.protection==='wall-handrail').map(segment=>({
+    ...segment,
+    kind:`${segment.kind.replace(/-wall-handrail$/,'')}-wall-finish`,
+    protection:'wall-finish',
+    start:{...segment.start,y:segment.start.y+surfaceLift},
+    end:{...segment.end,y:segment.end.y+surfaceLift},
+    finishHeight,
+    finishThickness,
+    surfaceLift
+  }));
+}
+
 export function railPostFractions(run, spacing = 1.4) {
   if (!run?.start || !run?.end) return [];
   const horizontalLength = Math.hypot(run.end.x - run.start.x, run.end.z - run.start.z);

@@ -144,7 +144,7 @@ export function createDungeonPreview({ scene, camera, canvas, onPreviewChange })
     if (!dungeon) return;
     state.floor = Math.max(0, Math.min((dungeon.floorCount || 1) - 1, floor));
     state.layer = dungeon.layers?.[state.floor] || dungeon;
-    state.floorY = state.floor * (dungeon.floorHeight || 8);
+    state.floorY = state.floor * (dungeon.floorHeight || 5);
     character.position.copy(findStart());
     character.position.y = state.floorY;
     if (state.phase !== 'idle') snapCamera();

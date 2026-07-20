@@ -11,9 +11,13 @@ const BASE_RECIPES = Object.freeze({
       profile:'square',style:'stone-balustrade',infillStyle:'open-balusters',
       height:.8,thickness:.16,
       postStyle:'stone-baluster',postThickness:.14,postSpacing:.72,
+      wallHandrail:false,wallHandrailInset:.2,wallBracketSpacing:1.4,
       capitalSize:.22,capitalHeight:.08,plinthSize:.2,plinthHeight:.08
     }),
     marking:Object.freeze({enabled:false,width:.085,inset:.05,height:.035}),
+    lighting:Object.freeze({required:true,mount:'wall',fixture:'torch-sconce',themeAsset:'dungeon-torch',
+      assetSource:'theme-prop-library',minimumFixtures:2,
+      mountAboveTread:1.05,intensityScale:.82,distanceScale:1,flicker:.12,maxAnalyticLights:2}),
     material:Object.freeze({
       body:Object.freeze({roughness:.92,metalness:.01}),
       trim:Object.freeze({roughness:.88,metalness:.02}),
@@ -28,8 +32,12 @@ const BASE_RECIPES = Object.freeze({
     treadSource:'floor', landingSource:'corridor', trimSource:'cap', railSource:'cap',
     tread:Object.freeze({profile:'clean-nosing',capHeight:.035,nosingDepth:.035,sideInset:.035,irregularity:0}),
     landing:Object.freeze({profile:'warning-frame',borderWidth:.075,borderHeight:.025,accentBorder:true}),
-    rail:Object.freeze({profile:'round',height:.92,thickness:.065,postThickness:.052,postSpacing:1.25}),
+    rail:Object.freeze({profile:'round',height:.92,thickness:.065,postThickness:.052,postSpacing:1.25,
+      wallHandrail:true,wallHandrailInset:.18,wallBracketSpacing:1.25}),
     marking:Object.freeze({enabled:true,width:.085,inset:.055,height:.035}),
+    lighting:Object.freeze({required:true,mount:'wall',fixture:'clinical-wall-light',themeAsset:'hospital-wall-light',
+      assetSource:'theme-prop-library',minimumFixtures:2,
+      mountAboveTread:1.18,intensityScale:.72,distanceScale:.9,flicker:0,maxAnalyticLights:2}),
     material:Object.freeze({
       body:Object.freeze({roughness:.76,metalness:.04}),
       trim:Object.freeze({roughness:.5,metalness:.26}),
@@ -44,8 +52,12 @@ const BASE_RECIPES = Object.freeze({
     treadSource:'corridor', landingSource:'floor', trimSource:'cap', railSource:'cap',
     tread:Object.freeze({profile:'metal-plate',capHeight:.045,nosingDepth:.055,sideInset:.045,irregularity:.05}),
     landing:Object.freeze({profile:'reinforced-frame',borderWidth:.1,borderHeight:.04,accentBorder:true}),
-    rail:Object.freeze({profile:'round',height:.88,thickness:.075,postThickness:.065,postSpacing:1.15}),
+    rail:Object.freeze({profile:'round',height:.88,thickness:.075,postThickness:.065,postSpacing:1.15,
+      wallHandrail:true,wallHandrailInset:.18,wallBracketSpacing:1.15}),
     marking:Object.freeze({enabled:true,width:.07,inset:.045,height:.03}),
+    lighting:Object.freeze({required:true,mount:'pendant',fixture:'cage-pendant',themeAsset:'industrial-cage-pendant',
+      assetSource:'procedural-theme-kit',minimumFixtures:2,
+      pendantHeight:1.32,intensityScale:.78,distanceScale:1,flicker:.025,maxAnalyticLights:2}),
     material:Object.freeze({
       body:Object.freeze({roughness:.58,metalness:.42}),
       trim:Object.freeze({roughness:.4,metalness:.72}),
@@ -60,8 +72,12 @@ const BASE_RECIPES = Object.freeze({
     treadSource:'cap', landingSource:'floor', trimSource:'wall', railSource:'wall',
     tread:Object.freeze({profile:'timber-board',capHeight:.065,nosingDepth:.065,sideInset:.055,irregularity:.14}),
     landing:Object.freeze({profile:'timber-frame',borderWidth:.09,borderHeight:.035,accentBorder:false}),
-    rail:Object.freeze({profile:'square',height:.86,thickness:.095,postThickness:.085,postSpacing:1.35}),
+    rail:Object.freeze({profile:'square',height:.86,thickness:.095,postThickness:.085,postSpacing:1.35,
+      wallHandrail:true,wallHandrailInset:.2,wallBracketSpacing:1.35}),
     marking:Object.freeze({enabled:false,width:.07,inset:.045,height:.03}),
+    lighting:Object.freeze({required:true,mount:'wall',fixture:'lantern-sconce',themeAsset:'timber-lantern-sconce',
+      assetSource:'procedural-theme-kit',minimumFixtures:2,
+      mountAboveTread:1.08,intensityScale:.76,distanceScale:.9,flicker:.07,maxAnalyticLights:2}),
     material:Object.freeze({
       body:Object.freeze({roughness:.78,metalness:.02}),
       trim:Object.freeze({roughness:.72,metalness:.02}),
@@ -76,8 +92,12 @@ const BASE_RECIPES = Object.freeze({
     treadSource:'corridor', landingSource:'floor', trimSource:'cap', railSource:'cap',
     tread:Object.freeze({profile:'neutral-panel',capHeight:.04,nosingDepth:.04,sideInset:.04,irregularity:.04}),
     landing:Object.freeze({profile:'simple-frame',borderWidth:.075,borderHeight:.03,accentBorder:false}),
-    rail:Object.freeze({profile:'square',height:.86,thickness:.1,postThickness:.085,postSpacing:1.45}),
+    rail:Object.freeze({profile:'square',height:.86,thickness:.1,postThickness:.085,postSpacing:1.45,
+      wallHandrail:true,wallHandrailInset:.19,wallBracketSpacing:1.45}),
     marking:Object.freeze({enabled:true,width:.075,inset:.05,height:.03}),
+    lighting:Object.freeze({required:true,mount:'wall',fixture:'neutral-sconce',themeAsset:'neutral-sconce',
+      assetSource:'procedural-theme-kit',minimumFixtures:2,
+      mountAboveTread:1.05,intensityScale:.74,distanceScale:.9,flicker:0,maxAnalyticLights:2}),
     material:Object.freeze({
       body:Object.freeze({roughness:.7,metalness:.12}),
       trim:Object.freeze({roughness:.58,metalness:.24}),
@@ -231,6 +251,7 @@ export function compileStairAssetRecipe(theme={}, {seed=0,connectorId=''}={}){
     landing:{...base.landing},
     rail:{...base.rail},
     marking:{...base.marking},
+    lighting:{...base.lighting},
     material:Object.fromEntries(Object.entries(base.material).map(([role,value])=>[role,{...value}])),
     colors,
     treadColor:colors.body,
@@ -241,6 +262,11 @@ export function compileStairAssetRecipe(theme={}, {seed=0,connectorId=''}={}){
     accentColor:colors.marking,
     themeAccentColor:colors.themeAccent
   };
+  const themeLight=Array.isArray(theme.torchLight)?theme.torchLight:[];
+  recipe.lighting.color=normalizeColor(themeLight[0],colors.themeAccent);
+  recipe.lighting.intensity=Math.max(.35,Number(themeLight[1])||1.2)*recipe.lighting.intensityScale;
+  recipe.lighting.distance=Math.max(5,Number(themeLight[2])||8)*recipe.lighting.distanceScale;
+  recipe.lighting.fixtureColor=colors.rail;
   recipe.variantSeed=stairAssetVariantSeed(seed,connectorId,recipe.id);
   // Flat compatibility fields keep the renderer-facing surface small while
   // the nested recipe remains the source of truth for procedural modelling.

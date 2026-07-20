@@ -47,6 +47,7 @@ test('advanced display switches stay internal and have no visible UI', async () 
   for (const id of ['tAnim', 'tPost', 'tGraph', 'tHeat']) {
     assert.match(html, new RegExp(`<input[^>]*id=["']${id}["'][^>]*hidden`));
   }
+  assert.doesNotMatch(html, /<input[^>]*id=["']tAnim["'][^>]*checked/);
 });
 
 test('build animation is a presentation-only staged reveal', async () => {
@@ -203,7 +204,7 @@ test('stair visualization consumes the generated landing and opening contract', 
     readFile(new URL('src/render/stair-style.js', root), 'utf8'),
     readFile(new URL('src/render/stair-assets.js', root), 'utf8')
   ]);
-  for (const field of ['lowerApproach', 'upperApproach', 'turn', 'secondDirection', 'firstFlightSteps', 'secondFlightSteps', 'stepCount', 'treadDepth', 'landingDepth', 'stairFootprintCells', 'headroomCells', 'openingCells', 'openingBoundaryEdges', 'openingAccessEdges', 'openingGuardSegments', 'sharedFootprintCells', 'sharedFootprintKind', 'clearVolume']) {
+  for (const field of ['lowerApproach', 'upperApproach', 'lowerApproachGate', 'upperApproachGate', 'lowerApproachRouteCell', 'upperApproachRouteCell', 'lowerApproachCells', 'upperApproachCells', 'lowerRouteCells', 'upperRouteCells', 'turn', 'secondDirection', 'firstFlightSteps', 'secondFlightSteps', 'stepCount', 'treadDepth', 'landingDepth', 'stairFootprintCells', 'headroomCells', 'sweptClearanceCells', 'openingCells', 'floorOpeningCells', 'openingMetrics', 'doubleHeightWallCells', 'lowerSingleHeightWallCells', 'upperSingleHeightWallCells', 'lowerNoWallCells', 'upperNoWallCells', 'openingBoundaryEdges', 'openingAccessEdges', 'openingGuardSegments', 'stairwellInteriorCells', 'stairwellLowerGuardSegments', 'stairwellUpperGuardSegments', 'wallMode', 'wallReservationPolicy', 'wallGeneration', 'wallHeightPolicy', 'lightingPolicy', 'minimumLightCount', 'lightingAnchors', 'sharedFootprintCells', 'sharedFootprintKind', 'clearVolume']) {
     assert.match(generation, new RegExp(field));
   }
   assert.match(main, /function drawEditorStair/);
@@ -211,9 +212,31 @@ test('stair visualization consumes the generated landing and opening contract', 
   assert.match(main, /if\(connector\.turn\)/);
   assert.match(main, /stairEditorSegments\(l\.stair\)/);
   assert.match(main, /slabOpening/);
+  assert.match(main, /GEO\.ceiling/);
+  assert.match(main, /const openingAbove=sourceDungeon\.layers\?\.\[activeFloor\+1\]\?\.slabOpening/);
+  assert.match(main, /activeFloor<\(sourceDungeon\.layers\?\.length \|\| 1\)-1/);
   assert.match(main, /routeHit\.stair/);
   assert.match(main, /const stairKitBase=compileStairAssetRecipe\(TH,\{seed:dungeon\.seed\}\)/);
   assert.match(main, /const stairKit=compileStairAssetRecipe\(TH,\{seed:dungeon\.seed,connectorId:connector\.id\}\)/);
+  assert.match(main, /function stairDoubleHeightWallCells\(dungeon,floor\)/);
+  assert.match(main, /function stairCoveredUpperWallCells\(dungeon,floor\)/);
+  assert.match(main, /doubleHeightWalls\.has\(cell\) \? storeyHeight\+generatedHeight : generatedHeight/);
+  assert.match(generation, /function stairTransitionWallExclusions\(connectors,floor\)/);
+  assert.match(generation, /!excludedWallCells\.has\(neighbor\)/);
+  assert.match(main, /connector\.doubleHeightWallCells \|\| \[\]/);
+  assert.doesNotMatch(main, /grid\[c\]!==FLOOR \|\| lakeMask\[c\] \|\| stairMask\[c\]/);
+  assert.doesNotMatch(main, /layer\.grid\[c\]===FLOOR && !layer\.stairMask\[c\]/);
+  assert.doesNotMatch(main, /function addGeneratedStairwellWalls\(/);
+  assert.doesNotMatch(main, /function addStairwellWallSegments\(/);
+  assert.match(main, /addThemedStairLighting\(root,connector,totalRise,lowerY,stairKit/);
+  assert.match(main, /spec\.themeAsset==='dungeon-torch'/);
+  assert.match(main, /new THREE\.Mesh\(GEO\.torch,materials\.housing\)/);
+  assert.match(main, /new THREE\.Mesh\(GEO\.flame,materials\.flame\)/);
+  assert.match(main, /spec\.themeAsset==='hospital-wall-light'/);
+  assert.match(main, /new THREE\.Mesh\(GEO\.wallLight,materials\.glow\)/);
+  assert.match(stairAssets, /themeAsset:'dungeon-torch'/);
+  assert.match(stairAssets, /themeAsset:'hospital-wall-light'/);
+  assert.match(stairAssets, /assetSource:'theme-prop-library'/);
   assert.match(main, /stairTreadAssetPlan\(stairKit/);
   assert.match(main, /addProceduralStairLandingFrame\(/);
   assert.match(main, /stairKitBase\.material\.body/);
@@ -224,7 +247,13 @@ test('stair visualization consumes the generated landing and opening contract', 
   assert.doesNotMatch(main, /function addStairParapetSegment\(/);
   assert.match(main, /kit\.rail\.postStyle\?\.startsWith\('stone-'\)/);
   assert.match(main, /if\(kit\.landing\.edgeFrame===false\) return/);
-  assert.match(main, /stairRailSegments\(connector,totalRise,lowerY,offset\)/);
+  assert.match(main, /stairRailProtectionSegments\(connector,totalRise,lowerY,offset,/);
+  assert.match(main, /function addThemedStairWallFinish\(/);
+  assert.match(main, /stairWallFinishSegments\(connector,totalRise,lowerY,offset,/);
+  assert.match(main, /stairWallFinish:true/);
+  assert.match(main, /segment\.protection==='wall-blocked'/);
+  assert.match(main, /segment\.protection==='wall-handrail'&&!kit\.rail\.wallHandrail/);
+  assert.match(main, /if\(segment\.protection==='wall-handrail'\)/);
   assert.match(main, /new THREE\.Mesh\(landingGeo,stairLandingMat\)/);
   assert.match(main, /turnLanding\.scale\.set\(turnPlatform\.visualSpan,1,turnPlatform\.visualSpan\)/);
   assert.match(main, /platform\.visualSpan\*editor\.scale/);
@@ -292,7 +321,7 @@ test('the editor places stairs directly in rooms and rotates them by 90 degrees'
   assert.match(main, /stairWidthResizeFromPointer\(drag\.stairStart,drag\.visualStart,p,\{startPointer:drag\.start\}\)/);
   assert.match(main, /drag\.stair\.previewLateralCenterOffset=lateralCenterOffset/);
   assert.match(main, /lateralCenterOffset:connector\.lateralCenterOffset/);
-  assert.match(main, /0\.25 步进/);
+  assert.match(main, /1m 地砖卡尺/);
   assert.match(main, /g\.fillText\(stairWidthHandleGlyph\(\),handle\.x,handle\.y\+\.5\)/);
   assert.match(main, /style:stair\.previewStyle \|\| stair\.style \|\| 'l-turn'/);
   assert.match(styles, /\.editor-stair-style\{/);
@@ -362,7 +391,7 @@ test('all-floor and exploded views build complete art for every floor', async ()
   assert.match(main, /const states=renderedFloorStates\.length \? renderedFloorStates/);
   assert.match(main, /if\(!staticLayer\)\{ const spec = TH\.particles/);
   assert.match(main, /if\(!staticLayer\)\{\s*const budget = 12/);
-  assert.match(main, /const EXPLODED_FLOOR_SPACING = 3\.2/);
+  assert.match(main, /const EXPLODED_FLOOR_SPACING = FLOOR_HEIGHT \+ 0\.2/);
   assert.match(main, /const spacing=floorViewMode==='explode'\?EXPLODED_FLOOR_SPACING:1/);
   assert.match(main, /if\(exploded\)\{/);
   assert.match(main, /new THREE\.CylinderGeometry\(\.16,\.16,1,10,1,true\)/);
@@ -451,8 +480,11 @@ test('the editor, route preview, and 3D layer use one coordinate space', async (
   const main = await readFile(new URL('src/main.js', root), 'utf8');
   assert.match(main, /const layerShift=dungeonLayerShift\(sourceDungeon\)/);
   assert.match(main, /group\.position\.set\(layerShift\.x,activeFloor/);
-  assert.match(main, /const off = corridorCenterOffset\(linkDispWidth\(l\)\)/);
-  assert.match(main, /const centerOffset=corridorCenterOffset\(bandWidth\)/);
+  assert.match(main, /corridorCenterShiftAt\(pts,index,linkDispWidth\(l\)\)/);
+  assert.match(main, /corridorCenterShiftAt\(sourcePts,index,bandWidth\)/);
+  assert.match(main, /e\.visualWidth = linkDispWidth\(l\)/);
+  assert.match(main, /ctx\.link\.autoWidth=null; ctx\.link\.width=Math\.max/);
+  assert.match(main, /ctx\.link\.autoWidth=null; ctx\.link\.width=Math\.min/);
   assert.match(main, /const offset=dungeonEditorOffset\(D\)/);
   assert.match(main, /const q=editorToGridPoint\(D,p\)/);
   assert.doesNotMatch(main, /linkDispWidth\(l\)===2 \? 1 : 0\.5/);

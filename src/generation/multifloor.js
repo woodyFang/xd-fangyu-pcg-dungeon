@@ -1,12 +1,26 @@
 import {
   normalizeStairStyle,
   resolveStairStructure,
+  snapStairGridPoint,
   snapStairWidth,
   stairLateralCenterOffset
 } from '../domain/stair-contract.js';
 
-export const FLOOR_HEIGHT = 4;
-export const STAIR_REQUIRED_HEADROOM = 2.1;
+// The authored world uses one grid cell = one metre. Keep the reference height
+// explicit so vertical decoration and wall kits can scale with the floor
+// contract instead of retaining hidden 3m assumptions.
+export const FLOOR_HEIGHT = 5;
+export const REFERENCE_FLOOR_HEIGHT = 3;
+export const STAIR_REQUIRED_HEADROOM = 2.5;
+export const CORRIDOR_WIDTH_MIN = 2;
+export const CORRIDOR_WIDTH_MAX = 4;
+export const CORRIDOR_WIDTH_STEP = 1;
+
+export function normalizeCorridorWidth(value, fallback = CORRIDOR_WIDTH_MIN) {
+  const numeric = Number(value);
+  const base = Number.isFinite(numeric) ? numeric : fallback;
+  return Math.max(CORRIDOR_WIDTH_MIN, Math.min(CORRIDOR_WIDTH_MAX, Math.round(base)));
+}
 
 const DEFAULT_TILES = Object.freeze({ VOID: 0, FLOOR: 1, WALL: 2, POOL: 3 });
 
@@ -91,6 +105,7 @@ export function createLayerData(floor, W, H) {
     doorway: new Uint8Array(total),
     stairMask: new Uint8Array(total),
     stairwellMask: new Uint8Array(total),
+    stairWallMask: new Uint8Array(total),
     stairClearance: new Uint8Array(total),
     stairLanding: new Uint8Array(total),
     slabOpening: new Uint8Array(total),
@@ -324,10 +339,11 @@ export function routeAStar(layer, start, goal, options = {}) {
       // stairwellMask is the regular rectangular architectural envelope. Its
       // filler corners are ordinary walkable floor, so only physical treads,
       // landings, clear volume and slab openings are hard routing obstacles.
+      const stairWallRestricted=!!layer.stairWallMask?.[next];
       const stairRestricted = layer.stairMask?.[next] || layer.stairClearance?.[next]
         || layer.stairLanding?.[next] || layer.slabOpening?.[next];
       const contractRestricted=blockedCells.has(next) && next!==goalIndex && next!==startIndex;
-      if (closed[nextState] || contractRestricted
+      if (closed[nextState] || stairWallRestricted || contractRestricted
           || (!allowStairs && stairRestricted && next !== goalIndex && next !== startIndex)) continue;
       const roomId = layer.roomId[next];
       let step = layer.corridor[next] ? corridorCost : 1;
@@ -398,7 +414,7 @@ function stampCell(layer, W, H, x, y, width, owner, tiles) {
       const cell = idx2(W, nx, ny);
       // The rectangular envelope can contain walkable filler corners. Protect
       // only physical stair geometry when widening a corridor through it.
-      if (layer.stairMask?.[cell] || layer.stairClearance?.[cell]
+      if (layer.stairMask?.[cell] || layer.stairWallMask?.[cell] || layer.stairClearance?.[cell]
           || layer.stairLanding?.[cell] || layer.slabOpening?.[cell]) continue;
       layer.grid[cell] = tiles.FLOOR;
       layer.corridor[cell] = 1;
@@ -427,7 +443,7 @@ function markDoor(layer, W, H, point, width = 1) {
   const y = Math.round(point.y);
   const normal = doorNormal(point);
   const tangent = normal.y !== 0 ? { x: 1, y: 0 } : { x: 0, y: 1 };
-  for (const offset of widthOffsets(Math.max(1, Math.min(3, Math.round(width))))) {
+  for (const offset of widthOffsets(Math.max(1, Math.min(CORRIDOR_WIDTH_MAX, Math.round(width))))) {
     const dx = x + tangent.x * offset;
     const dy = y + tangent.y * offset;
     if (inBounds(W, H, dx, dy)) layer.doorway[idx2(W, dx, dy)] = 1;
@@ -467,7 +483,7 @@ function resolveWallDoor(layer, W, H, room, preferred, fallback, width, allowSid
   const sides = allowSideFallback
     ? [requestedSide, ...validSides.filter(side => side !== requestedSide)]
     : [requestedSide];
-  const span = widthOffsets(Math.max(1, Math.min(3, Math.round(width || 1))));
+  const span = widthOffsets(normalizeCorridorWidth(width));
   const preferredTangent = side => {
     const value = side === 'n' || side === 's' ? preferred?.x : preferred?.y;
     return Number.isFinite(value) ? value : (side === 'n' || side === 's' ? room.cx : room.cy);
@@ -478,7 +494,7 @@ function resolveWallDoor(layer, W, H, room, preferred, fallback, width, allowSid
       const nx=x+normal.x*depth,ny=y+normal.y*depth;
       if (!inBounds(W, H, nx, ny)) return false;
       const cell = idx2(W, nx, ny);
-      const hardStair=layer.stairMask?.[cell] || layer.stairClearance?.[cell]
+      const hardStair=layer.stairMask?.[cell] || layer.stairWallMask?.[cell] || layer.stairClearance?.[cell]
         || layer.stairLanding?.[cell] || layer.slabOpening?.[cell];
       const reusedDoorway = depth===1 && layer.corridor[cell]
         && layer.doorway[idx2(W, x, y)];
@@ -510,29 +526,93 @@ function resolveWallDoor(layer, W, H, room, preferred, fallback, width, allowSid
   return null;
 }
 
-function addResolvedArch(layer, room, point, width) {
+function resolveArchInterface(layer, W, H, room, point, width) {
+  const len = normalizeCorridorWidth(width);
+  const normal = doorNormalForSide(point.side);
+  const tangent = normal.y !== 0 ? { x: 1, y: 0 } : { x: 0, y: 1 };
+  const anchorX = Math.round(point.x);
+  const anchorY = Math.round(point.y);
+  const offsets = widthOffsets(len);
+  const centerOffset = (offsets[0] + offsets[offsets.length - 1]) / 2;
+  const interfaces = [];
+  for (const offset of offsets) {
+    let roomX = anchorX + tangent.x * offset;
+    let roomY = anchorY + tangent.y * offset;
+    if (!inBounds(W, H, roomX, roomY) || layer.roomId[idx2(W, roomX, roomY)] !== room.id) return null;
+    for (let step = 0; step < Math.max(W, H); step++) {
+      const nextX = roomX + normal.x;
+      const nextY = roomY + normal.y;
+      if (!inBounds(W, H, nextX, nextY) || layer.roomId[idx2(W, nextX, nextY)] !== room.id) break;
+      roomX = nextX;
+      roomY = nextY;
+    }
+    const outsideX = roomX + normal.x;
+    const outsideY = roomY + normal.y;
+    if (!inBounds(W, H, outsideX, outsideY)) return null;
+    interfaces.push({ roomX, roomY, x: roomX + normal.x * 0.5, y: roomY + normal.y * 0.5 });
+  }
+  if (!interfaces.length) return null;
+  const first = interfaces[0];
+  const normalCoordinate = item => normal.x !== 0 ? item.x : item.y;
+  if (interfaces.some(item => normalCoordinate(item) !== normalCoordinate(first))) return null;
+  const centerX = anchorX + tangent.x * centerOffset;
+  const centerY = anchorY + tangent.y * centerOffset;
+  return {
+    wallCellX: tangent.x ? centerX : first.roomX,
+    wallCellY: tangent.y ? centerY : first.roomY,
+    interfaceX: normal.x ? first.x : centerX,
+    interfaceY: normal.y ? first.y : centerY
+  };
+}
+
+function addResolvedArch(layer, room, point, width, W, H) {
   if (!layer || !room || !point) return;
-  const len = Math.max(1, Math.min(3, Math.round(width || 1)));
+  const corridorWidth = normalizeCorridorWidth(width);
   const normal = doorNormalForSide(point.side);
   const px = normal.y !== 0 ? 1 : 0;
   const py = px ? 0 : 1;
-  const key = `${room.id}:${point.side}:${point.x}:${point.y}:${len}`;
-  if (layer.arches.some(arch => arch._doorKey === key)) return;
-  layer.arches.push({
-    x: point.x + px * (len - 1) / 2,
-    y: point.y + py * (len - 1) / 2,
-    px,
-    py,
-    len,
-    roomId: room.id,
-    floor: room.floor || 0,
-    side: point.side,
-    anchorX: point.x,
-    anchorY: point.y,
-    nx: normal.x,
-    ny: normal.y,
-    _doorKey: key
-  });
+  const isDoubleDoor = corridorWidth === 4;
+  const unitWidth = isDoubleDoor ? 2 : corridorWidth;
+  // A resolved point is already the anchor cell used by the raster contract;
+  // only the two-unit 4m opening needs to split that anchor into two starts.
+  const unitStarts = isDoubleDoor ? [-1, 1] : [0];
+  for (let unitIndex = 0; unitIndex < unitStarts.length; unitIndex++) {
+    const startOffset = unitStarts[unitIndex];
+    const unitPoint = {
+      ...point,
+      x: point.x + (normal.y !== 0 ? startOffset : 0),
+      y: point.y + (normal.x !== 0 ? startOffset : 0)
+    };
+    const offsets = widthOffsets(unitWidth);
+    const centerOffset = (offsets[0] + offsets[offsets.length - 1]) / 2;
+    const key = `${room.id}:${point.side}:${point.x}:${point.y}:${corridorWidth}:${unitIndex}`;
+    if (layer.arches.some(arch => arch._doorKey === key)) continue;
+    const interfaceInfo = resolveArchInterface(layer, W, H, room, unitPoint, unitWidth);
+    layer.arches.push({
+      x: unitPoint.x + px * centerOffset,
+      y: unitPoint.y + py * centerOffset,
+      px,
+      py,
+      len: unitWidth,
+      corridorWidth,
+      doorUnitWidth: unitWidth,
+      doorUnitHeight: 2,
+      doorUnitIndex: unitIndex,
+      doorUnitCount: unitStarts.length,
+      // The first 2m frame owns the shared centre post. The second frame
+      // supplies only its lintel and outer post, avoiding a doubled mullion.
+      suppressLeadingPost: isDoubleDoor && unitIndex === 1,
+      roomId: room.id,
+      floor: room.floor || 0,
+      side: point.side,
+      anchorX: unitPoint.x,
+      anchorY: unitPoint.y,
+      nx: normal.x,
+      ny: normal.y,
+      ...(interfaceInfo || {}),
+      _doorKey: key
+    });
+  }
 }
 
 function rasterizeRooms(layers, rooms, W, H, tiles) {
@@ -664,7 +744,7 @@ function visualUpperCell(point, direction) {
   return {x:alongCell(point.x,direction.x),y:alongCell(point.y,direction.y)};
 }
 
-function stairOpeningCells({
+function stairSweptClearanceCells({
   firstFlightCells,
   turnCells,
   secondFlightCells,
@@ -677,11 +757,10 @@ function stairOpeningCells({
   W,
   requiredHeadroom = STAIR_REQUIRED_HEADROOM
 }) {
-  // A slab opening is the intersection between the stair's swept headroom and
-  // the upper slab plane. It is deliberately smaller than the complete tread
-  // footprint: low treads remain below the upper floor instead of carving a
-  // full-height well through the whole stair run.
-  const openingThreshold = Math.max(0, Math.min(1, 1 - requiredHeadroom / FLOOR_HEIGHT));
+  // Preserve the complete per-cell vertical clearance column. The slab
+  // opening is only one derived slice of this volume; fixtures, ceilings and
+  // validation need the whole swept headroom, including low treads that stay
+  // below the upper floor plane.
   const cellPoint = cell => ({ x:cell % W, y:Math.floor(cell / W) });
   const projectedDistance = (cell, origin, axis) => {
     const point=cellPoint(cell);
@@ -705,17 +784,65 @@ function stairOpeningCells({
     return Math.max(.5,Math.min(1,
       .5+((projectedDistance(cell,secondOrigin,secondDirection)+.5)/run)*.5));
   };
-  const firstOpening=firstFlightCells.filter(cell=>firstHeightFraction(cell)>=openingThreshold);
-  const turnOpening=style==='l-turn' && .5>=openingThreshold ? turnCells : [];
-  const secondOpening=style==='l-turn'
-    ? secondFlightCells.filter(cell=>secondHeightFraction(cell)>=openingThreshold)
-    : [];
-  return uniqueCells(firstOpening,turnOpening,secondOpening);
+  const elevations=new Map();
+  const record=(cells,heightFraction)=>{
+    for(const cell of cells || []){
+      const elevation=typeof heightFraction==='function' ? heightFraction(cell)*FLOOR_HEIGHT : heightFraction*FLOOR_HEIGHT;
+      elevations.set(cell,Math.max(elevations.get(cell) ?? -Infinity,elevation));
+    }
+  };
+  record(firstFlightCells,firstHeightFraction);
+  if(style==='l-turn'){
+    record(turnCells,.5);
+    record(secondFlightCells,secondHeightFraction);
+  }
+  return [...elevations].sort((a,b)=>a[0]-b[0]).map(([cell,treadElevation])=>{
+    const clearanceTop=treadElevation+requiredHeadroom;
+    // Once a tread has reached the upper floor plane it is the arrival
+    // surface, not empty shaft volume. Keep that cell as upper landing floor;
+    // only lower treads whose headroom crosses the slab need a real opening.
+    const belowUpperFloor=treadElevation<FLOOR_HEIGHT-1e-9;
+    return {
+      cell,
+      treadElevation:Number(treadElevation.toFixed(6)),
+      clearanceTop:Number(clearanceTop.toFixed(6)),
+      intersectsUpperSlab:belowUpperFloor&&clearanceTop>FLOOR_HEIGHT+1e-9
+    };
+  });
 }
 
-function openingBoundaryEdges(openingCells, upperLandingCells, accessDirection, W, H) {
+function stairOpeningCells(clearanceCells) {
+  // A slab opening is the intersection between the complete swept clearance
+  // volume and the upper slab plane.
+  return (clearanceCells || []).filter(record=>record.intersectsUpperSlab).map(record=>record.cell);
+}
+
+function stairLightingAnchors({lower,direction,secondDirection,firstRun,secondRun,style,turnPlatform}) {
+  const anchor=(id,origin,axis,distance,elevationFraction)=>({
+    id,
+    x:origin.x+axis.x*distance,
+    y:origin.y+axis.y*distance,
+    elevationFraction,
+    direction:{x:axis.x,y:axis.y}
+  });
+  if(style==='straight'){
+    return [
+      anchor('lower-flight',lower,direction,firstRun*.3,.3),
+      anchor('upper-flight',lower,direction,firstRun*.72,.72)
+    ];
+  }
+  return [
+    anchor('lower-flight',turnPlatform.first.start,direction,firstRun*.38,.24),
+    {id:'turn-platform',x:turnPlatform.center.x,y:turnPlatform.center.y,elevationFraction:.5,
+      direction:{x:secondDirection.x,y:secondDirection.y}},
+    anchor('upper-flight',turnPlatform.second.start,secondDirection,secondRun*.62,.78)
+  ];
+}
+
+function openingBoundaryEdges(openingCells, upperLandingCells, headroomCells, accessDirection, W, H) {
   const opening=new Set(openingCells);
   const landing=new Set(upperLandingCells);
+  const headroom=new Set(headroomCells);
   const edges=[];
   const sides=[
     {dx:-1,dy:0,edge:(x,y)=>({x1:x-.5,y1:y-.5,x2:x-.5,y2:y+.5})},
@@ -734,7 +861,67 @@ function openingBoundaryEdges(openingCells, upperLandingCells, accessDirection, 
         openingCell:cell,
         neighborCell,
         access:neighborCell>=0&&landing.has(neighborCell)
-          && side.dx===accessDirection.x&&side.dy===accessDirection.y
+          && side.dx===accessDirection.x&&side.dy===accessDirection.y,
+        // A headroom-tight opening has a second mandatory open edge where the
+        // rising flight passes from beneath the retained upper slab into the
+        // opening. Treating that transverse edge as an ordinary exposed slab
+        // boundary produces a guard beam straight across the stair path.
+        stairPassage:neighborCell>=0&&headroom.has(neighborCell)
+          && side.dx===-accessDirection.x&&side.dy===-accessDirection.y
+      });
+    }
+  }
+  return edges;
+}
+
+function stairwellBoundaryEdges(footprintCells, lowerLandingCells, upperLandingCells, direction, upperDirection, W, H, structuralEnvelopeCells = footprintCells) {
+  const footprint=new Set(footprintCells);
+  const structuralEnvelope=new Set(structuralEnvelopeCells || footprintCells);
+  const envelopeXs=[...structuralEnvelope].map(cell=>cell%W);
+  const envelopeYs=[...structuralEnvelope].map(cell=>Math.floor(cell/W));
+  const envelopeBounds={
+    minX:Math.min(...envelopeXs),maxX:Math.max(...envelopeXs),
+    minY:Math.min(...envelopeYs),maxY:Math.max(...envelopeYs)
+  };
+  const lowerLanding=new Set(lowerLandingCells);
+  const upperLanding=new Set(upperLandingCells);
+  const lowerOut={x:-direction.x,y:-direction.y};
+  const edges=[];
+  const sides=[
+    {dx:-1,dy:0,edge:(x,y)=>({x1:x-.5,y1:y-.5,x2:x-.5,y2:y+.5})},
+    {dx:1,dy:0,edge:(x,y)=>({x1:x+.5,y1:y-.5,x2:x+.5,y2:y+.5})},
+    {dx:0,dy:-1,edge:(x,y)=>({x1:x-.5,y1:y-.5,x2:x+.5,y2:y-.5})},
+    {dx:0,dy:1,edge:(x,y)=>({x1:x-.5,y1:y+.5,x2:x+.5,y2:y+.5})}
+  ];
+  for(const cell of footprintCells){
+    const x=cell%W,y=Math.floor(cell/W);
+    for(const side of sides){
+      const nx=x+side.dx,ny=y+side.dy;
+      const neighborCell=inBounds(W,H,nx,ny)?idx2(W,nx,ny):-1;
+      if(neighborCell>=0&&footprint.has(neighborCell)) continue;
+      const directionMatchesStructuralSpine=direction.x===upperDirection.x&&direction.y===upperDirection.y
+        // A wall-backed straight stair owns one deterministic side only. The
+        // opposite side is a mandatory open edge with a guardrail.
+        ? side.dx===-direction.y&&side.dy===direction.x
+        : (side.dx===-upperDirection.x&&side.dy===-upperDirection.y)
+          || (side.dx===direction.x&&side.dy===direction.y);
+      const neighborInsideEnvelope=neighborCell>=0&&structuralEnvelope.has(neighborCell);
+      const onOuterEnvelopeSide=side.dx<0 ? nx===envelopeBounds.minX
+        : side.dx>0 ? nx===envelopeBounds.maxX
+          : side.dy<0 ? ny===envelopeBounds.minY
+            : ny===envelopeBounds.maxY;
+      edges.push({
+        ...side.edge(x,y),insideCell:cell,neighborCell,
+        normal:{x:side.dx,y:side.dy},
+        // Direction alone cannot distinguish an L stair's exterior spine from
+        // the parallel transverse seam at its concave turn. A structural wall
+        // inside the reserved envelope must also sit on that envelope's outer
+        // band; otherwise it is transition-open and must never divide the two
+        // flights or their turn platform.
+        structuralSpine:directionMatchesStructuralSpine
+          && (!neighborInsideEnvelope||onOuterEnvelopeSide),
+        lowerAccess:lowerLanding.has(cell)&&side.dx===lowerOut.x&&side.dy===lowerOut.y,
+        upperAccess:upperLanding.has(cell)&&side.dx===upperDirection.x&&side.dy===upperDirection.y
       });
     }
   }
@@ -750,6 +937,13 @@ function buildStairContract(W, H, lower, direction, run, width, landingDepth, si
     : structure.anchorUpper;
   const lowerApproach = { x: lower.x - direction.x * landingDepth, y: lower.y - direction.y * landingDepth };
   const upperApproach = { x: upper.x + secondDirection.x * landingDepth, y: upper.y + secondDirection.y * landingDepth };
+  // The approach is a directional socket, not a routing hint. Routes stop one
+  // cell outside the socket and cross its gate only along the flight axis.
+  // This prevents a corridor from entering either landing from the side.
+  const lowerApproachGate={x:lowerApproach.x-direction.x,y:lowerApproach.y-direction.y};
+  const upperApproachGate={x:upperApproach.x+secondDirection.x,y:upperApproach.y+secondDirection.y};
+  const lowerApproachRouteCell={x:lowerApproachGate.x-direction.x,y:lowerApproachGate.y-direction.y};
+  const upperApproachRouteCell={x:upperApproachGate.x+secondDirection.x,y:upperApproachGate.y+secondDirection.y};
   const firstFlightCells = stairStripCells(W, H, lower, direction, 1, firstRun - 1, width,lateralCenterOffset);
   const secondFlightCells = style==='l-turn'
     ? visualStripCells(W,H,turnPlatform.exit,turnPlatform.second.end,width) : [];
@@ -766,6 +960,10 @@ function buildStairContract(W, H, lower, direction, run, width, landingDepth, si
       y:turnPlatform.second.end.y+secondDirection.y*(landingDepth+1)
     },width)
     : stairStripCells(W, H, upper, secondDirection, 0, landingDepth, width,lateralCenterOffset);
+  const lowerApproachGateCells=stairStripCells(W,H,lowerApproachGate,direction,0,0,width,lateralCenterOffset);
+  const upperApproachGateCells=stairStripCells(W,H,upperApproachGate,secondDirection,0,0,width,lateralCenterOffset);
+  const lowerApproachRouteCells=stairStripCells(W,H,lowerApproachRouteCell,direction,0,0,width,lateralCenterOffset);
+  const upperApproachRouteCells=stairStripCells(W,H,upperApproachRouteCell,secondDirection,0,0,width,lateralCenterOffset);
   const footprintOffsets=stairwellWidthOffsets(width,sideClearance,lateralCenterOffset);
   const firstFootprint=stairStripCellsWithOffsets(W,H,lower,direction,-landingDepth,firstRun,footprintOffsets);
   const secondFootprint=style==='l-turn'
@@ -776,21 +974,48 @@ function buildStairContract(W, H, lower, direction, run, width, landingDepth, si
     : stairStripCellsWithOffsets(W,H,upper,secondDirection,0,landingDepth,footprintOffsets);
   const rawFootprintCells = firstFootprint && secondFootprint
     ? uniqueCells(firstFootprint,secondFootprint) : null;
-  // The two strips of an L stair form an irregular L-shaped pad. If that pad is
-  // carved directly, wall generation follows every missing corner and produces
-  // exterior notches. Reserve its complete axis-aligned envelope so the stair
-  // room always has a regular rectangular outer contour.
-  const sharedFootprintCells=rawFootprintCells ? rectangularCellEnvelope(rawFootprintCells,W,H) : null;
-  const slabOpeningCells=shaftCells ? stairOpeningCells({
+  const sweptClearanceCells=shaftCells ? stairSweptClearanceCells({
     firstFlightCells,turnCells,secondFlightCells,lower,direction,firstRun,
     secondDirection,secondRun,style,W
   }) : null;
+  const slabOpeningCells=sweptClearanceCells ? stairOpeningCells(sweptClearanceCells) : null;
   const openingSet=new Set(slabOpeningCells || []);
-  const upperLandingCells=rawUpperLandingCells?.filter(cell=>!openingSet.has(cell));
-  const boundaryEdges=slabOpeningCells&&upperLandingCells
-    ? openingBoundaryEdges(slabOpeningCells,upperLandingCells,secondDirection,W,H) : null;
-  if (!shaftCells || !lowerLandingCells || !upperLandingCells || !sharedFootprintCells
-      || !slabOpeningCells?.length || !boundaryEdges?.length) return null;
+  // Rasterized L flights can contain one or more cells whose tread has already
+  // reached the upper floor plane. They are the arrival platform that closes
+  // the former over-cut portion of the shaft and must participate in the
+  // upper access socket and opening-boundary classification.
+  const upperArrivalCells=(sweptClearanceCells || [])
+    .filter(record=>record.treadElevation>=FLOOR_HEIGHT-1e-9)
+    .map(record=>record.cell);
+  const upperLandingCells=rawUpperLandingCells
+    ? uniqueCells(rawUpperLandingCells,upperArrivalCells).filter(cell=>!openingSet.has(cell))
+    : null;
+  const lowerApproachCells=lowerLandingCells&&lowerApproachGateCells
+    ? uniqueCells(lowerLandingCells,lowerApproachGateCells) : null;
+  const upperApproachCells=upperLandingCells&&upperApproachGateCells
+    ? uniqueCells(upperLandingCells,upperApproachGateCells) : null;
+  const stairwellInteriorCells=shaftCells&&lowerLandingCells&&upperLandingCells
+    ? uniqueCells(lowerLandingCells,shaftCells,upperLandingCells) : null;
+  // The reservation must contain the complete visible stairwell interior, not
+  // only the two conservative footprint strips. For some west/north L stairs
+  // the visual turn platform extends one cell beyond those strips; omitting it
+  // allowed a later stair to overwrite an existing upper-floor opening.
+  const sharedFootprintCells=rawFootprintCells&&stairwellInteriorCells
+    ? rectangularCellEnvelope(uniqueCells(rawFootprintCells,stairwellInteriorCells),W,H)
+    : null;
+  const boundaryEdges=slabOpeningCells&&upperLandingCells&&sweptClearanceCells
+    ? openingBoundaryEdges(slabOpeningCells,upperLandingCells,
+      sweptClearanceCells.map(record=>record.cell),secondDirection,W,H) : null;
+  const stairwellEdges=stairwellInteriorCells&&lowerLandingCells&&upperLandingCells
+    ? stairwellBoundaryEdges(stairwellInteriorCells,lowerLandingCells,upperLandingCells,direction,secondDirection,W,H,sharedFootprintCells) : null;
+  const lightingAnchors=stairLightingAnchors({
+    lower,direction,secondDirection,firstRun,secondRun,style,turnPlatform
+  });
+  if (!shaftCells || !lowerLandingCells || !upperLandingCells || !lowerApproachCells || !upperApproachCells
+      || !lowerApproachRouteCells || !upperApproachRouteCells || !sharedFootprintCells || !stairwellInteriorCells
+      || !slabOpeningCells?.length || !boundaryEdges?.length || !stairwellEdges?.length
+      || !stairwellEdges.some(edge=>edge.lowerAccess) || !stairwellEdges.some(edge=>edge.upperAccess)
+      || lightingAnchors.length<2) return null;
   return {
     style,
     lower: { ...lower },
@@ -798,6 +1023,10 @@ function buildStairContract(W, H, lower, direction, run, width, landingDepth, si
     upper,
     lowerApproach,
     upperApproach,
+    lowerApproachGate,
+    upperApproachGate,
+    lowerApproachRouteCell,
+    upperApproachRouteCell,
     direction: { ...direction },
     secondDirection,
     run,
@@ -808,13 +1037,95 @@ function buildStairContract(W, H, lower, direction, run, width, landingDepth, si
     landingDepth,
     shaftCells,
     stairFootprintCells:shaftCells,
-    headroomCells:slabOpeningCells,
+    sweptClearanceCells,
+    headroomCells:sweptClearanceCells.map(record=>record.cell),
     slabOpeningCells,
     openingBoundaryEdges:boundaryEdges,
     openingAccessEdges:boundaryEdges.filter(edge=>edge.access),
+    openingStairPassageEdges:boundaryEdges.filter(edge=>edge.stairPassage),
+    stairwellBoundaryEdges:stairwellEdges,
+    stairwellLowerAccessEdges:stairwellEdges.filter(edge=>edge.lowerAccess),
+    stairwellUpperAccessEdges:stairwellEdges.filter(edge=>edge.upperAccess),
+    stairwellLowerWallSegments:stairwellEdges.filter(edge=>!edge.lowerAccess),
+    stairwellUpperWallSegments:stairwellEdges.filter(edge=>!edge.upperAccess),
+    stairwellInteriorCells,
+    lightingAnchors,
     lowerLandingCells,
     upperLandingCells,
+    lowerApproachGateCells,
+    upperApproachGateCells,
+    lowerApproachCells,
+    upperApproachCells,
     sharedFootprintCells
+  };
+}
+
+function stairOpeningMetrics(cells, W) {
+  if(!cells?.length) return {cellCount:0,area:0,bounds:null};
+  const xs=cells.map(cell=>cell%W),ys=cells.map(cell=>Math.floor(cell/W));
+  const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+  return {
+    cellCount:cells.length,
+    area:cells.length,
+    bounds:{minX,maxX,minY,maxY,width:maxX-minX+1,depth:maxY-minY+1}
+  };
+}
+
+/* A stair owns one explicit architectural plan. Floor holes, walls and
+   mandatory openings must never be inferred independently from the final room
+   raster: doing so made the same stair change shape when a neighbouring room
+   happened to contribute a wall cell. */
+function classifyStairStructure(contract, wallMode = 'wall-backed', W, allowExternalWalls = false) {
+  const footprint=new Set(contract.sharedFootprintCells || []);
+  const opening=new Set(contract.slabOpeningCells || []);
+  const lowerNoWall=new Set(uniqueCells(contract.stairwellInteriorCells,contract.lowerApproachCells));
+  const upperNoWall=new Set(uniqueCells(contract.stairwellInteriorCells,contract.upperApproachCells,contract.slabOpeningCells));
+  const wallEdges=[];
+  const ownsEdge=edge=>wallMode==='enclosed' || (wallMode==='wall-backed'&&edge.structuralSpine);
+
+  for(const edge of contract.stairwellBoundaryEdges || []){
+    const cell=edge.neighborCell;
+    if(cell<0) continue;
+    // Both sockets are hard openings through the complete vertical stair
+    // volume. A lower wall must not rise through the upper exit and an upper
+    // wall must not cap the lower entrance.
+    const mandatoryOpen=edge.lowerAccess || edge.upperAccess || !ownsEdge(edge);
+    if(mandatoryOpen&&footprint.has(cell)){
+      lowerNoWall.add(cell);
+      upperNoWall.add(cell);
+    }else if(!mandatoryOpen&&(footprint.has(cell)||allowExternalWalls)){
+      wallEdges.push(edge);
+    }
+  }
+
+  const doubleHeight=new Set();
+  const lowerSingle=new Set();
+  const upperSingle=new Set();
+  for(const edge of wallEdges){
+    const cell=edge.neighborCell;
+    if(opening.has(edge.insideCell)) doubleHeight.add(cell);
+    else lowerSingle.add(cell);
+    if(!doubleHeight.has(cell)) upperSingle.add(cell);
+  }
+
+  // "No wall" is the strongest rule. It resolves concave L-turn filler cells
+  // that can be touched by more than one boundary edge without letting a
+  // structural classification re-introduce a transverse wall.
+  for(const cell of lowerNoWall){
+    doubleHeight.delete(cell);
+    lowerSingle.delete(cell);
+  }
+  for(const cell of upperNoWall){
+    doubleHeight.delete(cell);
+    upperSingle.delete(cell);
+  }
+  return {
+    openingMetrics:stairOpeningMetrics(contract.slabOpeningCells,W),
+    doubleHeightWallCells:[...doubleHeight].sort((a,b)=>a-b),
+    lowerSingleHeightWallCells:[...lowerSingle].sort((a,b)=>a-b),
+    upperSingleHeightWallCells:[...upperSingle].sort((a,b)=>a-b),
+    lowerNoWallCells:[...lowerNoWall].sort((a,b)=>a-b),
+    upperNoWallCells:[...upperNoWall].sort((a,b)=>a-b)
   };
 }
 
@@ -823,7 +1134,8 @@ function stairContractClear(lowerLayer, upperLayer, contract, lowerRoom, upperRo
   // A room centre is only a validation seed, not protected geometry. If a
   // manually positioned stair crosses it, validation selects another walkable
   // cell from that room after the upper slab has been opened.
-  const blocked = (layer, cell) => layer.stairMask[cell] || layer.stairwellMask[cell] || layer.stairClearance[cell] || layer.stairLanding[cell] || layer.slabOpening[cell];
+  const blocked = (layer, cell) => layer.stairMask[cell] || layer.stairwellMask[cell] || layer.stairWallMask[cell]
+    || layer.stairClearance[cell] || layer.stairLanding[cell] || layer.slabOpening[cell];
   for (const cell of contract.sharedFootprintCells) {
     if (blocked(lowerLayer, cell) || blocked(upperLayer, cell)) return false;
     // Ordinary floor, corridor, wall and decoration data are mutable. The
@@ -841,12 +1153,12 @@ function stairContractClear(lowerLayer, upperLayer, contract, lowerRoom, upperRo
     if (!allowStructureAdaptation && lowerOwner >= 0 && lowerOwner !== lowerRoomId) return false;
     if (!allowStructureAdaptation && upperOwner >= 0 && upperOwner !== upperRoomId) return false;
   }
-  for (const cell of contract.lowerLandingCells) {
+  for (const cell of uniqueCells(contract.lowerApproachCells,contract.lowerApproachRouteCells)) {
     if (blocked(lowerLayer, cell)) return false;
     const owner = lowerLayer.roomId[cell];
     if (!allowStructureAdaptation && owner >= 0 && owner !== lowerRoomId) return false;
   }
-  for (const cell of contract.upperLandingCells) {
+  for (const cell of uniqueCells(contract.upperApproachCells,contract.upperApproachRouteCells)) {
     if (blocked(upperLayer, cell)) return false;
     const owner = upperLayer.roomId[cell];
     if (!allowStructureAdaptation && owner >= 0 && owner !== upperRoomId) return false;
@@ -854,21 +1166,48 @@ function stairContractClear(lowerLayer, upperLayer, contract, lowerRoom, upperRo
   return true;
 }
 
-function reserveStair(lowerLayer, upperLayer, contract, connectorId, tiles) {
+function stairWallPlanClear(lowerLayer,upperLayer,plan){
+  const occupied=(layer,cell)=>layer.stairMask[cell]||layer.stairWallMask[cell]
+    ||layer.stairClearance[cell]||layer.stairLanding[cell]||layer.slabOpening[cell]
+    ||(layer.corridor[cell]&&layer.corridorOwner[cell]>=0);
+  const lowerWalls=uniqueCells(plan.doubleHeightWallCells,plan.lowerSingleHeightWallCells);
+  const upperWalls=uniqueCells(plan.doubleHeightWallCells,plan.upperSingleHeightWallCells);
+  return lowerWalls.every(cell=>!occupied(lowerLayer,cell))
+    &&upperWalls.every(cell=>!occupied(upperLayer,cell));
+}
+
+function reserveStair(lowerLayer, upperLayer, contract, structurePlan, connectorId, tiles) {
   for (const cell of contract.sharedFootprintCells) {
-    // The envelope is reservation/validation metadata only. Mutating every
-    // cell in it used to bulldoze unrelated upper-floor walls and turn L stair
-    // filler corners into floor. Exact geometry sets below own all carving.
+    // The rectangle is conservative reservation metadata. It prevents another
+    // connector from colliding with the turn without becoming visible floor.
     lowerLayer.stairwellMask[cell] = 1;
     upperLayer.stairwellMask[cell] = 1;
   }
-  for (const cell of contract.lowerLandingCells) {
+  for(const cell of uniqueCells(structurePlan.doubleHeightWallCells,structurePlan.lowerSingleHeightWallCells)){
+    lowerLayer.stairWallMask[cell]=1;
+  }
+  for(const cell of uniqueCells(structurePlan.doubleHeightWallCells,structurePlan.upperSingleHeightWallCells)){
+    upperLayer.stairWallMask[cell]=1;
+  }
+  for (const cell of contract.stairwellInteriorCells) {
+    // Only the actual L/straight stair volume is reshaped on both floors.
+    // Clearing the rectangular filler corner made the stairwell feel boxed in.
+    lowerLayer.grid[cell] = tiles.FLOOR;
+    upperLayer.grid[cell] = tiles.FLOOR;
+    lowerLayer.corridor[cell] = 1;
+    upperLayer.corridor[cell] = 1;
+    lowerLayer.corridorOwner[cell] = connectorId;
+    upperLayer.corridorOwner[cell] = connectorId;
+    lowerLayer.roomId[cell] = -1;
+    upperLayer.roomId[cell] = -1;
+  }
+  for (const cell of contract.lowerApproachCells) {
     lowerLayer.grid[cell] = tiles.FLOOR;
     lowerLayer.corridor[cell] = 1;
     lowerLayer.corridorOwner[cell] = connectorId;
     lowerLayer.stairLanding[cell] = 1;
   }
-  for (const cell of contract.upperLandingCells) {
+  for (const cell of contract.upperApproachCells) {
     upperLayer.grid[cell] = tiles.FLOOR;
     upperLayer.corridor[cell] = 1;
     upperLayer.corridorOwner[cell] = connectorId;
@@ -894,15 +1233,67 @@ function reserveStair(lowerLayer, upperLayer, contract, connectorId, tiles) {
   }
 }
 
+function setStairOpenFloor(layer,cell,connectorId,tiles){
+  layer.grid[cell]=tiles.FLOOR;
+  layer.corridor[cell]=1;
+  layer.corridorOwner[cell]=connectorId;
+  layer.roomId[cell]=-1;
+  layer.doorway[cell]=0;
+}
+
+function setStairWall(layer,cell,tiles){
+  layer.grid[cell]=tiles.WALL;
+  layer.corridor[cell]=0;
+  layer.corridorOwner[cell]=-1;
+  layer.roomId[cell]=-1;
+  layer.doorway[cell]=0;
+}
+
+function enforceStairStructure(connector,lowerLayer,upperLayer,tiles){
+  for(const cell of connector.lowerNoWallCells || []) setStairOpenFloor(lowerLayer,cell,connector.id,tiles);
+  for(const cell of connector.upperNoWallCells || []){
+    if(upperLayer.slabOpening[cell]){
+      upperLayer.grid[cell]=tiles.VOID;
+      upperLayer.corridor[cell]=0;
+      upperLayer.corridorOwner[cell]=connector.id;
+      upperLayer.roomId[cell]=-1;
+      upperLayer.doorway[cell]=0;
+    }else setStairOpenFloor(upperLayer,cell,connector.id,tiles);
+  }
+  for(const cell of connector.lowerSingleHeightWallCells || []) setStairWall(lowerLayer,cell,tiles);
+  for(const cell of connector.upperSingleHeightWallCells || []) setStairWall(upperLayer,cell,tiles);
+  for(const cell of connector.doubleHeightWallCells || []){
+    setStairWall(lowerLayer,cell,tiles);
+    setStairWall(upperLayer,cell,tiles);
+  }
+}
+
 function finalizeOpeningProtection(connectors, layers, tiles) {
   for(const connector of connectors){
+    const lowerLayer=layers[connector.fromFloor];
     const upperLayer=layers[connector.toFloor];
+    enforceStairStructure(connector,lowerLayer,upperLayer,tiles);
     const boundary=connector.openingBoundaryEdges || [];
     connector.openingAccessEdges=boundary.filter(edge=>edge.access).map(edge=>({...edge}));
-    connector.openingWallSegments=boundary.filter(edge=>!edge.access
+    connector.openingWallSegments=boundary.filter(edge=>!edge.access&&!edge.stairPassage
       && edge.neighborCell>=0 && upperLayer?.grid[edge.neighborCell]===tiles.WALL).map(edge=>({...edge}));
-    connector.openingGuardSegments=boundary.filter(edge=>!edge.access
-      && edge.neighborCell>=0 && upperLayer?.grid[edge.neighborCell]===tiles.FLOOR).map(edge=>({...edge}));
+    connector.openingGuardSegments=boundary.filter(edge=>!edge.access&&!edge.stairPassage
+      && !(edge.neighborCell>=0 && upperLayer?.grid[edge.neighborCell]===tiles.WALL)).map(edge=>({...edge}));
+    const stairwellBoundary=connector.stairwellBoundaryEdges || [];
+    const lowerWallCells=new Set([...(connector.doubleHeightWallCells || []),...(connector.lowerSingleHeightWallCells || [])]);
+    const upperWallCells=new Set([...(connector.doubleHeightWallCells || []),...(connector.upperSingleHeightWallCells || [])]);
+    const ownsLowerWall=edge=>edge.neighborCell>=0&&lowerWallCells.has(edge.neighborCell)
+      &&lowerLayer?.grid[edge.neighborCell]===tiles.WALL;
+    const ownsUpperWall=edge=>edge.neighborCell>=0&&upperWallCells.has(edge.neighborCell)
+      &&upperLayer?.grid[edge.neighborCell]===tiles.WALL;
+    connector.stairwellLowerWallSegments=stairwellBoundary.filter(edge=>!edge.lowerAccess&&ownsLowerWall(edge))
+      .map(edge=>({...edge,normal:{...edge.normal}}));
+    connector.stairwellUpperWallSegments=stairwellBoundary.filter(edge=>!edge.upperAccess&&ownsUpperWall(edge))
+      .map(edge=>({...edge,normal:{...edge.normal}}));
+    connector.stairwellLowerGuardSegments=stairwellBoundary.filter(edge=>!edge.lowerAccess&&!ownsLowerWall(edge))
+      .map(edge=>({...edge,normal:{...edge.normal}}));
+    connector.stairwellUpperGuardSegments=stairwellBoundary.filter(edge=>!edge.upperAccess&&!ownsUpperWall(edge))
+      .map(edge=>({...edge,normal:{...edge.normal}}));
   }
 }
 
@@ -947,13 +1338,14 @@ function buildStructureAdaptationRoutes({contract,lowerLayer,upperLayer,lowerRoo
   return routes;
 }
 
-function stairRouteAlignmentPenalty(route, W, direction, atEnd) {
-  if (!route?.cells || route.cells.length < 2) return 0;
-  const from = atEnd ? route.cells[route.cells.length - 2] : route.cells[0];
-  const to = atEnd ? route.cells[route.cells.length - 1] : route.cells[1];
-  const dx = (to % W) - (from % W);
-  const dy = Math.floor(to / W) - Math.floor(from / W);
-  return dx === direction.x && dy === direction.y ? 0 : 6;
+function routeWithForcedSocketCell(route, socketPoint, W, H, atEnd) {
+  if(!route?.cells?.length || !inBounds(W,H,socketPoint.x,socketPoint.y)) return null;
+  const socketCell=idx2(W,socketPoint.x,socketPoint.y);
+  const adjacentCell=atEnd ? route.cells[route.cells.length-1] : route.cells[0];
+  const ax=adjacentCell%W,ay=Math.floor(adjacentCell/W);
+  if(Math.abs(socketPoint.x-ax)+Math.abs(socketPoint.y-ay)!==1 || route.cells.includes(socketCell)) return null;
+  const cells=atEnd ? [...route.cells,socketCell] : [socketCell,...route.cells];
+  return {cells,points:simplifyCells(cells,W),cost:route.cost+1};
 }
 
 function connectorCandidates(aDoor, bDoor, W, H, run, width, landingDepth, style = 'l-turn', lateralCenterOffset) {
@@ -1046,7 +1438,7 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
     ...connectorCandidates(lowerDoor, upperDoor, W, H, run, width, landingDepth, style, lateralCenterOffset)
   ];
   const candidates = (hasStableAnchor
-    ? [{ lower:{x:Math.round(stairSpec.anchor.x),y:Math.round(stairSpec.anchor.y)}, direction:pinnedDirection }]
+    ? [{ lower:snapStairGridPoint(stairSpec.anchor), direction:pinnedDirection }]
     : generatedCandidates)
     .sort((a, b) => {
       const endpoint=candidate=>{
@@ -1064,6 +1456,7 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
     })
     .slice(0, hasStableAnchor ? 1 : 48);
   const legal = [];
+  const wallMode=stairSpec?.wallMode || 'wall-backed';
   // Automatic placement first looks for a complete rectangular stairwell that
   // touches only the linked rooms. Dense layouts may have no strict socket, so
   // a second pass can reshape ordinary structure, while still reserving the
@@ -1080,21 +1473,42 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
       const sideClearance = hasStableAnchor || allowStructureAdaptation ? 0 : 1;
       const contract = buildStairContract(W, H, candidate.lower, candidate.direction, run, width, landingDepth, sideClearance, style, lateralCenterOffset);
       if (!contract || !stairContractClear(lowerLayer, upperLayer, contract, lowerRoom, upperRoom, W, allowStructureAdaptation)) continue;
-      const futureShaft=new Set(contract.shaftCells);
-      const lowerRoute = routeAStar(lowerLayer, lowerDoor, contract.lowerApproach, {
+      const structurePlan=classifyStairStructure(contract,wallMode,W,hasStableAnchor);
+      // Locked/editor stairs may reshape ordinary room structure, but they may
+      // never place a stair wall over an already carved corridor or another
+      // stair's landing/clearance. Without this check a later locked stair
+      // could visually cut through the access route of an earlier stair while
+      // the global BFS still found a detour and incorrectly reported success.
+      if(!stairWallPlanClear(lowerLayer,upperLayer,structurePlan)) continue;
+      const lowerBlocked=new Set(uniqueCells(contract.sharedFootprintCells,contract.lowerApproachCells,
+        structurePlan.doubleHeightWallCells,structurePlan.lowerSingleHeightWallCells));
+      const upperBlocked=new Set(uniqueCells(contract.sharedFootprintCells,contract.upperApproachCells,contract.slabOpeningCells,
+        structurePlan.doubleHeightWallCells,structurePlan.upperSingleHeightWallCells));
+      const lowerRouteCore = routeAStar(lowerLayer, lowerDoor, contract.lowerApproachRouteCell, {
         W, H, startRoomId: lowerRoom.id, goalRoomId: lowerRoom.id,
-        preferredRoomId:lowerRoom.id, blockedCells:futureShaft
+        preferredRoomId:lowerRoom.id, blockedCells:lowerBlocked
       });
-      const upperRoute = routeAStar(upperLayer, contract.upperApproach, upperDoor, {
+      const upperRouteCore = routeAStar(upperLayer, contract.upperApproachRouteCell, upperDoor, {
         W, H, startRoomId: upperRoom.id, goalRoomId: upperRoom.id,
-        preferredRoomId:upperRoom.id, blockedCells:futureShaft
+        preferredRoomId:upperRoom.id, blockedCells:upperBlocked
       });
+      const lowerRoute=routeWithForcedSocketCell(lowerRouteCore,contract.lowerApproachGate,W,H,true);
+      const upperRoute=routeWithForcedSocketCell(upperRouteCore,contract.upperApproachGate,W,H,false);
       if (!lowerRoute || !upperRoute) continue;
+      const lowerStructureWalls=new Set(uniqueCells(
+        structurePlan.doubleHeightWallCells,structurePlan.lowerSingleHeightWallCells
+      ));
+      const upperStructureWalls=new Set(uniqueCells(
+        structurePlan.doubleHeightWallCells,structurePlan.upperSingleHeightWallCells
+      ));
+      // The candidate's own access route must not terminate at or pass through
+      // one of its generated walls. Stacked rooms can share the same nominal
+      // door point, so checking only the pre-stair raster is insufficient.
+      if(lowerRoute.cells.some(cell=>lowerStructureWalls.has(cell))
+        ||upperRoute.cells.some(cell=>upperStructureWalls.has(cell))) continue;
       let overlapPenalty = 0;
       for (const cell of lowerRoute.cells) if (lowerLayer.corridor[cell]) overlapPenalty -= 0.4;
       for (const cell of upperRoute.cells) if (upperLayer.corridor[cell]) overlapPenalty -= 0.4;
-      const alignmentPenalty = stairRouteAlignmentPenalty(lowerRoute, W, candidate.direction, true)
-        + stairRouteAlignmentPenalty(upperRoute, W, contract.secondDirection, false);
       const sharedRoomOverlap=contract.sharedFootprintCells.every(cell=>{
         const lowerOwner=lowerLayer.roomId[cell], upperOwner=upperLayer.roomId[cell];
         return lowerOwner===lowerRoom.id && upperOwner===upperRoom.id;
@@ -1105,9 +1519,9 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
         if(lowerOwner>=0&&lowerOwner!==lowerRoom.id) structurePenalty+=12;
         if(upperOwner>=0&&upperOwner!==upperRoom.id) structurePenalty+=12;
       }
-      const score = lowerRoute.cost + upperRoute.cost + run + landingDepth * 2 + alignmentPenalty + overlapPenalty
+      const score = lowerRoute.cost + upperRoute.cost + run + landingDepth * 2 + overlapPenalty
         + structurePenalty - (sharedRoomOverlap ? 1000 : 0);
-      passLegal.push({ ...candidate, contract, lowerRoute, upperRoute, sharedRoomOverlap, score, structureAdapted:allowStructureAdaptation });
+      passLegal.push({ ...candidate, contract, structurePlan, lowerRoute, upperRoute, sharedRoomOverlap, score, structureAdapted:allowStructureAdaptation });
     }
     if(passLegal.length){
       legal.push(...passLegal);
@@ -1124,6 +1538,8 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
       contract:best.contract,lowerLayer,upperLayer,lowerRoom,upperRoom,rooms,W,H,tiles
     }) : [];
 
+  const structurePlan=best.structurePlan || classifyStairStructure(best.contract,wallMode,W);
+
   // Stair approaches inherit the stair width. Using the generic critical-path
   // width here widened a two-tile stair to three tiles and punched through the
   // wall beside an otherwise valid wall-flush placement.
@@ -1133,7 +1549,7 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
   for(const adaptation of structureAdaptationRoutes){
     carveCells(adaptation.layer,adaptation.route.cells,W,H,1,edge.id,tiles);
   }
-  reserveStair(lowerLayer, upperLayer, best.contract, connectorId, tiles);
+  reserveStair(lowerLayer, upperLayer, best.contract, structurePlan, connectorId, tiles);
   markDoor(lowerLayer, W, H, lowerDoor);
   markDoor(upperLayer, W, H, upperDoor);
   lowerLayer.doorway[idx2(W, best.contract.lower.x, best.contract.lower.y)] = 1;
@@ -1151,6 +1567,10 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
     upper: { ...best.contract.upper },
     lowerApproach: { ...best.contract.lowerApproach },
     upperApproach: { ...best.contract.upperApproach },
+    lowerApproachGate:{...best.contract.lowerApproachGate},
+    upperApproachGate:{...best.contract.upperApproachGate},
+    lowerApproachRouteCell:{...best.contract.lowerApproachRouteCell},
+    upperApproachRouteCell:{...best.contract.upperApproachRouteCell},
     direction: best.direction.name,
     directionVector: { x: best.direction.x, y: best.direction.y },
     secondDirection:best.contract.secondDirection.name,
@@ -1175,15 +1595,41 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
     structureAdaptationRoutes:structureAdaptationRoutes.map(adaptation=>({
       floor:adaptation.layer.floor,roomId:adaptation.roomId,points:adaptation.route.points
     })),
-    openingPolicy:'headroom-tight',
+    openingPolicy:'headroom-tight-upper-slab-only',
     requiredHeadroom:STAIR_REQUIRED_HEADROOM,
+    wallMode,
+    wallReservationPolicy:hasStableAnchor?'locked-external-wall':'reserved-footprint-only',
+    wallGeneration:'stair-contract',
+    wallHeightPolicy:'opening-span-classified',
     stairFootprintCells:[...best.contract.stairFootprintCells],
     headroomCells:[...best.contract.headroomCells],
+    sweptClearanceCells:best.contract.sweptClearanceCells.map(record=>({...record})),
     openingCells: [...best.contract.slabOpeningCells],
+    floorOpeningCells:[...best.contract.slabOpeningCells],
+    openingMetrics:{...structurePlan.openingMetrics,bounds:structurePlan.openingMetrics.bounds?{...structurePlan.openingMetrics.bounds}:null},
+    doubleHeightWallCells:[...structurePlan.doubleHeightWallCells],
+    lowerSingleHeightWallCells:[...structurePlan.lowerSingleHeightWallCells],
+    upperSingleHeightWallCells:[...structurePlan.upperSingleHeightWallCells],
+    lowerNoWallCells:[...structurePlan.lowerNoWallCells],
+    upperNoWallCells:[...structurePlan.upperNoWallCells],
     openingBoundaryEdges:best.contract.openingBoundaryEdges.map(edge=>({...edge})),
     openingAccessEdges:best.contract.openingAccessEdges.map(edge=>({...edge})),
+    openingStairPassageEdges:best.contract.openingStairPassageEdges.map(edge=>({...edge})),
     openingGuardSegments:[],
     openingWallSegments:[],
+    stairwellBoundaryEdges:best.contract.stairwellBoundaryEdges.map(edge=>({...edge,normal:{...edge.normal}})),
+    stairwellLowerAccessEdges:best.contract.stairwellLowerAccessEdges.map(edge=>({...edge,normal:{...edge.normal}})),
+    stairwellUpperAccessEdges:best.contract.stairwellUpperAccessEdges.map(edge=>({...edge,normal:{...edge.normal}})),
+    stairwellLowerWallSegments:[],
+    stairwellUpperWallSegments:[],
+    stairwellLowerGuardSegments:[],
+    stairwellUpperGuardSegments:[],
+    stairwellInteriorCells:[...best.contract.stairwellInteriorCells],
+    lightingPolicy:'required-themed',
+    minimumLightCount:2,
+    lightingAnchors:best.contract.lightingAnchors.map(anchor=>({...anchor,direction:{...anchor.direction}})),
+    lowerApproachCells:[...best.contract.lowerApproachCells],
+    upperApproachCells:[...best.contract.upperApproachCells],
     sharedFootprintCells:[...best.contract.sharedFootprintCells],
     sharedFootprintKind:best.sharedRoomOverlap?'room-overlap':'rectangular-stairwell-pad',
     clearVolume: {
@@ -1195,7 +1641,9 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
       height: FLOOR_HEIGHT
     },
     lowerRoute: best.lowerRoute.points,
-    upperRoute: best.upperRoute.points
+    upperRoute: best.upperRoute.points,
+    lowerRouteCells:[...best.lowerRoute.cells],
+    upperRouteCells:[...best.upperRoute.cells]
   };
   edge.connectorId = connectorId;
   edge.lowerRoute = connector.lowerRoute;
@@ -1205,7 +1653,21 @@ function placeConnector({ edge, rooms, layers, W, H, connectorId, tiles }) {
   return connector;
 }
 
-function buildWalls(layer, W, H, tiles) {
+function stairTransitionWallExclusions(connectors,floor){
+  const excluded=new Set();
+  for(const connector of connectors || []){
+    const isLower=connector.fromFloor===floor;
+    const isUpper=connector.toFloor===floor;
+    if(!isLower&&!isUpper) continue;
+    for(const cell of isLower ? (connector.lowerNoWallCells || []) : (connector.upperNoWallCells || [])) excluded.add(cell);
+  }
+  return excluded;
+}
+
+function buildWalls(layer, W, H, tiles, excludedWallCells = new Set()) {
+  for(const cell of excludedWallCells){
+    if(layer.grid[cell]===tiles.WALL) layer.grid[cell]=tiles.VOID;
+  }
   const floorCells = [];
   for (let cell = 0; cell < layer.grid.length; cell++) if (layer.grid[cell] === tiles.FLOOR) floorCells.push(cell);
   for (const cell of floorCells) {
@@ -1217,7 +1679,8 @@ function buildWalls(layer, W, H, tiles) {
         const ny = y + oy;
         if (!inBounds(W, H, nx, ny)) continue;
         const neighbor = idx2(W, nx, ny);
-        if (layer.grid[neighbor] === tiles.VOID && !layer.slabOpening[neighbor]) layer.grid[neighbor] = tiles.WALL;
+        if (layer.grid[neighbor] === tiles.VOID && !layer.slabOpening[neighbor]
+            && !excludedWallCells.has(neighbor)) layer.grid[neighbor] = tiles.WALL;
       }
     }
   }
@@ -1381,7 +1844,7 @@ function roomAccessCell(room, layer, W, H, tiles) {
   return best;
 }
 
-function stairConnectorContractValid(connector, W, H) {
+function stairConnectorContractValid(connector, W, H, lowerLayer, upperLayer, tiles) {
   if(!connector?.lower || !connector?.upper || !connector?.directionVector) return false;
   const rebuilt=buildStairContract(
     W,H,connector.lower,connector.directionVector,connector.length,connector.width,
@@ -1394,10 +1857,60 @@ function stairConnectorContractValid(connector, W, H) {
     const set=new Set(actual);
     return set.size===expected.length && expected.every(cell=>set.has(cell));
   };
+  const edgeKey=edge=>[
+    edge.x1,edge.y1,edge.x2,edge.y2,
+    Number(!!edge.lowerAccess),Number(!!edge.upperAccess),Number(!!edge.structuralSpine)
+  ].join(',');
+  const sameEdges=(actual,expected)=>{
+    if(!Array.isArray(actual) || actual.length!==expected.length) return false;
+    const set=new Set(actual.map(edgeKey));
+    return set.size===expected.length && expected.every(edge=>set.has(edgeKey(edge)));
+  };
+  const anchorKey=anchor=>[
+    anchor.id,anchor.x,anchor.y,anchor.elevationFraction,anchor.direction?.x,anchor.direction?.y
+  ].join(',');
+  const sameAnchors=(actual,expected)=>{
+    if(!Array.isArray(actual) || actual.length!==expected.length) return false;
+    const set=new Set(actual.map(anchorKey));
+    return set.size===expected.length && expected.every(anchor=>set.has(anchorKey(anchor)));
+  };
+  const clearanceKey=record=>[
+    record.cell,record.treadElevation,record.clearanceTop,Number(!!record.intersectsUpperSlab)
+  ].join(',');
+  const sameClearance=(actual,expected)=>{
+    if(!Array.isArray(actual)||actual.length!==expected.length) return false;
+    const set=new Set(actual.map(clearanceKey));
+    return set.size===expected.length&&expected.every(record=>set.has(clearanceKey(record)));
+  };
+  const routeDirectionValid=(cells,gate,routeCell,direction,atEnd)=>{
+    if(!Array.isArray(cells)||cells.length<2) return false;
+    const gateCell=idx2(W,gate.x,gate.y),outsideCell=idx2(W,routeCell.x,routeCell.y);
+    const from=atEnd?cells[cells.length-2]:cells[0];
+    const to=atEnd?cells[cells.length-1]:cells[1];
+    return (atEnd ? from===outsideCell&&to===gateCell : from===gateCell&&to===outsideCell)
+      && (to%W)-(from%W)===direction.x
+      && Math.floor(to/W)-Math.floor(from/W)===direction.y;
+  };
   const stepsValid=Number.isInteger(connector.stepCount) && connector.stepCount>0
     && Number.isInteger(connector.firstFlightSteps) && Number.isInteger(connector.secondFlightSteps)
     && connector.firstFlightSteps+connector.secondFlightSteps===connector.stepCount
     && Math.abs(connector.stepRise*connector.stepCount-connector.rise)<1e-9;
+  const wallMode=connector.wallMode || 'wall-backed';
+  const structurePlan=classifyStairStructure(rebuilt,wallMode,W,connector.wallReservationPolicy==='locked-external-wall');
+  const lowerWallCells=new Set([...structurePlan.doubleHeightWallCells,...structurePlan.lowerSingleHeightWallCells]);
+  const upperWallCells=new Set([...structurePlan.doubleHeightWallCells,...structurePlan.upperSingleHeightWallCells]);
+  const ownsLowerWall=edge=>edge.neighborCell>=0&&lowerWallCells.has(edge.neighborCell)
+    &&lowerLayer?.grid[edge.neighborCell]===tiles.WALL;
+  const ownsUpperWall=edge=>edge.neighborCell>=0&&upperWallCells.has(edge.neighborCell)
+    &&upperLayer?.grid[edge.neighborCell]===tiles.WALL;
+  const expectedLowerWalls=rebuilt.stairwellBoundaryEdges.filter(edge=>!edge.lowerAccess&&ownsLowerWall(edge));
+  const expectedUpperWalls=rebuilt.stairwellBoundaryEdges.filter(edge=>!edge.upperAccess&&ownsUpperWall(edge));
+  const expectedLowerGuards=rebuilt.stairwellBoundaryEdges.filter(edge=>!edge.lowerAccess&&!ownsLowerWall(edge));
+  const expectedUpperGuards=rebuilt.stairwellBoundaryEdges.filter(edge=>!edge.upperAccess&&!ownsUpperWall(edge));
+  const expectedOpeningWalls=rebuilt.openingBoundaryEdges.filter(edge=>!edge.access&&!edge.stairPassage
+    && edge.neighborCell>=0&&upperLayer?.grid[edge.neighborCell]===tiles.WALL);
+  const expectedOpeningGuards=rebuilt.openingBoundaryEdges.filter(edge=>!edge.access&&!edge.stairPassage
+    && !(edge.neighborCell>=0&&upperLayer?.grid[edge.neighborCell]===tiles.WALL));
   return normalizeStairStyle(connector.style)===rebuilt.style
     && connector.width===snapStairWidth(connector.width)
     && connector.firstRun===rebuilt.firstRun
@@ -1405,13 +1918,164 @@ function stairConnectorContractValid(connector, W, H) {
     && connector.length===rebuilt.run
     && samePoint(connector.turn,rebuilt.turn)
     && samePoint(connector.upper,rebuilt.upper)
+    && samePoint(connector.lowerApproachGate,rebuilt.lowerApproachGate)
+    && samePoint(connector.upperApproachGate,rebuilt.upperApproachGate)
+    && samePoint(connector.lowerApproachRouteCell,rebuilt.lowerApproachRouteCell)
+    && samePoint(connector.upperApproachRouteCell,rebuilt.upperApproachRouteCell)
     && connector.secondDirectionVector?.x===rebuilt.secondDirection.x
     && connector.secondDirectionVector?.y===rebuilt.secondDirection.y
     && sameCells(connector.stairFootprintCells,rebuilt.stairFootprintCells)
     && sameCells(connector.headroomCells,rebuilt.headroomCells)
+    && sameClearance(connector.sweptClearanceCells,rebuilt.sweptClearanceCells)
     && sameCells(connector.openingCells,rebuilt.slabOpeningCells)
+    && sameCells(connector.floorOpeningCells,rebuilt.slabOpeningCells)
+    && connector.openingMetrics?.cellCount===structurePlan.openingMetrics.cellCount
+    && connector.openingMetrics?.area===structurePlan.openingMetrics.area
+    && sameCells(connector.doubleHeightWallCells,structurePlan.doubleHeightWallCells)
+    && sameCells(connector.lowerSingleHeightWallCells,structurePlan.lowerSingleHeightWallCells)
+    && sameCells(connector.upperSingleHeightWallCells,structurePlan.upperSingleHeightWallCells)
+    && sameCells(connector.lowerNoWallCells,structurePlan.lowerNoWallCells)
+    && sameCells(connector.upperNoWallCells,structurePlan.upperNoWallCells)
+    && sameCells(connector.lowerApproachCells,rebuilt.lowerApproachCells)
+    && sameCells(connector.upperApproachCells,rebuilt.upperApproachCells)
     && sameCells(connector.sharedFootprintCells,rebuilt.sharedFootprintCells)
+    && sameCells(connector.stairwellInteriorCells,rebuilt.stairwellInteriorCells)
+    && ['open','wall-backed','enclosed'].includes(wallMode)
+    && ['locked-external-wall','reserved-footprint-only'].includes(connector.wallReservationPolicy)
+    && connector.wallGeneration==='stair-contract'
+    && connector.wallHeightPolicy==='opening-span-classified'
+    && connector.lightingPolicy==='required-themed'
+    && Number.isInteger(connector.minimumLightCount) && connector.minimumLightCount>=2
+    && connector.lightingAnchors?.length>=connector.minimumLightCount
+    && sameAnchors(connector.lightingAnchors,rebuilt.lightingAnchors)
+    && sameEdges(connector.openingAccessEdges,rebuilt.openingAccessEdges)
+    && sameEdges(connector.openingStairPassageEdges,rebuilt.openingStairPassageEdges)
+    && sameEdges(connector.openingWallSegments,expectedOpeningWalls)
+    && sameEdges(connector.openingGuardSegments,expectedOpeningGuards)
+    && sameEdges(connector.stairwellBoundaryEdges,rebuilt.stairwellBoundaryEdges)
+    && sameEdges(connector.stairwellLowerWallSegments,expectedLowerWalls)
+    && sameEdges(connector.stairwellUpperWallSegments,expectedUpperWalls)
+    && sameEdges(connector.stairwellLowerGuardSegments,expectedLowerGuards)
+    && sameEdges(connector.stairwellUpperGuardSegments,expectedUpperGuards)
+    && routeDirectionValid(connector.lowerRouteCells,rebuilt.lowerApproachGate,rebuilt.lowerApproachRouteCell,rebuilt.direction,true)
+    && routeDirectionValid(connector.upperRouteCells,rebuilt.upperApproachGate,rebuilt.upperApproachRouteCell,rebuilt.secondDirection,false)
     && stepsValid;
+}
+
+function stairAuditEdgeKey(edge) {
+  return [edge?.x1,edge?.y1,edge?.x2,edge?.y2].join(',');
+}
+
+function stairBoundaryProtectionComplete(boundary, accessField, walls, guards, mandatoryOpenField = null) {
+  if(!Array.isArray(boundary)||!Array.isArray(walls)||!Array.isArray(guards)) return false;
+  const wallKeys=new Set(walls.map(stairAuditEdgeKey));
+  const guardKeys=new Set(guards.map(stairAuditEdgeKey));
+  return boundary.every(edge=>{
+    const key=stairAuditEdgeKey(edge);
+    if(edge[accessField]||(mandatoryOpenField&&edge[mandatoryOpenField])){
+      return !wallKeys.has(key)&&!guardKeys.has(key);
+    }
+    return Number(wallKeys.has(key))+Number(guardKeys.has(key))===1;
+  });
+}
+
+/**
+ * Performs the per-stair acceptance pass used after every generation.
+ * This is deliberately layer-aware: rebuilding the connector contract alone
+ * cannot detect a later stair wall cutting through an earlier access route, or
+ * an unrelated slab hole appearing inside the reserved stairwell.
+ */
+export function auditStairConnector({connector,W,H,lowerLayer,upperLayer,tiles=DEFAULT_TILES}) {
+  const issues=[];
+  const addIssue=(code,message)=>{
+    if(!issues.some(issue=>issue.code===code)) issues.push({code,message});
+  };
+  const total=W*H;
+  const cellsMatch=(cells,predicate,requireNonEmpty=true)=>Array.isArray(cells)
+    &&(!requireNonEmpty||cells.length>0)
+    &&cells.every(cell=>Number.isInteger(cell)&&cell>=0&&cell<total&&predicate(cell));
+  const openingSet=new Set(connector?.openingCells || []);
+
+  const layersPresent=!!lowerLayer&&!!upperLayer;
+  const contractComplete=layersPresent
+    &&stairConnectorContractValid(connector,W,H,lowerLayer,upperLayer,tiles);
+  if(!contractComplete) addIssue('contract-mismatch','楼梯几何、尺寸或结构契约不一致');
+
+  const lowerLandingCell=connector?.lower ? idx2(W,connector.lower.x,connector.lower.y) : -1;
+  const upperLandingCell=connector?.upper ? idx2(W,connector.upper.x,connector.upper.y) : -1;
+  const landingsWalkable=layersPresent
+    &&lowerLandingCell>=0&&upperLandingCell>=0
+    &&lowerLayer.grid[lowerLandingCell]===tiles.FLOOR
+    &&upperLayer.grid[upperLandingCell]===tiles.FLOOR
+    &&!!lowerLayer.stairLanding[lowerLandingCell]
+    &&!!upperLayer.stairLanding[upperLandingCell]
+    &&cellsMatch(connector.lowerApproachCells,cell=>lowerLayer.grid[cell]===tiles.FLOOR
+      &&!!lowerLayer.stairLanding[cell]&&!lowerLayer.slabOpening[cell])
+    &&cellsMatch(connector.upperApproachCells,cell=>upperLayer.grid[cell]===tiles.FLOOR
+      &&!!upperLayer.stairLanding[cell]&&!upperLayer.slabOpening[cell]);
+  if(!landingsWalkable) addIssue('landing-blocked','楼梯上下落脚区被墙体、洞口或非地面单元阻断');
+
+  const routesWalkable=layersPresent
+    &&cellsMatch(connector.lowerRouteCells,cell=>lowerLayer.grid[cell]===tiles.FLOOR&&!lowerLayer.slabOpening[cell])
+    &&cellsMatch(connector.upperRouteCells,cell=>upperLayer.grid[cell]===tiles.FLOOR&&!upperLayer.slabOpening[cell]);
+  if(!routesWalkable) addIssue('access-route-blocked','楼梯接入路线穿过墙体或楼板洞口');
+
+  const treadVolumeWalkable=layersPresent
+    &&cellsMatch(connector.stairFootprintCells,cell=>lowerLayer.grid[cell]===tiles.FLOOR
+      &&!!lowerLayer.stairMask[cell]&&!!lowerLayer.stairClearance[cell]
+      &&!lowerLayer.slabOpening[cell]);
+  if(!treadVolumeWalkable) addIssue('tread-volume-blocked','下层踏步占地存在墙体、空洞或净空缺失');
+
+  const floorRelationValid=layersPresent
+    &&connector.toFloor-connector.fromFloor===1
+    &&connector.rise===FLOOR_HEIGHT;
+  if(!floorRelationValid) addIssue('floor-relation-invalid','楼梯没有连接相邻楼层或层高不一致');
+  const traversable=landingsWalkable&&routesWalkable&&treadVolumeWalkable&&floorRelationValid;
+
+  const openingCellsValid=layersPresent&&openingSet.size>0
+    &&openingSet.size===(connector.openingCells || []).length
+    &&[...openingSet].every(cell=>Number.isInteger(cell)&&cell>=0&&cell<total
+      &&!!upperLayer.slabOpening[cell]&&!!upperLayer.stairClearance[cell]
+      &&upperLayer.grid[cell]===tiles.VOID);
+  const lowerSlabSolid=layersPresent&&cellsMatch(connector.sharedFootprintCells,cell=>!lowerLayer.slabOpening[cell]);
+  const upperOpeningExact=layersPresent&&cellsMatch(connector.sharedFootprintCells,cell=>
+    !!upperLayer.slabOpening[cell]===openingSet.has(cell));
+  const upperRemainderSolid=layersPresent&&cellsMatch(connector.stairFootprintCells,cell=>
+    openingSet.has(cell)||(upperLayer.grid[cell]!==tiles.VOID&&!upperLayer.slabOpening[cell]));
+  const slabsComplete=openingCellsValid&&lowerSlabSolid&&upperOpeningExact&&upperRemainderSolid;
+  if(!slabsComplete) addIssue('slab-hole-invalid','上下层楼板存在漏开、误开或未封闭的空洞');
+
+  const segmentBackedByWall=(segments,layer)=>Array.isArray(segments)&&segments.every(edge=>
+    Number.isInteger(edge.neighborCell)&&edge.neighborCell>=0&&edge.neighborCell<total
+    &&layer.grid[edge.neighborCell]===tiles.WALL);
+  const wallCellsComplete=layersPresent
+    &&cellsMatch(connector.doubleHeightWallCells,cell=>lowerLayer.grid[cell]===tiles.WALL&&upperLayer.grid[cell]===tiles.WALL,false)
+    &&cellsMatch(connector.lowerSingleHeightWallCells,cell=>lowerLayer.grid[cell]===tiles.WALL,false)
+    &&cellsMatch(connector.upperSingleHeightWallCells,cell=>upperLayer.grid[cell]===tiles.WALL,false)
+    &&cellsMatch(connector.lowerNoWallCells,cell=>lowerLayer.grid[cell]!==tiles.WALL,false)
+    &&cellsMatch(connector.upperNoWallCells,cell=>upperLayer.grid[cell]!==tiles.WALL,false);
+  const boundaryProtectionComplete=layersPresent
+    &&stairBoundaryProtectionComplete(connector.openingBoundaryEdges,'access',connector.openingWallSegments,
+      connector.openingGuardSegments,'stairPassage')
+    &&stairBoundaryProtectionComplete(connector.stairwellBoundaryEdges,'lowerAccess',connector.stairwellLowerWallSegments,connector.stairwellLowerGuardSegments)
+    &&stairBoundaryProtectionComplete(connector.stairwellBoundaryEdges,'upperAccess',connector.stairwellUpperWallSegments,connector.stairwellUpperGuardSegments)
+    &&segmentBackedByWall(connector.openingWallSegments,upperLayer)
+    &&segmentBackedByWall(connector.stairwellLowerWallSegments,lowerLayer)
+    &&segmentBackedByWall(connector.stairwellUpperWallSegments,upperLayer);
+  const wallsComplete=wallCellsComplete&&boundaryProtectionComplete;
+  if(!wallsComplete) addIssue('wall-protection-incomplete','楼梯墙体或临空护栏不完整，或入口被错误封闭');
+
+  return {
+    connectorId:connector?.id ?? null,
+    edgeId:connector?.edgeId ?? null,
+    pass:contractComplete&&traversable&&slabsComplete&&wallsComplete,
+    contractComplete,
+    traversable,
+    reachable:false,
+    wallsComplete,
+    slabsComplete,
+    issues
+  };
 }
 
 export function validateDungeon3D({ layers, rooms, connectors, entrance, W, H, tiles = DEFAULT_TILES }) {
@@ -1421,6 +2085,7 @@ export function validateDungeon3D({ layers, rooms, connectors, entrance, W, H, t
   const queue = new Int32Array(total);
   const transitions = new Map();
   const invalidConnectors = [];
+  const stairAudits = [];
   const addTransition = (from, to) => {
     const list = transitions.get(from) || [];
     list.push(to);
@@ -1429,33 +2094,18 @@ export function validateDungeon3D({ layers, rooms, connectors, entrance, W, H, t
   for (const connector of connectors) {
     const lowerLayer = layers[connector.fromFloor];
     const upperLayer = layers[connector.toFloor];
-    let spatiallyValid = !!lowerLayer && !!upperLayer
-      && connector.toFloor - connector.fromFloor === 1
-      && stairConnectorContractValid(connector,W,H)
-      && connector.rise === FLOOR_HEIGHT;
-    if (spatiallyValid) {
-      const lowerLocal = idx2(W, connector.lower.x, connector.lower.y);
-      const upperLocal = idx2(W, connector.upper.x, connector.upper.y);
-      spatiallyValid = !!lowerLayer.stairLanding[lowerLocal] && !!upperLayer.stairLanding[upperLocal]
-        && lowerLayer.grid[lowerLocal] === tiles.FLOOR && upperLayer.grid[upperLocal] === tiles.FLOOR;
-      for (const cell of connector.stairFootprintCells || []) {
-        if (!lowerLayer.stairMask[cell] || !lowerLayer.stairClearance[cell]) {
-          spatiallyValid = false;
-          break;
-        }
-      }
-      for (const cell of connector.openingCells || []) {
-        if (!upperLayer.slabOpening[cell] || !upperLayer.stairClearance[cell]) {
-          spatiallyValid = false;
-          break;
-        }
-      }
-    }
+    const audit=auditStairConnector({connector,W,H,lowerLayer,upperLayer,tiles});
+    stairAudits.push(audit);
+    const spatiallyValid=audit.pass;
     if (!spatiallyValid) invalidConnectors.push(connector.id);
     const lower = connector.fromFloor * totalPerFloor + idx2(W, connector.lower.x, connector.lower.y);
     const upper = connector.toFloor * totalPerFloor + idx2(W, connector.upper.x, connector.upper.y);
-    addTransition(lower, upper);
-    addTransition(upper, lower);
+    // A stair that failed its own physical audit must not make the global BFS
+    // appear connected by contributing a synthetic cross-floor transition.
+    if(spatiallyValid){
+      addTransition(lower, upper);
+      addTransition(upper, lower);
+    }
   }
   const startRoom = rooms[entrance];
   const startLocal = startRoom ? roomAccessCell(startRoom, layers[startRoom.floor], W, H, tiles) : null;
@@ -1504,6 +2154,13 @@ export function validateDungeon3D({ layers, rooms, connectors, entrance, W, H, t
     const upper = connector.toFloor * totalPerFloor + idx2(W, connector.upper.x, connector.upper.y);
     return distance[lower] < 0 || distance[upper] < 0;
   }).map(connector => connector.id);
+  for(const audit of stairAudits){
+    audit.reachable=!unreachableConnectors.includes(audit.connectorId);
+    if(!audit.reachable&&!audit.issues.some(issue=>issue.code==='unreachable')){
+      audit.issues.push({code:'unreachable',message:'楼梯上下层不能从场景入口正常通行'});
+    }
+    audit.pass=audit.pass&&audit.reachable;
+  }
 
   layers.forEach(layer => {
     const offset = layer.floor * totalPerFloor;
@@ -1515,12 +2172,14 @@ export function validateDungeon3D({ layers, rooms, connectors, entrance, W, H, t
     layer.maxBfs = max;
   });
   return {
-    valid: unreachableRooms.length === 0 && unreachableConnectors.length === 0 && invalidConnectors.length === 0,
+    valid: unreachableRooms.length === 0 && unreachableConnectors.length === 0
+      && invalidConnectors.length === 0 && stairAudits.every(audit=>audit.pass),
     distance,
     reach,
     unreachableRooms,
     unreachableConnectors,
-    invalidConnectors
+    invalidConnectors,
+    stairAudits
   };
 }
 
@@ -1559,13 +2218,28 @@ export function buildMultiFloorLayout({
       const requestedGoal = edge.hasCustomDoorB && Number.isFinite(edge.bx) && Number.isFinite(edge.by)
         ? { x: Math.round(edge.bx), y: Math.round(edge.by), side: edge.bside || defaultGoal.side }
         : defaultGoal;
-      const width = Math.max(1, Math.min(3, Math.round(edge.visualWidth || (edge.isCritical ? 3 : 2))));
-      const start = resolveWallDoor(layer, W, H, roomA, requestedStart, defaultStart, width, !edge.hasCustomDoorA);
-      const goal = resolveWallDoor(layer, W, H, roomB, requestedGoal, defaultGoal, width, !edge.hasCustomDoorB);
+      const requestedWidth = normalizeCorridorWidth(edge.visualWidth || (edge.isCritical ? 3 : 2));
+      let width = 0, start = null, goal = null;
+      // A constrained door may not have enough tangent cells for the desired
+      // corridor width. Find the widest width that both door sockets can
+      // actually accept, then use that one width for the whole corridor.
+      for(let candidate=requestedWidth; candidate>=CORRIDOR_WIDTH_MIN; candidate-=CORRIDOR_WIDTH_STEP){
+        const candidateStart = resolveWallDoor(layer, W, H, roomA, requestedStart, defaultStart, candidate, !edge.hasCustomDoorA);
+        const candidateGoal = resolveWallDoor(layer, W, H, roomB, requestedGoal, defaultGoal, candidate, !edge.hasCustomDoorB);
+        if(candidateStart && candidateGoal){
+          width = candidate;
+          start = candidateStart;
+          goal = candidateGoal;
+          break;
+        }
+      }
       if (!start || !goal) {
         errors.push(`edge ${edge.id} has no legal wall door`);
         continue;
       }
+      edge.requestedWidth = requestedWidth;
+      edge.widthAdapted = width !== requestedWidth;
+      edge.visualWidth = width;
       /* Door points are boundary cells with a verified open cell immediately
          outside the room. Extend the route through that wall normal before
          A* starts, so a door cannot be punched from the room interior or
@@ -1594,8 +2268,8 @@ export function buildMultiFloorLayout({
       edge.carvedWidth = width;
       markDoor(layer, W, H, start, width);
       markDoor(layer, W, H, goal, width);
-      addResolvedArch(layer, roomA, start, width);
-      addResolvedArch(layer, roomB, goal, width);
+      addResolvedArch(layer, roomA, start, width, W, H);
+      addResolvedArch(layer, roomB, goal, width, W, H);
     } else {
       const connector = placeConnector({
         edge,
@@ -1614,13 +2288,14 @@ export function buildMultiFloorLayout({
       }
     }
   }
-  for (const layer of layers) buildWalls(layer, W, H, tiles);
+  for (const layer of layers) buildWalls(layer,W,H,tiles,stairTransitionWallExclusions(connectors,layer.floor));
   finalizeOpeningProtection(connectors,layers,tiles);
   transferLegacyDetails({ layers, rooms, W, H, legacy, tiles });
   const validation = validateDungeon3D({ layers, rooms, connectors, entrance, W, H, tiles });
   errors.push(...validation.unreachableRooms.map(id => `room ${id} is unreachable`));
   errors.push(...validation.unreachableConnectors.map(id => `connector ${id} is unreachable`));
-  errors.push(...validation.invalidConnectors.map(id => `connector ${id} violates stair spatial contract`));
+  errors.push(...validation.stairAudits.filter(audit=>!audit.pass).map(audit=>
+    `connector ${audit.connectorId} stair audit failed: ${audit.issues.map(issue=>issue.message).join('; ')}`));
   for (const connectorId of validation.unreachableConnectors) {
     const connector = connectors.find(item => item.id === connectorId);
     const edge = classified.edges.find(item => item.id === connector?.edgeId);
@@ -1629,7 +2304,8 @@ export function buildMultiFloorLayout({
   for (const connectorId of validation.invalidConnectors) {
     const connector = connectors.find(item => item.id === connectorId);
     const edge = classified.edges.find(item => item.id === connector?.edgeId);
-    if (edge) addStairFailure(edge, `connector ${connectorId} violates stair spatial contract`);
+    const audit=validation.stairAudits.find(item=>item.connectorId===connectorId);
+    if (edge) addStairFailure(edge, audit?.issues?.[0]?.message || `connector ${connectorId} violates stair spatial contract`);
   }
   return {
     layers,
@@ -1640,7 +2316,8 @@ export function buildMultiFloorLayout({
     reach: validation.reach,
     valid: errors.length === 0 && validation.valid,
     errors,
-    stairFailures
+    stairFailures,
+    stairAudits:validation.stairAudits
   };
 }
 

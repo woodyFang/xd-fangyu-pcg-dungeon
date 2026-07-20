@@ -125,6 +125,12 @@ sense — the only entropy is the seed you give it.
 9. **Render.** Everything is batched into `InstancedMesh` draw calls and composited through the
    custom post-processing stack.
 
+The complete stair contract—data, placement, geometry, walls, themes, lighting, editing, and
+acceptance—lives in [Section 8 of the multi-floor architecture](docs/multi-floor-architecture.md#8-楼梯系统跨层连接器). The references above are intentionally only a pipeline overview.
+
+For a standalone implementation guide covering both the 2D and 3D rules, see
+[Stair PCG generation rules and code map](docs/stair-pcg-generation-rules.md).
+
 ### Project structure
 
 ```

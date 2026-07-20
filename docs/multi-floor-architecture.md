@@ -221,43 +221,7 @@ const edge = {
 };
 ```
 
-垂直连接器独立保存：
-
-```js
-const connector = {
-  id,
-  edgeId,
-  kind: 'stairs',
-
-  fromFloor,
-  toFloor,
-  lower: { x, y },
-  upper: { x, y },
-
-  direction: 'east',
-  secondDirection: 'south',
-  style: 'straight' | 'l-turn',
-  width: 2,
-  lateralCenterOffset: 0.5,
-  length: 12,
-  firstRun: 6,
-  secondRun: 6,
-  landingDepth: 2,
-  stepCount: 16,
-  firstFlightSteps: 8,
-  secondFlightSteps: 8,
-  stairFootprintCells: [],
-  headroomCells: [],
-  openingCells: [],
-  openingBoundaryEdges: [],
-  openingAccessEdges: [],
-  openingGuardSegments: [],
-  openingWallSegments: [],
-  sharedFootprintCells: [],
-  lowerRoute: [],
-  upperRoute: []
-};
-```
+垂直连接器独立于拓扑边保存；拓扑边只通过 `connectorId` 引用它。完整字段、派生集合和职责边界统一见[第 8 章：楼梯系统](#8-楼梯系统跨层连接器)，此处不再维护第二份楼梯结构定义。
 
 连接器必须是拓扑边的空间实现，而不是仅供渲染使用的装饰物。
 
@@ -432,9 +396,115 @@ corridorOwner[cell] = accessRegionId;
 
 只有访问区域兼容的走廊才能低成本复用，避免绕过锁门或秘密区域。
 
-## 8. 跨层连接器
+## 8. 楼梯系统（跨层连接器）
 
-### 8.1 不允许任意垂直移动
+本章是楼梯的唯一规范入口。数据字段、选址、几何、洞口、防护、墙体、题材、照明、编辑和验收都以本章为准；数据模型、编辑器和测试章节只描述各自职责，不再复制楼梯规则。
+
+### 8.1 数据契约与职责边界
+
+拓扑边通过 `connectorId` 引用楼梯连接器。连接器保存所有跨层结构语义，生成器负责写入，编辑器通过领域规则修改，渲染器只消费，不得根据可见网格重新猜测尺寸或墙体。
+
+```js
+const connector = {
+  id,
+  edgeId,
+  kind: 'stairs',
+
+  fromFloor,
+  toFloor,
+  lower: { x, y },
+  turn: { x, y } | null,
+  upper: { x, y },
+  lowerApproach: { x, y },
+  upperApproach: { x, y },
+  lowerApproachGate: { x, y },
+  upperApproachGate: { x, y },
+  lowerApproachRouteCell: { x, y },
+  upperApproachRouteCell: { x, y },
+  lowerApproachCells: [],
+  upperApproachCells: [],
+
+  direction: 'east',
+  directionVector: { x: 1, y: 0 },
+  secondDirection: 'south',
+  secondDirectionVector: { x: 0, y: 1 },
+  style: 'straight' | 'l-turn',
+  width: 2,
+  lateralCenterOffset: 0.5,
+  length: 12,
+  firstRun: 6,
+  secondRun: 6,
+  rise: 4,
+  landingDepth: 2,
+  stepCount: 16,
+  firstFlightSteps: 8,
+  secondFlightSteps: 8,
+  stepRise: 0.25,
+  treadDepth: 0.5,
+  sideClearance: 0,
+
+  mode: 'stable-auto',
+  candidateIndex: 0,
+  candidateCount: 1,
+  structureAdapted: false,
+  structureAdaptationRoutes: [],
+  openingPolicy: 'headroom-tight-upper-slab-only',
+  requiredHeadroom: 2.5,
+
+  stairFootprintCells: [],
+  headroomCells: [],
+  sweptClearanceCells: [
+    { cell, treadElevation, clearanceTop, intersectsUpperSlab }
+  ],
+  openingCells: [],
+  openingBoundaryEdges: [],
+  openingAccessEdges: [],
+  openingGuardSegments: [],
+  openingWallSegments: [],
+
+  stairwellBoundaryEdges: [],
+  stairwellLowerAccessEdges: [],
+  stairwellUpperAccessEdges: [],
+  stairwellLowerWallSegments: [],
+  stairwellUpperWallSegments: [],
+  stairwellLowerGuardSegments: [],
+  stairwellUpperGuardSegments: [],
+  stairwellInteriorCells: [],
+  sharedFootprintCells: [],
+  sharedFootprintKind: 'rectangular-stairwell-pad',
+  clearVolume: {
+    floorFrom,
+    floorTo,
+    start: { x, y },
+    end: { x, y },
+    width: 2,
+    height: 4
+  },
+
+  wallMode: 'open' | 'wall-backed' | 'enclosed',
+  wallGeneration: 'existing-floor-wall-system',
+  wallHeightPolicy: 'double-floor-lower-wall',
+
+  lightingPolicy: 'required-themed',
+  minimumLightCount: 2,
+  lightingAnchors: [],
+
+  lowerRoute: [],
+  upperRoute: [],
+  lowerRouteCells: [],
+  upperRouteCells: []
+};
+```
+
+| 层级 | 负责内容 | 不得负责 |
+| --- | --- | --- |
+| `StairContract` / 生成器 | 位置、方向、宽度、梯段、平台、净空、洞口、墙体语义、接入路线 | 题材造型和灯具外观 |
+| 编辑器 | 创建、选择、移动、旋转、改宽、切换样式，并触发契约重算 | 直接改写渲染几何 |
+| `StairAssetRecipe` / 渲染器 | 按契约装配题材踏步、扶手、材质和灯具 | 反向改变拓扑、净空或连通关系 |
+
+### 8.2 选址与跨层路由
+
+不允许让 A* 在任意格子直接获得垂直邻居：
 
 错误做法是让 A* 在任意格子拥有以下邻居：
 
@@ -445,8 +515,6 @@ corridorOwner[cell] = accessRegionId;
 这会让算法在任何方便的位置凭空上下楼。
 
 正确做法是先计算有限数量的合法楼梯候选，A* 和 BFS 只能通过这些候选跨层。
-
-### 8.2 楼梯候选约束
 
 候选位置必须满足：
 
@@ -518,6 +586,8 @@ stepCount = floorHeight / stepRise; // 16
 - 自动选址先寻找不影响无关房间的完整矩形楼梯井；密集布局确实无解时，只允许为受影响房间增加绕开洞口的最短适配通道，不能清空整个包络。
 - 矩形包络只用于候选校验、冲突预留和编辑器 footprint，不拥有地面或墙体写入权。只有踏步、平台、楼板洞口和必要接入路线可以修改格子；包络中的原墙体和空角必须保留。
 - 楼梯接入走廊必须在候选阶段避开该楼梯即将生成的洞口，不能先穿过未来梯段再被楼梯覆盖。
+- 上下端接入是硬方向插槽，不是路径评分偏好。`lowerApproachGate` 外侧的最后一步必须严格等于第一跑方向，`upperApproachGate` 向外的第一步必须严格等于末跑方向；路径不得从平台侧面进入。
+- 两个 Gate 按楼梯完整宽度预留为 `lowerApproachCells / upperApproachCells`，并写入平台占用掩码。候选无法从指定方向接入时必须淘汰，禁止通过增加软惩罚保留错误朝向。
 - L 型楼梯的中间平台只在外侧边缘保持连续栏杆；第一跑和第二跑的内侧栏杆必须延伸到平台内角并在同一点精确相接，禁止提前截短、跨过平台内部或堵塞转弯通道。
 - 楼梯上下端不生成独立落脚板或延伸栏杆，首末级踏步直接衔接楼层地面；L 型楼梯只在转角生成一个必要平台，并与普通踏步使用同一材质。
 
@@ -527,27 +597,36 @@ stepCount = floorHeight / stepRise; // 16
 
 ```text
 stairFootprintCells：下层实际踏步占地
-headroomCells：楼梯移动包络在上层楼板平面的净空投影
+headroomCells：完整楼梯移动包络的平面投影
+sweptClearanceCells：逐格记录踏步标高、净空顶部和是否穿过上层楼板
 openingCells：真正切除的上层楼板格
 ```
 
 紧凑洞口模式使用以下判定：
 
 ```text
-zTread(s) + requiredHeadroom >= upperSlabUnderside
+zTread(s) < upperSlabUnderside
+and
+zTread(s) + requiredHeadroom > upperSlabUnderside
 ```
 
-满足条件的踏步格才进入 `openingCells`。默认不得把完整梯段投影或矩形楼梯井包络直接作为洞口；完整挑空井必须是独立结构模式，不能由题材决定。
+每个踏步格都必须先进入 `sweptClearanceCells`，再由 `intersectsUpperSlab` 推导 `openingCells`。这样低位踏步上方也保留可供天花、灯具和碰撞检查使用的三维净空数据。默认不得把完整梯段投影或矩形楼梯井包络直接作为洞口；完整挑空井必须是独立结构模式，不能由题材决定。
+
+楼梯摆放使用固定的 `1m` 地砖卡尺。下端锚点、转角点和上端锚点必须吸附到整数格；自动生成、直接放置、移动、旋转和旧数据回写都必须经过同一吸附函数。偶数格宽楼梯允许中心线相对锚点偏移 `0.5m`，该偏移用于让楼梯两侧边缘贴合地砖边界，不代表楼梯脱离 `1m` 摆放网格。
 
 洞口生成后提取四邻域边界，并按相邻上层格分类：
 
 ```text
 沿末段楼梯前进方向连接上层平台 → openingAccessEdges，不生成扶手
+
+沿末段楼梯反方向连接仍在净空包络内、但因严格 2.5m 判定而保留楼板的梯段格 → openingStairPassageEdges，不生成墙体或横向护栏
 相邻格为墙体                         → openingWallSegments，由墙体负责防护
-相邻格为可行走地面                   → openingGuardSegments，必须生成扶手
+其余边（地面、虚空或越界）           → openingGuardSegments，必须生成扶手
 ```
 
-因此所有可行走的暴露洞口边都必须由墙或扶手覆盖，楼梯入口宽度内不得出现横向栏杆。旋转、移动、改宽和切换直跑/L 型后必须重新计算四类数据。
+因此除上层落脚入口和梯段净空入口外，每条洞口边必须严格由墙或扶手二选一覆盖，不能遗漏，也不能重叠归属；两个入口宽度内都不得出现横向栏杆。旋转、移动、改宽和切换直跑/L 型后必须重新计算全部边界归属。
+
+楼梯间本身必须按一份跨层契约生成，不能由上下两层各自推断。`sharedFootprintCells` 只是防止其他连接器侵入的矩形预留区，不得整块转成可见楼梯间；真正清墙和生成外壳的是贴合直跑/L 型几何的 `stairwellInteriorCells`。外壳边界生成 `stairwellBoundaryEdges`，下层来向和上层去向分别保留入口。真实墙段只保留外侧结构脊墙；其余非入口边进入对应楼层的 `stairwellLowerGuardSegments / stairwellUpperGuardSegments`。最终验证要求每层每条非入口边严格属于真实墙或护栏之一，从而同时避免侧向闯入、漏防护和把楼梯包成完整盒子。
 
 #### 8.5.2 转角平台宽度协同规则（强制）
 
@@ -569,7 +648,36 @@ gridSpan    = ceil(visualWidth)
 - 扶手中心线必须从同一组梯跑边界派生：两条外侧扶手沿平台外轮廓连续包角；两条内侧扶手取各自边线的交点作为共同端点。不得再按平台宽度添加额外缩短量，扶手梁自身厚度造成的中心线偏移必须由边线交点补偿。
 - 该规则仅定义直跑和 L 型楼梯。U 型楼梯必须使用独立拓扑；标准返折平台的横向跨度为 `2 × visualWidth + stairWellGap`，不得套用 L 型方形平台公式。
 
-### 8.6 楼梯题材风格规则（强制）
+### 8.6 楼梯间墙体规则（强制）
+
+楼梯墙体属于跨层建筑契约，不得由渲染器临时使用简易方盒补齐。连接器使用以下语义：
+
+```text
+wallMode: open | wall-backed | enclosed
+wallGeneration: existing-floor-wall-system
+wallHeightPolicy: double-floor-lower-wall
+```
+
+- `open` 不生成楼梯墙，暴露的楼板洞口边交给护栏系统。
+- `wall-backed` 只选择结构脊边外侧已经由房间墙体系统生成的真实墙单元，不新增边界薄墙。
+- `enclosed` 的完整围护墙也必须先进入房间墙体拓扑，再由统一墙体系统生成；渲染阶段不得补简易墙片。
+- 楼梯踏步边界、洞口护栏和楼梯墙是三套互斥语义，不能通过同一个“邻格不是地面”条件决定。
+- L 型楼梯内凹转角、上下层入口和平台衔接边属于 `transition-open`。即使普通 `buildWalls` 发现其邻格是虚空，也必须禁止在这些位置补墙；只有外侧结构脊边可以保留真实墙单元。结构脊边不能只按朝向判定，还必须位于楼梯间预留外轮廓对应法线方向的最外沿；与外墙平行但处在 L 型凹口内部、两侧都连接梯段或平台的横向墙格必须清空，禁止切断转角平台的空间与视线。
+- 梯段每一侧必须按真实墙段切分防护路径：两层高实体墙覆盖的区间禁止生成落地立柱、栏柱和护栏压顶；临空区间必须生成完整护栏；同一侧由墙转为临空时必须在归属变化点拆段，横杆不得伸进墙体。
+- 墙侧允许由题材配方选择贴墙扶手。贴墙扶手必须向楼梯净空侧偏移并只使用墙面支架，不得复用落地立柱；地宫石墙默认由实体墙承担侧向防护，不额外叠加石栏杆，医院、工业、木构和中性配方可生成贴墙扶手。
+
+楼梯连接器只能标记既有墙单元的高度策略。需要显示的楼梯墙必须继续使用普通墙单元原有的平面厚度、程序化几何、主题材质、单元色差和墙帽比例，不得沿楼梯边界创建独立薄墙、固定材质墙片或额外 `BoxGeometry`。
+
+下层被楼梯契约选中的真实墙单元直接生成两层高：
+
+```text
+lowerStairWallHeight = floorHeight + generatedThemeWallHeight
+generatedThemeWallHeight = themeWallHeight ± themeWallVariation
+```
+
+这里的“两层高”表示墙体从一层地面跨过层间标高，并与二层正常生成墙的顶部对齐，不是简单使用 `floorHeight × 2`。该墙只在最终顶部生成一次墙帽；层间标高不得出现水平墙帽、接缝或第二堵重叠墙。上层同坐标墙单元保留结构和碰撞语义，但视觉实例由下层跨层墙统一拥有。没有既有墙单元的位置保持开放，交由洞口护栏处理。
+
+### 8.7 楼梯题材、材质与照明（强制）
 
 题材是场景表现层的最高级规则，不是附加标签。题材先编译为 `ThemeAuthority`，并以高权重统一约束建筑轮廓、墙地结构、门框、楼梯、道具族、材质族和照明语言；色调只能在该题材允许的色板族内变化，不能覆盖或稀释题材。
 
@@ -679,7 +787,7 @@ const stairAssetRecipe = {
 
 程序化建模器必须消费通用契约提供的部件插槽：踏步宽度与进深、平台中心与边界、左右扶手路径、立柱路径采样点。配方可以改变截面、倒角感、踏鼻、包边和表面不规则度，但所有结果必须裁剪在对应插槽的安全包络内。
 
-### 8.6.1 楼梯配色适配规则（强制）
+#### 8.7.1 楼梯配色适配规则（强制）
 
 楼梯不得保存独立于场景题材的固定颜色。所有楼梯颜色必须从当前色板的 `floor / corridor / wall / cap / accent` 派生为五个用途明确的角色色：
 
@@ -698,6 +806,20 @@ marking：防滑条、警示平台包边
 3. `trim` 与 `body`、`rail` 与 `landing` 必须保留可辨识明暗层次；`marking` 与踏步主体必须满足最低视觉对比度。对比不足时只能在当前强调色基础上增亮或压暗，不得借用其他题材颜色。
 4. 配色适配属于模型材质规则，不得通过修改全局灯光、雾或曝光来掩盖模型颜色问题。
 5. 自定义题材即使进入中性造型回退，也必须继续继承当前选中的色板，不得回退成遗迹或医院固定色。
+
+#### 8.7.2 楼梯照明规则（强制）
+
+每个楼梯连接器必须使用 `lightingPolicy: required-themed`，并至少生成两个跨层 `lightingAnchors`；L 型楼梯默认在首段、转角平台和末段各布一个语义锚点。照明是通行结构的必需项，题材决定灯具资产、安装方式、色温和亮度。
+
+| 题材 | `themeAsset` | 资产来源与安装方式 |
+| --- | --- | --- |
+| 地宫 / 遗迹 | `dungeon-torch` | 直接复用地宫走廊的火把、火焰和焰芯，安装在有效楼梯间墙段 |
+| 医院 | `hospital-wall-light` | 直接复用医院走廊的临床壁灯，安装在有效楼梯间墙段 |
+| 工业 | `industrial-cage-pendant` | 使用工业题材配方的笼式吊灯，悬挂在楼梯上方空间 |
+| 木构 | `timber-lantern-sconce` | 使用木构题材配方的灯笼壁灯，安装在有效楼梯间墙段 |
+| 中性回退 | `neutral-sconce` | 使用继承当前色板的中性壁灯，并保留 `fallback` 记录 |
+
+内置题材必须复用自己的场景灯具资产，不能只给通用灯具换色。任何灯具不得侵入踏步、平台、洞口入口及规定净空；题材切换时必须重新解析 `themeAsset`，但不得删除最低照明数量。
 
 第一版题材映射规则：
 
@@ -729,18 +851,51 @@ const recipe = compileStairAssetRecipe(theme, {
 buildStairConnector(contract, generateStairAssets(contract, recipe));
 ```
 
-当前第一版已落地在：
-
-- `src/domain/stair-contract.js`：通用结构尺寸、平台和路径规则。
-- `src/render/stair-assets.js`：题材到程序化楼梯造型配方的编译、确定性变体和踏步素材尺寸计划。
-- `src/render/stair-style.js`：扶手路径与平台几何消费，不重新推导结构。
-- `src/main.js`：按连接器生成踏步表层、踏鼻、平台边框、扶手、立柱和警示条并装配。
-
 内置遗迹采用“地宫石阶”配方：踏步是厚重块石，转角平台保持无中心框线的完整石面，两侧沿真实梯段生成透空短石栏柱、柱座、柱头和连续压顶。栏柱间必须保留清晰空隙，禁止用连续实体墙填满扶手中部。所有地宫造型仅消费通用楼梯契约的路径与宽度，不修改通行净宽、平台边界、楼层高度或交互缩放结果。
 
 内置医院题材生成临床金属/混凝土造型。自定义题材的第一版通过中英文题材关键词解析工业、木质、临床和遗迹造型；仅有参考图且没有可解析文字时使用当前色板的中性程序化配方，不猜测图像语义。
 
 连接器生成失败属于结构错误；题材资源缺失属于表现回退。两者必须分别报告，不能把美术资源缺失误判为楼梯冲突。
+
+### 8.8 编辑与重算规则
+
+编辑器直接操作楼梯连接器，不修改渲染模型。当前支持：创建与删除、整体移动、90° 按钮旋转、拖拽旋转手柄、直跑/L 型切换，以及拖拽 `↔` 手柄改宽。宽度范围为 1～5 米，按 1 米地砖卡尺吸附；单侧改宽时保持对侧边界不动。历史数据中的小数宽度和中心偏移在重算时归一到最近合法整米尺寸及对应地砖边界。
+
+以下任何操作完成后，都必须从领域规则重新解析完整契约，不得只更新画面：
+
+```text
+创建 / 移动 / 旋转 / 改宽 / 切换样式
+→ resolveStairStructure()
+→ 重算 footprint、平台、净空和 openingCells
+→ 重算洞口防护、楼梯间边界和墙体高度策略
+→ 重算题材资产、扶手路径和 lightingAnchors
+→ 重新验证上下层接入路线与三维连通性
+```
+
+编辑预览可以保留 `previewAnchor / previewDirection / previewWidth / previewStyle`，确认后必须写回稳定连接器字段；取消则恢复原契约。2D 编辑器只显示结构 footprint、方向、样式和宽度，3D 场景始终由确认后的连接器重新生成。
+
+### 8.9 实现位置与验收入口
+
+| 职责 | 当前实现 |
+| --- | --- |
+| 结构公式与归一化 | `src/domain/stair-contract.js` |
+| 候选、占地、洞口、墙体语义与连通验证 | `src/generation/multifloor.js` |
+| 编辑操作与几何变换 | `src/ui/stair-editing.js` |
+| 题材造型配方与灯具映射 | `src/render/stair-assets.js` |
+| 扶手路径和平台几何消费 | `src/render/stair-style.js` |
+| 2D/3D 装配和场景集成 | `src/main.js` |
+
+验收以一条完整链路为单位，不能只检查某个模型是否出现：
+
+1. **结构**：上下端可达，楼层差为 1，踏步、平台、净空、洞口和接入路线互不冲突。
+2. **建筑**：洞口入口无遮挡，暴露边有墙或护栏，跨层墙无重复墙帽、薄墙片或层间接缝。
+3. **编辑**：移动、旋转、改宽和样式切换后，2D footprint 与 3D 几何一致，旧方向数据全部清除。
+4. **题材**：踏步、扶手、材质和灯具属于同一题材；资源缺失时显式进入中性回退。
+5. **确定性**：相同 `seed + connectorId + themeId` 产生相同楼梯，表现变化不改变拓扑。
+
+对应自动化测试集中在 `tests/stair-contract.test.js`、`tests/stair-editing.test.js`、`tests/stair-style.test.js`、`tests/multifloor.test.js` 和 `tests/ui-contract.test.js`。全局房间可达性仍由第 9 章的三维 BFS 验证负责。
+
+每次生成和每次楼梯编辑提交后必须对每个连接器运行逐楼梯验收，并输出 `stairAudits`。验收同时覆盖四类结果：上下落脚区及接入路线可通行；楼梯踏步体积和净空未被墙体侵入；所有非入口边严格由墙体或护栏二选一保护；下层楼板保持完整、上层只允许 `openingCells` 指定的净空洞口。未通过验收的楼梯不得向三维 BFS 注册跨层跳转；自动生成应换种子重试，编辑操作应拒绝并恢复上一个有效状态。界面在每次成功生成后显示“楼梯验收 n/n ✓”。
 
 ## 9. 三维连通验证
 
@@ -926,14 +1081,7 @@ new THREE.Vector3(
 
 ### 13.2 楼梯工具
 
-推荐交互：
-
-1. 用户在当前层选择起始房间或落点。
-2. 切换到相邻层。
-3. 选择目标房间或落点。
-4. 系统计算并显示楼梯占地预览。
-5. 合法时创建连接器。
-6. 非法时高亮冲突格子并给出原因。
+本节只定义多层编辑器入口；楼梯字段、几何和重算要求统一见[第 8.8 节](#88-编辑与重算规则)。用户从当前层房间或落点发起，在相邻层选择目标并确认占地预览；非法候选必须高亮冲突格并给出原因。选中已有楼梯后，界面提供移动、旋转、直跑/L 型、宽度和删除操作。
 
 ### 13.3 房间跨层移动
 
@@ -1088,8 +1236,7 @@ src/editor/floor-mutations.js
 1、2、3、4、6 层分别生成 100 个种子
 入口到 Boss 必须可达
 所有必要房间必须可达
-所有楼梯上下端必须可达
-不得出现跨越两层以上的普通楼梯
+所有楼梯通过第 8.9 节的结构验收
 ```
 
 ### 16.3 编辑器测试
@@ -1100,7 +1247,7 @@ src/editor/floor-mutations.js
 删除非空楼层
 房间移动到相邻层
 房间移动后边类型转换
-创建与删除楼梯
+楼梯编辑通过第 8.8、8.9 节的操作与重算验收
 撤销和重做
 保存后重载
 ```
@@ -1112,11 +1259,7 @@ src/editor/floor-mutations.js
 当前层显示正确
 幽灵层不阻挡操作
 全部楼层高度正确
-楼梯与上下楼板对齐
-遗迹、医院和自定义题材的楼梯造型与各自题材一致
-扶手沿梯段坡度生成，并在转角平台连续衔接
-旋转、改宽和切换直跑/L 型后不保留旧方向的扶手或装饰
-题材资源缺失时使用中性回退并给出可见记录
+楼梯建筑、题材、材质与照明通过第 8.9 节验收
 切换楼层后灯光和粒子正确隐藏
 ```
 

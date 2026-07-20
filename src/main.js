@@ -14,6 +14,11 @@
 import * as THREE from 'three';
 import {
   FLOOR_HEIGHT,
+  REFERENCE_FLOOR_HEIGHT,
+  CORRIDOR_WIDTH_MIN,
+  CORRIDOR_WIDTH_MAX,
+  CORRIDOR_WIDTH_STEP,
+  normalizeCorridorWidth,
   assignRoomsToFloors,
   buildMultiFloorLayout,
   compactRoomsByFloor,
@@ -25,13 +30,14 @@ import { simplifyRoutePoints } from './ui/route-path.js';
 import { adaptRoomToRotatedStair, changeStairStyle, chooseStairTargetFloor, directStairPlacement, rotateStairPlacement90, stairPairError, stairRemovalDisconnectsRooms, stairRotationFromPointer, stairVisualForRotation, stairWidthResizeFromPointer, translateStairPlacement } from './ui/stair-editing.js';
 import { preserveUneditedFloors } from './generation/floor-preservation.js';
 import { adaptRouteBends } from './generation/adaptive-route.js';
-import { corridorCenterOffset, dungeonEditorOffset, dungeonLayerShift, editorToGridPoint } from './generation/coordinate-space.js';
+import { corridorCenterOffset, corridorCenterShiftAt, dungeonEditorOffset, dungeonLayerShift, editorToGridPoint } from './generation/coordinate-space.js';
 import { createDungeonPreview } from './gameplay/camera-preview.js';
 import {
   compileStairAssetRecipe,
   railPostFractions,
   stairLandingCenterY,
-  stairRailSegments,
+  stairRailProtectionSegments,
+  stairWallFinishSegments,
   stairRunCenter,
   stairTreadAssetPlan,
   stairTurnPlatformMetrics
@@ -796,7 +802,7 @@ function tryGenerate(seed, params){
     if(grid[c]!==FLOOR) grid[c]=FLOOR;
     corridor[c]=1;
   };
-  const offs = w => w===1?[0] : (w===2?[0,1] : [-1,0,1]);
+  const offs = w => w===1?[0] : (w===2?[0,1] : (w===3?[-1,0,1]:[-1,0,1,2]));
   const hLine=(x0,x1,y,w)=>{ const o=offs(w); for(let x=Math.min(x0,x1); x<=Math.max(x0,x1); x++) for(const k of o) stamp(x,y+k); };
   const vLine=(y0,y1,x,w)=>{ const o=offs(w); for(let y=Math.min(y0,y1); y<=Math.max(y0,y1); y++) for(const k of o) stamp(x+k,y); };
   const stampWide=(x,y,w)=>{
@@ -804,7 +810,7 @@ function tryGenerate(seed, params){
     for(const ox of o) for(const oy of o) stamp(x+ox,y+oy);
   };
   const markDoorCore=(x,y,nx,ny,tx,ty,w)=>{
-    const span=Math.max(1, Math.min(3, Math.round(w)));
+    const span=normalizeCorridorWidth(w);
     const o=offs(span);
     for(const k of o){
       const bx=x+tx*k, by=y+ty*k;
@@ -878,7 +884,7 @@ function tryGenerate(seed, params){
        Do not carve a fake planar corridor into the legacy decoration surface. */
     if((A.floor||0)!==(B.floor||0)) continue;
     let w = e.isCritical ? 3 : 2;
-    if(!e.isCritical && (rooms[e.a].type===TYPE.TREASURE || rooms[e.b].type===TYPE.TREASURE) && rng.chance(0.4)) w = 1;
+    if(!e.isCritical && (rooms[e.a].type===TYPE.TREASURE || rooms[e.b].type===TYPE.TREASURE) && rng.chance(0.4)) w = 2;
     if(e.useEditorRoute){
       const route=edgeRoutePoints(e), rw=e.visualWidth || w;
       carveRoute(route, rw);
@@ -934,7 +940,7 @@ function tryGenerate(seed, params){
   for(const e of edges){
     const A=rooms[e.a], B=rooms[e.b];
     if(!A || !B || (A.floor||0)!==(B.floor||0)) continue;
-    const w=Math.max(1, Math.min(3, Math.round(e.carvedWidth || (e.isCritical ? 3 : 2))));
+    const w=normalizeCorridorWidth(e.carvedWidth || (e.isCritical ? 3 : 2));
     markEdgeDoor({x:e.ax,y:e.ay,side:e.aside}, w);
     markEdgeDoor({x:e.bx,y:e.by,side:e.bside}, w);
   }
@@ -1051,26 +1057,28 @@ function tryGenerate(seed, params){
   { const seen = new Set();
     const addArch = (roomId, p, width)=>{
       if(!p || !p.side || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
-      const len=Math.max(1, Math.min(3, Math.round(width || 2)));
+      const corridorWidth=normalizeCorridorWidth(width || 2);
+      const len=corridorWidth===4 ? 2 : corridorWidth;
       const px=(p.side==='n' || p.side==='s') ? 1 : 0;
       const py=px ? 0 : 1;
-      /* markDoorCore uses [0,1] for a two-cell socket; center the frame over
-         that run so the visual does not drift by half a tile. */
-      const x=Math.round(p.x) + px*(len-1)/2;
-      const y=Math.round(p.y) + py*(len-1)/2;
+      /* Match the socket span: width two is [0,1], while width three is
+         [-1,0,1]. The same center rule is used by the carved corridor. */
+      const centerOffset=corridorCenterOffset(len);
+      const x=Math.round(p.x) + px*centerOffset;
+      const y=Math.round(p.y) + py*centerOffset;
       const floor=rooms[roomId]?.floor || 0;
-      const key=[roomId,p.side,Math.round(p.x),Math.round(p.y),len].join(':');
+      const key=[roomId,p.side,Math.round(p.x),Math.round(p.y),corridorWidth].join(':');
       if(seen.has(key)) return;
       seen.add(key);
       const nx=p.side==='e'?1:(p.side==='w'?-1:0);
       const ny=p.side==='s'?1:(p.side==='n'?-1:0);
-      arches.push({x,y,px,py,len,roomId,floor,side:p.side,
+      arches.push({x,y,px,py,len,corridorWidth,doorUnitWidth:len,doorUnitHeight:2,doorUnitIndex:0,doorUnitCount:1,roomId,floor,side:p.side,
         anchorX:Math.round(p.x),anchorY:Math.round(p.y),nx,ny});
     };
     for(const e of edges){
       const A=rooms[e.a], B=rooms[e.b];
       if(!A || !B || (A.floor||0)!==(B.floor||0)) continue;
-      const width=e.carvedWidth || (e.isCritical ? 3 : 2);
+    const width=normalizeCorridorWidth(e.carvedWidth || (e.isCritical ? 3 : 2));
       addArch(e.a,{x:e.ax,y:e.ay,side:e.aside},width);
       addArch(e.b,{x:e.bx,y:e.by,side:e.bside},width);
     }
@@ -1536,7 +1544,7 @@ function tryGenerate(seed, params){
     loopChancesByFloor:targetLoopChances, decorDensitiesByFloor:targetDecorDensities,
     props:baseLayer.props, spawns:baseLayer.spawns, torches:baseLayer.torches,
     pools:baseLayer.pools, lakeCells:baseLayer.lakeCells, lakeMask:baseLayer.lakeMask, arches:baseLayer.arches,
-    generationErrors:multi.errors, stairFailures:multi.stairFailures || [],
+    generationErrors:multi.errors, stairFailures:multi.stairFailures || [], stairAudits:multi.stairAudits || [],
     stats:{ rooms:N, edges:multi.edges.length, loops, critLen, floorTiles:totalFloorTiles, reach:multi.reach, floors:floorCount, genMs:0, attempts:1 }
   };
 }
@@ -1565,6 +1573,8 @@ const CAMERA_FOV = 45;
 const CAMERA_DEFAULT_YAW = Math.PI/4;
 const CAMERA_DEFAULT_PITCH = 0.64;
 const CAMERA_PITCH_LIMIT = 1.5;
+const CAMERA_MIN_DISTANCE = 0.25;
+const CAMERA_MAX_DISTANCE = 360;
 let aspect = innerWidth/innerHeight;
 const cam = new THREE.PerspectiveCamera(CAMERA_FOV, aspect, 0.1, 1000);
 let yaw = CAMERA_DEFAULT_YAW, pitch = CAMERA_DEFAULT_PITCH, camDist = 170;
@@ -1880,6 +1890,8 @@ const matStone = new THREE.MeshStandardMaterial({map:TEX.stone, roughness:0.92, 
 const matHospitalFloor = new THREE.MeshStandardMaterial({map:TEX.hospitalFloor, roughness:0.58, metalness:0.02});
 const matHospitalWall = new THREE.MeshStandardMaterial({roughness:0.78, metalness:0.01});
 const matHospitalTrim = new THREE.MeshStandardMaterial({roughness:0.28, metalness:0.35});
+const matCeiling = new THREE.MeshStandardMaterial({map:TEX.stone,roughness:0.94,metalness:0.01,side:THREE.BackSide});
+const matHospitalCeiling = new THREE.MeshStandardMaterial({roughness:0.86,metalness:0,side:THREE.BackSide});
 const matTrim  = new THREE.MeshStandardMaterial({roughness:0.38, metalness:0.75});
 const matGlow  = new THREE.MeshBasicMaterial({color:0xffffff});
 matGlow.toneMapped = false;
@@ -2110,6 +2122,9 @@ const tube = (a,b,c)=> new THREE.TubeGeometry(new THREE.QuadraticBezierCurve3(a,
 const GEO = {};
 GEO.floor   = chamferBox(0.96,0.22,0.96,0.05).translate(0,-0.22,0);
 GEO.hospitalFloor = new THREE.BoxGeometry(0.98,0.1,0.98).translate(0,-0.05,0);
+// Downward-facing ceiling tiles remain visible from inside a room without
+// hiding the layout from the normal elevated editor camera.
+GEO.ceiling = new THREE.PlaneGeometry(0.98,0.98).rotateX(-Math.PI/2);
 GEO.wall    = chamferBox(1,1,1,0.07);
 GEO.hospitalWall = new THREE.BoxGeometry(1,1,1).translate(0,0.5,0);
 GEO.wallCap = chamferBox(1.09,0.13,1.09,0.035);
@@ -2383,8 +2398,8 @@ GEO.floorArrow = mergeGeos([
 ]);
 
 /* -------- instance set builder with reveal + tilt support -------- */
-function instSet(){
-  return { px:[],py:[],pz:[], sx:[],sy:[],sz:[], rx:[],ry:[],rz:[], col:[], delay:[], n:0,
+function instSet(verticalScale=1){
+  return { px:[],py:[],pz:[], sx:[],sy:[],sz:[], rx:[],ry:[],rz:[], col:[], delay:[], n:0, verticalScale,
     add(x,y,z, sx,sy,sz, ry, color, delay){
       this.px.push(x); this.py.push(y); this.pz.push(z);
       this.sx.push(sx); this.sy.push(sy); this.sz.push(sz);
@@ -2430,6 +2445,7 @@ function instanceRevealProgress(u, s, i, t){
 }
 function writeInstances(mesh, t){
   const u = mesh.userData, s = u.set;
+  const verticalScale=Number.isFinite(s.verticalScale) ? s.verticalScale : 1;
   let allDone = true;
   for(let i=0;i<s.n;i++){
     const k = instanceRevealProgress(u,s,i,t);
@@ -2437,16 +2453,16 @@ function writeInstances(mesh, t){
     const g = Math.max(0.0001,easeOutCubic(k));
     _q.setFromEuler(_E.set(s.rx[i], s.ry[i], s.rz[i]));
     if(u.mode==='rise'){
-      _p.set(s.px[i], s.py[i], s.pz[i]);
-      _s.set(s.sx[i], s.sy[i]*g, s.sz[i]);
+      _p.set(s.px[i], s.py[i]*verticalScale, s.pz[i]);
+      _s.set(s.sx[i], s.sy[i]*g*verticalScale, s.sz[i]);
     } else if(u.mode==='tile'){
       const m=0.82+0.18*g;
-      _p.set(s.px[i], s.py[i]-0.08*(1-g), s.pz[i]);
-      _s.set(s.sx[i]*m, s.sy[i]*g, s.sz[i]*m);
+      _p.set(s.px[i], s.py[i]*verticalScale-0.08*verticalScale*(1-g), s.pz[i]);
+      _s.set(s.sx[i]*m, s.sy[i]*g*verticalScale, s.sz[i]*m);
     } else {
       const m=0.78+0.22*g;
-      _p.set(s.px[i], s.py[i]+0.34*(1-g), s.pz[i]);
-      _s.set(s.sx[i]*m, s.sy[i]*m, s.sz[i]*m);
+      _p.set(s.px[i], s.py[i]*verticalScale+0.34*verticalScale*(1-g), s.pz[i]);
+      _s.set(s.sx[i]*m, s.sy[i]*m*verticalScale, s.sz[i]*m);
     }
     _m.compose(_p,_q,_s); mesh.setMatrixAt(i,_m);
   }
@@ -2470,8 +2486,9 @@ let fx = { liquids:[], shafts:[], spinners:[], parts:null };
 let levelGeos = [];
 let levelMats = [];
 let floorViewMode = 'neighbors';
-const EXPLODED_FLOOR_SPACING = 3.2;
+const EXPLODED_FLOOR_SPACING = FLOOR_HEIGHT + 0.2;
 const lerpC = (a,b,t)=> _c.set(a).lerp(new THREE.Color(b), t).getHex();
+
 
 function disposeLevel(){
   const root=levelRoot || group;
@@ -2566,12 +2583,32 @@ function addStairRailPost(root,base,kit,material,geos){
 }
 function addThemedStairRails(root,connector,totalRise,lowerY,kit,material,geos,wx,wz){
   const offset=(connector.width||2)/2+kit.railThickness*.55;
-  const segments=stairRailSegments(connector,totalRise,lowerY,offset);
+  const segments=stairRailProtectionSegments(connector,totalRise,lowerY,offset,{
+    wallInset:kit.rail.wallHandrailInset || .18
+  });
   const postKeys=new Set();
   for(const segment of segments){
+    if(segment.protection==='wall-blocked') continue;
+    if(segment.protection==='wall-handrail'&&!kit.rail.wallHandrail) continue;
     const start=stairPointToWorld({...segment.start,y:segment.start.y+kit.railHeight},wx,wz);
     const end=stairPointToWorld({...segment.end,y:segment.end.y+kit.railHeight},wx,wz);
     addStairRailBeam(root,start,end,kit,material,geos);
+    if(segment.protection==='wall-handrail'){
+      const normal=segment.wallNormal || {x:0,y:0};
+      for(const t of railPostFractions(segment,kit.rail.wallBracketSpacing || kit.postSpacing)){
+        if(t===0 || t===1) continue;
+        const railPoint={
+          x:segment.start.x+(segment.end.x-segment.start.x)*t,
+          y:segment.start.y+(segment.end.y-segment.start.y)*t+kit.railHeight,
+          z:segment.start.z+(segment.end.z-segment.start.z)*t
+        };
+        const wallPoint={...railPoint,x:railPoint.x+normal.x*(segment.wallInset-.035),
+          z:railPoint.z+normal.y*(segment.wallInset-.035)};
+        addStairRailBeam(root,stairPointToWorld(railPoint,wx,wz),stairPointToWorld(wallPoint,wx,wz),
+          {...kit,railThickness:Math.max(.025,kit.railThickness*.55)},material,geos);
+      }
+      continue;
+    }
     for(const t of railPostFractions(segment,kit.postSpacing)){
       const point={
         x:segment.start.x+(segment.end.x-segment.start.x)*t,
@@ -2583,6 +2620,47 @@ function addThemedStairRails(root,connector,totalRise,lowerY,kit,material,geos,w
       postKeys.add(key);
       addStairRailPost(root,stairPointToWorld(point,wx,wz),kit,material,geos);
     }
+  }
+}
+
+function addThemedStairWallFinish(root,connector,totalRise,lowerY,kit,material,wx,wz){
+  const offset=(connector.width||2)/2+kit.railThickness*.55;
+  const finishHeight=kit.structure==='stone'?.28:.2;
+  const segments=stairWallFinishSegments(connector,totalRise,lowerY,offset,{
+    wallInset:.025,finishHeight,finishThickness:kit.structure==='stone'?.075:.05
+  });
+  for(const segment of segments){
+    const normal=segment.wallNormal || {x:0,y:0};
+    const half=segment.finishThickness/2;
+    const points=[];
+    const addPoint=(point,side,top)=>points.push(
+      wx(point.x+normal.x*half*side),
+      point.y+(top?segment.finishHeight:0),
+      wz(point.z+normal.y*half*side)
+    );
+    addPoint(segment.start,-1,false); // 0 start inner bottom
+    addPoint(segment.end,-1,false);   // 1 end inner bottom
+    addPoint(segment.end,-1,true);    // 2 end inner top
+    addPoint(segment.start,-1,true);  // 3 start inner top
+    addPoint(segment.start,1,false);  // 4 start outer bottom
+    addPoint(segment.end,1,false);    // 5 end outer bottom
+    addPoint(segment.end,1,true);     // 6 end outer top
+    addPoint(segment.start,1,true);   // 7 start outer top
+    const indices=[
+      0,1,2,0,2,3, 5,4,7,5,7,6,
+      4,0,3,4,3,7, 1,5,6,1,6,2,
+      3,2,6,3,6,7, 4,5,1,4,1,0
+    ];
+    const geometry=new THREE.BufferGeometry();
+    geometry.setAttribute('position',new THREE.Float32BufferAttribute(points,3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    levelGeos.push(geometry);
+    const mesh=new THREE.Mesh(geometry,material);
+    mesh.castShadow=true;
+    mesh.receiveShadow=true;
+    mesh.userData={stairWallFinish:true,connectorId:connector.id,kind:segment.kind};
+    root.add(mesh);
   }
 }
 
@@ -2609,6 +2687,136 @@ function addThemedOpeningRails(root,connector,upperY,kit,material,geos,wx,wz){
       postKeys.add(key);
       addStairRailPost(root,stairPointToWorld(point,wx,wz),kit,material,geos);
     }
+  }
+}
+
+function stairDoubleHeightWallCells(dungeon,floor){
+  const layer=dungeon.layers?.[floor];
+  if(!layer) return new Set();
+  const cells=new Set();
+  for(const connector of dungeon.connectors || []){
+    if(connector.fromFloor!==floor) continue;
+    for(const cell of connector.doubleHeightWallCells || []) if(layer.grid[cell]===WALL) cells.add(cell);
+  }
+  return cells;
+}
+
+function stairCoveredUpperWallCells(dungeon,floor){
+  const layer=dungeon.layers?.[floor];
+  if(!layer) return new Set();
+  const cells=new Set();
+  for(const connector of dungeon.connectors || []){
+    if(connector.toFloor!==floor) continue;
+    for(const cell of connector.doubleHeightWallCells || []) if(layer.grid[cell]===WALL) cells.add(cell);
+  }
+  return cells;
+}
+
+function addThemedStairLighting(root,connector,totalRise,lowerY,kit,materials,geos,wx,wz){
+  const spec=kit.lighting;
+  const anchors=connector.lightingAnchors || [];
+  if(!spec?.required || anchors.length<(connector.minimumLightCount || 2)) return;
+  const wallSegments=[...(connector.stairwellLowerWallSegments || []),...(connector.stairwellUpperWallSegments || [])];
+  const nearestWall=anchor=>wallSegments.reduce((best,segment)=>{
+    const x=(segment.x1+segment.x2)/2,z=(segment.y1+segment.y2)/2;
+    const distance=(x-anchor.x)**2+(z-anchor.y)**2;
+    return !best||distance<best.distance?{segment,x,z,distance}:best;
+  },null);
+  const fixturePoints=[];
+  for(const anchor of anchors){
+    const treadY=lowerY+totalRise*anchor.elevationFraction;
+    if(spec.mount==='wall'){
+      const wall=nearestWall(anchor);
+      if(!wall) continue;
+      const normal=wall.segment.normal || {x:0,y:1};
+      const x=wall.x-normal.x*.16,z=wall.z-normal.y*.16;
+      const y=treadY+(spec.mountAboveTread || 1.05);
+      const rotation=Math.atan2(normal.x,normal.y);
+      if(spec.themeAsset==='dungeon-torch'){
+        // Reuse the dungeon topic's actual corridor torch, flame and core
+        // geometry instead of approximating it with a generic stair sconce.
+        const arm=new THREE.Mesh(GEO.torch,materials.housing);
+        arm.position.set(wx(x),y-.48,wz(z));
+        arm.rotation.y=rotation;
+        arm.castShadow=true;
+        arm.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+        root.add(arm);
+        const flamePoint=new THREE.Vector3(wx(x-normal.x*.16),y,wz(z-normal.y*.16));
+        const flame=new THREE.Mesh(GEO.flame,materials.flame);
+        flame.position.copy(flamePoint);
+        flame.scale.setScalar(1.2);
+        flame.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+        root.add(flame);
+        const core=new THREE.Mesh(GEO.flameCore,materials.flameCore);
+        core.position.copy(flamePoint).add(new THREE.Vector3(0,.03,0));
+        core.scale.setScalar(1.2);
+        core.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+        root.add(core);
+        fixturePoints.push(flamePoint);
+        continue;
+      }
+      if(spec.themeAsset==='hospital-wall-light'){
+        // Hospital stairs use the same clinical wall-light asset as hospital
+        // corridors. Topic selection therefore changes the actual fixture,
+        // not only its colour or point-light settings.
+        const wallLight=new THREE.Mesh(GEO.wallLight,materials.glow);
+        wallLight.position.set(wx(x-normal.x*.08),y,wz(z-normal.y*.08));
+        wallLight.rotation.y=rotation;
+        wallLight.scale.setScalar(.9);
+        wallLight.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+        root.add(wallLight);
+        fixturePoints.push(wallLight.position.clone());
+        continue;
+      }
+      const housing=new THREE.Mesh(geos.housing,materials.housing);
+      housing.position.set(wx(x),y,wz(z));
+      housing.scale.set(.2,.26,.14);
+      housing.rotation.y=rotation;
+      housing.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+      housing.castShadow=true; root.add(housing);
+      const bulb=new THREE.Mesh(geos.bulb,materials.glow);
+      bulb.position.set(wx(x-normal.x*.11),y+.01,wz(z-normal.y*.11));
+      bulb.scale.setScalar(spec.fixture==='torch-sconce'?.11:.095);
+      bulb.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+      root.add(bulb);
+      if(spec.fixture==='torch-sconce'){
+        const flame=new THREE.Mesh(geos.flame,materials.glow);
+        flame.position.set(bulb.position.x,y+.17,bulb.position.z);
+        flame.scale.set(.08,.18,.08);
+        root.add(flame);
+      }
+      fixturePoints.push(bulb.position.clone());
+    }else{
+      const upperY=lowerY+totalRise;
+      const pendantDrop=Math.min(spec.pendantHeight || 1.35, Math.max(.45,totalRise*.24));
+      const lampY=upperY-pendantDrop;
+      const cableTop=upperY-.18;
+      const cable=new THREE.Mesh(geos.cable,materials.housing);
+      cable.position.set(wx(anchor.x),(lampY+cableTop)/2,wz(anchor.y));
+      cable.scale.set(.022,cableTop-lampY,.022);
+      cable.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+      root.add(cable);
+      const shade=new THREE.Mesh(geos.shade,materials.housing);
+      shade.position.set(wx(anchor.x),lampY+.1,wz(anchor.y));
+      shade.scale.set(spec.fixture==='cage-pendant'?.24:.28,.22,spec.fixture==='cage-pendant'?.24:.28);
+      shade.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+      shade.castShadow=true; root.add(shade);
+      const bulb=new THREE.Mesh(geos.bulb,materials.glow);
+      bulb.position.set(wx(anchor.x),lampY-.07,wz(anchor.y));
+      bulb.scale.setScalar(.105);
+      bulb.userData={themeAsset:spec.themeAsset,assetSource:spec.assetSource};
+      root.add(bulb);
+      fixturePoints.push(bulb.position.clone());
+    }
+  }
+  const lightCount=Math.min(spec.maxAnalyticLights || 2,fixturePoints.length);
+  for(let i=0;i<lightCount;i++){
+    const index=lightCount===1?0:Math.round(i*(fixturePoints.length-1)/(lightCount-1));
+    const point=fixturePoints[index];
+    const light=new THREE.PointLight(spec.color,spec.intensity,spec.distance,2);
+    light.position.copy(point);
+    light.userData={base:spec.intensity,ph:(connector.id+1)*1.31+i*2.17,ramp:1,steady:!spec.flicker};
+    root.add(light); lights.push(light);
   }
 }
 
@@ -2648,9 +2856,19 @@ function addProceduralStairLandingFrame(root,platform,surfaceY,kit,material,geos
 function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShells=true){
   if(!Array.isArray(dungeon.layers) || dungeon.layers.length<=1) return;
   const floorHeight=dungeon.floorHeight || FLOOR_HEIGHT;
+  const contextVerticalScale=floorHeight / REFERENCE_FLOOR_HEIGHT;
   const floorGeo=new THREE.BoxGeometry(.96,.12,.96);
   const wallGeo=new THREE.BoxGeometry(.96,1,.96);
-  levelGeos.push(floorGeo,wallGeo);
+  const ceilingGeo=new THREE.PlaneGeometry(.98,.98).rotateX(-Math.PI/2);
+  const stairLightGeos={
+    housing:new THREE.BoxGeometry(1,1,1),
+    bulb:new THREE.SphereGeometry(1,10,8),
+    flame:new THREE.ConeGeometry(1,1,8),
+    cable:new THREE.CylinderGeometry(1,1,1,8),
+    shade:new THREE.ConeGeometry(1,.75,12,1,true)
+  };
+  levelGeos.push(floorGeo,wallGeo,ceilingGeo,
+    stairLightGeos.housing,stairLightGeos.bulb,stairLightGeos.flame,stairLightGeos.cable,stairLightGeos.shade);
   const solidContext=floorViewMode==='all' || floorViewMode==='explode';
   const ghostFloorColor=0x3f91d8;
   const ghostWallColor=0x286aa8;
@@ -2667,12 +2885,23 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     roughness:.92,metalness:0,
     transparent:!solidContext,opacity:solidContext?1:.14,depthWrite:solidContext
   });
+  const ghostCeilingMat=ghostWallMat.clone();
+  ghostCeilingMat.side=THREE.BackSide;
   const stairKitBase=compileStairAssetRecipe(TH,{seed:dungeon.seed});
   const stairMat=new THREE.MeshStandardMaterial({color:stairKitBase.treadColor,...stairKitBase.material.body});
   const stairCapMat=new THREE.MeshStandardMaterial({color:stairKitBase.treadCapColor,...stairKitBase.material.trim});
   const stairLandingMat=new THREE.MeshStandardMaterial({color:stairKitBase.landingColor,...stairKitBase.material.landing});
   const stairRailMat=new THREE.MeshStandardMaterial({color:stairKitBase.railColor,...stairKitBase.material.rail});
   const stairAccentMat=new THREE.MeshStandardMaterial({color:stairKitBase.markingColor,emissive:stairKitBase.markingColor,emissiveIntensity:.08,...stairKitBase.material.marking});
+  const stairLightHousingMat=new THREE.MeshStandardMaterial({
+    color:stairKitBase.lighting.fixtureColor,roughness:.42,metalness:.58
+  });
+  const stairLightGlowMat=new THREE.MeshBasicMaterial({color:stairKitBase.lighting.color});
+  stairLightGlowMat.toneMapped=false;
+  const stairLightFlameMat=new THREE.MeshBasicMaterial({color:TH.flame});
+  stairLightFlameMat.toneMapped=false;
+  const stairLightFlameCoreMat=new THREE.MeshBasicMaterial({color:TH.flameCore});
+  stairLightFlameCoreMat.toneMapped=false;
   const stairRailGeos={
     squareBeam:new THREE.BoxGeometry(1,1,1),
     roundBeam:new THREE.CylinderGeometry(1,1,1,10),
@@ -2684,34 +2913,46 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     color:TH.accent,emissive:TH.accent,emissiveIntensity:.24,
     roughness:.42,metalness:.04,transparent:true,opacity:.34,depthWrite:false
   });
-  levelMats.push(ghostMat,ghostWallMat,stairMat,stairCapMat,stairLandingMat,stairRailMat,stairAccentMat,connectorLinkMat);
+  levelMats.push(ghostMat,ghostWallMat,ghostCeilingMat,stairMat,stairCapMat,stairLandingMat,stairRailMat,stairAccentMat,
+    stairLightHousingMat,stairLightGlowMat,stairLightFlameMat,stairLightFlameCoreMat,connectorLinkMat);
   const exploded=floorViewMode==='explode';
   const spacing=exploded?EXPLODED_FLOOR_SPACING:1;
   const visibleFloor=floor=>floorViewMode==='all' || exploded || (floorViewMode==='neighbors' && Math.abs(floor-activeFloor)<=1);
   if(showShells) for(const layer of dungeon.layers){
     if(layer.floor===activeFloor || !visibleFloor(layer.floor)) continue;
-    let floorCount=0, wallCount=0;
+    const doubleHeightWalls=stairDoubleHeightWallCells(dungeon,layer.floor);
+    const coveredUpperWalls=stairCoveredUpperWallCells(dungeon,layer.floor);
+    const hasCeiling=layer.floor<dungeon.layers.length-1;
+    const openingAbove=hasCeiling ? dungeon.layers[layer.floor+1]?.slabOpening : null;
+    let floorCount=0, wallCount=0, ceilingCount=0;
     for(let c=0;c<layer.grid.length;c++){
-      if(layer.grid[c]===FLOOR && !layer.stairMask[c] && !layer.slabOpening?.[c]) floorCount++;
-      else if(layer.grid[c]===WALL) wallCount++;
+      if(layer.grid[c]===FLOOR && !layer.slabOpening?.[c]) floorCount++;
+      else if(layer.grid[c]===WALL && !coveredUpperWalls.has(c)) wallCount++;
+      if(hasCeiling && (layer.grid[c]===FLOOR || layer.grid[c]===POOL) && !openingAbove?.[c]) ceilingCount++;
     }
     const fg=new THREE.Group();
     fg.position.y=(layer.floor-activeFloor)*floorHeight*spacing;
     root.add(fg);
     const fm=new THREE.InstancedMesh(floorGeo,ghostMat,Math.max(1,floorCount)); fm.count=floorCount;
     const wm=new THREE.InstancedMesh(wallGeo,ghostWallMat,Math.max(1,wallCount)); wm.count=wallCount;
-    let fi=0,wi=0;
+    const cm=new THREE.InstancedMesh(ceilingGeo,ghostCeilingMat,Math.max(1,ceilingCount)); cm.count=ceilingCount;
+    let fi=0,wi=0,ci=0;
     for(let c=0;c<layer.grid.length;c++){
       const x=c%dungeon.W, y=Math.floor(c/dungeon.W);
-      if(layer.grid[c]===FLOOR && !layer.stairMask[c] && !layer.slabOpening?.[c]){
+      if(layer.grid[c]===FLOOR && !layer.slabOpening?.[c]){
         _p.set(wx(x),-.08,wz(y)); _q.identity(); _s.set(1,1,1); _m.compose(_p,_q,_s); fm.setMatrixAt(fi++,_m);
-      } else if(layer.grid[c]===WALL){
-        _p.set(wx(x),.6,wz(y)); _q.identity(); _s.set(1,1.2,1); _m.compose(_p,_q,_s); wm.setMatrixAt(wi++,_m);
+      } else if(layer.grid[c]===WALL && !coveredUpperWalls.has(c)){
+        const shellWallHeight=Math.min(floorHeight-.2,1.2*contextVerticalScale);
+        const wallHeight=!exploded&&doubleHeightWalls.has(c) ? floorHeight+shellWallHeight : shellWallHeight;
+        _p.set(wx(x),wallHeight/2,wz(y)); _q.identity(); _s.set(1,wallHeight,1); _m.compose(_p,_q,_s); wm.setMatrixAt(wi++,_m);
+      }
+      if(hasCeiling && (layer.grid[c]===FLOOR || layer.grid[c]===POOL) && !openingAbove?.[c]){
+        _p.set(wx(x),floorHeight-.04,wz(y)); _q.identity(); _s.set(1,1,1); _m.compose(_p,_q,_s); cm.setMatrixAt(ci++,_m);
       }
     }
-    fm.receiveShadow=true; wm.receiveShadow=true;
-    fm.castShadow=solidContext; wm.castShadow=solidContext;
-    fg.add(fm,wm);
+    fm.receiveShadow=true; wm.receiveShadow=true; cm.receiveShadow=true;
+    fm.castShadow=solidContext; wm.castShadow=solidContext; cm.castShadow=false;
+    fg.add(fm,wm,cm);
   }
   for(const connector of dungeon.connectors || []){
     const touchesActive=connector.fromFloor===activeFloor || connector.toFloor===activeFloor;
@@ -2746,6 +2987,9 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     }
     const openingFloorVisible=connector.toFloor===activeFloor
       || (floorViewMode!=='current' && visibleFloor(connector.toFloor));
+    addThemedStairLighting(root,connector,totalRise,lowerY,stairKit,
+      {housing:stairLightHousingMat,glow:stairLightGlowMat,
+        flame:stairLightFlameMat,flameCore:stairLightFlameCoreMat},stairLightGeos,wx,wz);
     if(openingFloorVisible){
       addThemedOpeningRails(root,connector,lowerY+totalRise,stairKit,stairRailMat,stairRailGeos,wx,wz);
     }
@@ -2801,6 +3045,7 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
       turnLanding.castShadow=true; turnLanding.receiveShadow=true; root.add(turnLanding);
       addProceduralStairLandingFrame(root,turnPlatform,landingSurfaceY,stairKit,
         stairKit.landing.accentBorder?stairAccentMat:stairCapMat,stairRailGeos,wx,wz);
+      addThemedStairWallFinish(root,connector,totalRise,lowerY,stairKit,stairCapMat,wx,wz);
       addThemedStairRails(root,connector,totalRise,lowerY,stairKit,stairRailMat,stairRailGeos,wx,wz);
       continue;
     }
@@ -2837,6 +3082,7 @@ function buildSimpleFloorContext(root, dungeon, activeFloor, TH, wx, wz, showShe
     sm.castShadow=true; sm.receiveShadow=true; root.add(sm);
     caps.castShadow=true; caps.receiveShadow=true; root.add(caps);
     if(markings){ markings.castShadow=false; markings.receiveShadow=true; root.add(markings); }
+    addThemedStairWallFinish(root,connector,totalRise,lowerY,stairKit,stairCapMat,wx,wz);
     addThemedStairRails(root,connector,totalRise,lowerY,stairKit,stairRailMat,stairRailGeos,wx,wz);
   }
 }
@@ -2849,6 +3095,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     ...sourceDungeon,
     grid:activeLayer.grid, roomId:activeLayer.roomId, corridor:activeLayer.corridor,
     doorway:activeLayer.doorway, stairMask:activeLayer.stairMask, stairwellMask:activeLayer.stairwellMask,
+    stairWallMask:activeLayer.stairWallMask,
     stairClearance:activeLayer.stairClearance, stairLanding:activeLayer.stairLanding, slabOpening:activeLayer.slabOpening,
     bfs:activeLayer.bfs, maxBfs:activeLayer.maxBfs, lakeMask:activeLayer.lakeMask,
     props:activeLayer.props, spawns:activeLayer.spawns, torches:activeLayer.torches,
@@ -2868,6 +3115,9 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   const idx=(x,y)=>y*W+x, wx=x=>x-W/2+0.5, wz=y=>y-H/2+0.5;
   const cellRng = makeRng(d.seed ^ 0x9e3779b9);
   const dStep = 0.016;
+  const storeyHeight=sourceDungeon.floorHeight || FLOOR_HEIGHT;
+  const decorVerticalScale=storeyHeight / REFERENCE_FLOOR_HEIGHT;
+  const decoratorSet=()=>instSet(decorVerticalScale);
 
   /* moss + pool adjacency masks for floor tinting */
   const mossMask = new Uint8Array(W*H);
@@ -2883,7 +3133,7 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   const base = new THREE.Color(), tint = new THREE.Color(),
         heatA = new THREE.Color(0x2f4bb0), heatB = new THREE.Color(0xe8502f);
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
-    const c=idx(x,y); if(grid[c]!==FLOOR || lakeMask[c] || stairMask[c] || slabOpening[c]) continue;
+    const c=idx(x,y); if(grid[c]!==FLOOR || lakeMask[c] || slabOpening[c]) continue;
     let walls8=0;
     for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
       if(!ox&&!oy) continue;
@@ -2916,16 +3166,33 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     ? buildMesh(fs, GEO.hospitalFloor, matHospitalFloor, 'tile', 0.34, 2)
     : buildMesh(fs, GEO.floor, matStone, 'tile', 0.34, 2);
 
+  /* Every occupied level except the top floor gets an interior ceiling. The
+     opening is sourced from the slab above because stair openings belong to
+     the upper layer's floor contract. */
+  const hasCeiling=activeFloor<(sourceDungeon.layers?.length || 1)-1;
+  if(hasCeiling){
+    const ceilingSet=instSet();
+    const openingAbove=sourceDungeon.layers?.[activeFloor+1]?.slabOpening;
+    const ceilingColor=TH.sceneKit==='hospital' ? 0xd7e0dc : lerpC(TH.wall,TH.cap,.45);
+    for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+      const c=idx(x,y);
+      if((grid[c]!==FLOOR && grid[c]!==POOL) || openingAbove?.[c]) continue;
+      ceilingSet.add(wx(x),(sourceDungeon.floorHeight || FLOOR_HEIGHT)-.04,wz(y),1,1,1,0,ceilingColor,Math.max(0,bfs[c])*dStep+.18);
+    }
+    meshes.ceiling=buildMesh(ceilingSet,GEO.ceiling,
+      TH.sceneKit==='hospital'?matHospitalCeiling:matCeiling,'pop',.34,2);
+  }
+
   /* walls + trim caps */
   const nearFloorBfs = (x,y)=>{ let b=1e4;
     for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
       const nx=x+ox, ny=y+oy;
       if(nx>=0&&ny>=0&&nx<W&&ny<H && bfs[idx(nx,ny)]>=0) b=Math.min(b,bfs[idx(nx,ny)]);
     } return b===1e4?0:b; };
-  /* Door frames are anchored to the room-side endpoint for generation, but
-     the visible frame must sit on the actual room/wall interface. Walk out
-     along the authored side until the owning room ends, then place the frame
-     halfway between the last room cell and the first outside cell. */
+  /* Door frames use the final carved room/corridor interface recorded by the
+     generator. The room walk remains a compatibility fallback for older
+     saved layouts, but current doors never infer their wall plane from the
+     authored endpoint alone. */
   const doorFramePose = a=>{
     const side=a.side || (a.px===1 ? 's' : 'e');
     const nx=Number.isFinite(a.nx) ? a.nx : (side==='e'?1:(side==='w'?-1:0));
@@ -2942,11 +3209,14 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
         bx=qx; by=qy;
       }
     }
-    const cx=ax+tx*(a.len-1)/2, cy=ay+ty*(a.len-1)/2;
+    const cx=Number.isFinite(a.x) ? a.x : ax+tx*(a.len-1)/2;
+    const cy=Number.isFinite(a.y) ? a.y : ay+ty*(a.len-1)/2;
+    const interfaceX=Number.isFinite(a.interfaceX) ? a.interfaceX : bx+nx*0.5;
+    const interfaceY=Number.isFinite(a.interfaceY) ? a.interfaceY : by+ny*0.5;
     return {
       side, nx, ny,
-      X:side==='e' || side==='w' ? wx(bx+nx*0.5) : wx(cx),
-      Z:side==='n' || side==='s' ? wz(by+ny*0.5) : wz(cy),
+      X:side==='e' || side==='w' ? wx(interfaceX) : wx(cx),
+      Z:side==='n' || side==='s' ? wz(interfaceY) : wz(cy),
       signX:-nx*0.18,
       signZ:-ny*0.18,
       horizontal:side==='n' || side==='s',
@@ -2955,6 +3225,8 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   };
   const ws = instSet(), cs = instSet();
   const wcol = new THREE.Color();
+  const doubleHeightWalls=stairDoubleHeightWallCells(sourceDungeon,activeFloor);
+  const coveredUpperWalls=stairCoveredUpperWallCells(sourceDungeon,activeFloor);
   const isDoorWallCut = (x,y)=>{
     const c=idx(x,y);
     if(grid[c]!==WALL) return false;
@@ -2964,8 +3236,13 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
       (y<H-1 && doorway[c+W] && y>0 && grid[c-W]===FLOOR);
   };
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
-    if(grid[idx(x,y)]!==WALL || isDoorWallCut(x,y)) continue;
-    const h = TH.themeAuthority.wallHeight + cellRng.f(-TH.themeAuthority.wallVariation,TH.themeAuthority.wallVariation);
+    const cell=idx(x,y);
+    if(grid[cell]!==WALL || coveredUpperWalls.has(cell) || isDoorWallCut(x,y)) continue;
+    const generatedHeight=Math.min(storeyHeight-.2,
+      (TH.themeAuthority.wallHeight
+        + cellRng.f(-TH.themeAuthority.wallVariation,TH.themeAuthority.wallVariation))
+        * decorVerticalScale);
+    const h=doubleHeightWalls.has(cell) ? storeyHeight+generatedHeight : generatedHeight;
     const dl = nearFloorBfs(x,y)*dStep + 0.30;
     if(TH.sceneKit === 'hospital'){
       wcol.set(0xaebdb8).multiplyScalar(cellRng.f(0.99,1.02));
@@ -2985,23 +3262,23 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
     : buildMesh(cs, GEO.wallCap, matStone, 'pop', 0.3, 1);
 
   /* prop instance sets */
-  const S = { pillar:instSet(), arch:instSet(), archL:instSet(), torchArm:instSet(),
-              flame:instSet(), flameCore:instSet(),
-              debrisA:instSet(), debrisB:instSet(), debrisC:instSet(),
-              hospitalBed:instSet(), ivStand:instSet(), medCabinet:instSet(), surgeryTable:instSet(), hospitalSign:instSet(),
-              nurseCounter:instSet(), doctorDesk:instSet(), examTable:instSet(), wallChart:instSet(), noticeBoard:instSet(), clock:instSet(),
-              receptionDesk:instSet(), waitingBench:instSet(), medCart:instSet(), monitor:instSet(),
-              privacyCurtain:instSet(), surgicalLamp:instSet(), mriScanner:instSet(), wallLight:instSet(),
-              oxygenTank:instSet(), bioBin:instSet(), gurney:instSet(), floorCross:instSet(), floorStripe:instSet(), wallPanel:instSet(),
-              hospitalDoorPost:instSet(), hospitalDoorLintel:instSet(), deptSign:instSet(), cleanZone:instSet(), floorArrow:instSet(),
-              chest:instSet(), chestTrim:instSet(), chestGlow:instSet(),
-              grave:instSet(), sarco:instSet(), candle:instSet(), bone:instSet(),
-              icicle:instSet(), shardIce:instSet(), roots:instSet(), moss:instSet(),
-              crackD:instSet(), skirt:instSet(), bannerRod:instSet(), bannerCloth:instSet(), emblem:instSet(),
-              spawn1:instSet(), spawn2:instSet(), spawn3:instSet(), band2:instSet(), band3:instSet(),
-              crystal:instSet(), ring:instSet(), plinth:instSet(), platform:instSet(),
-              brazier:instSet(), coals:instSet(), basin:instSet(),
-              bossGlow:instSet(), bossRock:instSet() };
+  const S = { pillar:decoratorSet(), arch:decoratorSet(), archL:decoratorSet(), torchArm:decoratorSet(),
+              flame:decoratorSet(), flameCore:decoratorSet(),
+              debrisA:decoratorSet(), debrisB:decoratorSet(), debrisC:decoratorSet(),
+              hospitalBed:decoratorSet(), ivStand:decoratorSet(), medCabinet:decoratorSet(), surgeryTable:decoratorSet(), hospitalSign:decoratorSet(),
+              nurseCounter:decoratorSet(), doctorDesk:decoratorSet(), examTable:decoratorSet(), wallChart:decoratorSet(), noticeBoard:decoratorSet(), clock:decoratorSet(),
+              receptionDesk:decoratorSet(), waitingBench:decoratorSet(), medCart:decoratorSet(), monitor:decoratorSet(),
+              privacyCurtain:decoratorSet(), surgicalLamp:decoratorSet(), mriScanner:decoratorSet(), wallLight:decoratorSet(),
+              oxygenTank:decoratorSet(), bioBin:decoratorSet(), gurney:decoratorSet(), floorCross:decoratorSet(), floorStripe:decoratorSet(), wallPanel:decoratorSet(),
+              hospitalDoorPost:decoratorSet(), hospitalDoorLintel:decoratorSet(), deptSign:decoratorSet(), cleanZone:decoratorSet(), floorArrow:decoratorSet(),
+              chest:decoratorSet(), chestTrim:decoratorSet(), chestGlow:decoratorSet(),
+              grave:decoratorSet(), sarco:decoratorSet(), candle:decoratorSet(), bone:decoratorSet(),
+              icicle:decoratorSet(), shardIce:decoratorSet(), roots:decoratorSet(), moss:decoratorSet(),
+              crackD:decoratorSet(), skirt:decoratorSet(), bannerRod:decoratorSet(), bannerCloth:decoratorSet(), emblem:decoratorSet(),
+              spawn1:decoratorSet(), spawn2:decoratorSet(), spawn3:decoratorSet(), band2:decoratorSet(), band3:decoratorSet(),
+              crystal:decoratorSet(), ring:decoratorSet(), plinth:decoratorSet(), platform:decoratorSet(),
+              brazier:decoratorSet(), coals:decoratorSet(), basin:decoratorSet(),
+              bossGlow:decoratorSet(), bossRock:decoratorSet() };
   const pd = (x,y)=> Math.max(0,bfs[idx(x,y)])*dStep + 0.62;
   const shaftAt = [];
   let portalXZ = null, runeXZ = null;
@@ -3224,32 +3501,40 @@ function buildSceneLayer(sourceDungeon, activeFloor, {frameCamera=false,focusFlo
   /* doorway frames */
   for(const a of d.arches){
     const pose=doorFramePose(a), X=pose.X, Z=pose.Z;
-    const half = a.len/2 + 0.15;
+    const postHalf = TH.sceneKit === 'hospital' ? 0.08 : 0.12;
+    const basePostHeight = TH.sceneKit === 'hospital' ? 1.55 : 1.74;
+    const doorHeight = Number.isFinite(Number(a.doorUnitHeight)) ? Number(a.doorUnitHeight) : 2;
+    const doorVerticalScale = doorHeight / basePostHeight;
+    const frameScaleY = doorVerticalScale / decorVerticalScale;
+    const half = a.len/2 + postHalf;
+    const lintelLength = a.len + postHalf*2;
+    const drawLeadingPost = !a.suppressLeadingPost;
+    const drawTrailingPost = !a.suppressTrailingPost;
     const dlA = nearFloorBfs(pose.bfsX, pose.bfsY)*dStep + 0.7;
     if(TH.sceneKit === 'hospital'){
       const col = lerpC(TH.wall, 0xe8f3ef, 0.35);
       const signC = accC;
       if(pose.horizontal){
-        S.hospitalDoorPost.add(X-half,0,Z, 1,1,1, 0, col, dlA);
-        S.hospitalDoorPost.add(X+half,0,Z, 1,1,1, 0, col, dlA);
-        S.hospitalDoorLintel.add(X,1.52,Z, a.len+0.46,1,1, 0, col, dlA+0.1);
-        S.deptSign.add(X+pose.signX,1.84,Z+pose.signZ, 1,1,1, 0, signC, dlA+0.12);
+        if(drawLeadingPost) S.hospitalDoorPost.add(X-half,0,Z, 1,frameScaleY,1, 0, col, dlA);
+        if(drawTrailingPost) S.hospitalDoorPost.add(X+half,0,Z, 1,frameScaleY,1, 0, col, dlA);
+        S.hospitalDoorLintel.add(X,1.52*doorVerticalScale/decorVerticalScale,Z, lintelLength,frameScaleY,1, 0, col, dlA+0.1);
+        S.deptSign.add(X+pose.signX,1.84*doorVerticalScale/decorVerticalScale,Z+pose.signZ, 1,frameScaleY,1, 0, signC, dlA+0.12);
       } else {
-        S.hospitalDoorPost.add(X,0,Z-half, 1,1,1, 0, col, dlA);
-        S.hospitalDoorPost.add(X,0,Z+half, 1,1,1, 0, col, dlA);
-        S.hospitalDoorLintel.add(X,1.52,Z, a.len+0.46,1,1, Math.PI/2, col, dlA+0.1);
-        S.deptSign.add(X+pose.signX,1.84,Z+pose.signZ, 1,1,1, Math.PI/2, signC, dlA+0.12);
+        if(drawLeadingPost) S.hospitalDoorPost.add(X,0,Z-half, 1,frameScaleY,1, 0, col, dlA);
+        if(drawTrailingPost) S.hospitalDoorPost.add(X,0,Z+half, 1,frameScaleY,1, 0, col, dlA);
+        S.hospitalDoorLintel.add(X,1.52*doorVerticalScale/decorVerticalScale,Z, lintelLength,frameScaleY,1, Math.PI/2, col, dlA+0.1);
+        S.deptSign.add(X+pose.signX,1.84*doorVerticalScale/decorVerticalScale,Z+pose.signZ, 1,frameScaleY,1, Math.PI/2, signC, dlA+0.12);
       }
     } else {
       const col = lerpC(TH.wall, 0xffffff, 0.12);
       if(pose.horizontal){
-        S.arch.add(X-half,0,Z, 1,1,1, 0, col, dlA);
-        S.arch.add(X+half,0,Z, 1,1,1, 0, col, dlA);
-        S.archL.add(X,1.62,Z, a.len+0.42,1,1, 0, col, dlA+0.1);
+        if(drawLeadingPost) S.arch.add(X-half,0,Z, 1,frameScaleY,1, 0, col, dlA);
+        if(drawTrailingPost) S.arch.add(X+half,0,Z, 1,frameScaleY,1, 0, col, dlA);
+        S.archL.add(X,1.62*doorVerticalScale/decorVerticalScale,Z, lintelLength,frameScaleY,1, 0, col, dlA+0.1);
       } else {
-        S.arch.add(X,0,Z-half, 1,1,1, 0, col, dlA);
-        S.arch.add(X,0,Z+half, 1,1,1, 0, col, dlA);
-        S.archL.add(X,1.62,Z, a.len+0.42,1,1, Math.PI/2, col, dlA+0.1);
+        if(drawLeadingPost) S.arch.add(X,0,Z-half, 1,frameScaleY,1, 0, col, dlA);
+        if(drawTrailingPost) S.arch.add(X,0,Z+half, 1,frameScaleY,1, 0, col, dlA);
+        S.archL.add(X,1.62*doorVerticalScale/decorVerticalScale,Z, lintelLength,frameScaleY,1, Math.PI/2, col, dlA+0.1);
       }
     }
   }
@@ -3616,7 +3901,7 @@ function createBuildTimeline(depthSpan){
   });
   return {stages,byId:Object.fromEntries(stages.map(stage=>[stage.id,stage])),end:cursor};
 }
-const STRUCTURE_REVEAL_KEYS=new Set(['floor','wall','wallCap','arch','archL','hospitalDoorPost','hospitalDoorLintel']);
+const STRUCTURE_REVEAL_KEYS=new Set(['floor','ceiling','wall','wallCap','arch','archL','hospitalDoorPost','hospitalDoorLintel']);
 const ATMOSPHERE_REVEAL_KEYS=new Set([
   'flame','flameCore','coals','chestGlow','emblem','band2','band3','crystal','ring','bossGlow',
   'wallLight','deptSign','floorCross','floorStripe','cleanZone','floorArrow'
@@ -3631,7 +3916,7 @@ function configureRevealSchedules(sceneMeshes,timeline){
   for(const [key,mesh] of Object.entries(sceneMeshes)){
     if(ATMOSPHERE_REVEAL_KEYS.has(key)) setMeshRevealWindow(mesh,atmosphere.start,atmosphere.end);
     else if(STRUCTURE_REVEAL_KEYS.has(key)){
-      const offset=key==='floor'?0:(key==='wall'?0.16:0.34);
+      const offset=key==='floor'?0:(key==='wall'?0.16:(key==='ceiling'?0.26:0.34));
       setMeshRevealWindow(mesh,structure.start+offset,structure.end);
     } else setMeshRevealWindow(mesh,rooms.start,rooms.end);
   }
@@ -4525,7 +4810,7 @@ function defaultLinkRoute(A,B){
   assignEdgeRoute(e);
   return edgeRoutePoints(e);
 }
-function linkWidth(l){ return Math.max(1, Math.min(3, Number.isFinite(l && l.width) ? l.width : 2)); }
+function linkWidth(l){ return normalizeCorridorWidth(Number.isFinite(l && l.width) ? l.width : CORRIDOR_WIDTH_MIN); }
 function clampDoorOffset(v){ return Math.max(-0.82, Math.min(0.82, Number.isFinite(v) ? v : 0)); }
 function pointToDoorSpec(room, p){
   const x0=room.x-room.w/2, x1=room.x+room.w/2, y0=room.y-room.h/2, y1=room.y+room.h/2;
@@ -4605,22 +4890,18 @@ function linkAutoRoute(l){
   if(l && Array.isArray(l.bends) && l.bends.length) return null;
   return autoRouteFresh(l);
 }
-function linkDispWidth(l){ return Number.isFinite(l && l.autoWidth) ? l.autoWidth : linkWidth(l); }
-/* Width two stamps [c,c+1], so its visual centre is +0.5 on both axes.
-   Width one and three are symmetric and require no correction. Endpoints only
-   shift perpendicular to their segment so doors remain on the room wall. */
+function linkDispWidth(l){
+  return normalizeCorridorWidth(Number.isFinite(l && l.autoWidth) ? l.autoWidth : linkWidth(l));
+}
+/* Width two stamps [c,c+1], so its visual centre is +0.5 across the corridor.
+   Keep the route endpoints on the wall axis; at a bend the two perpendicular
+   shifts meet at one shared corner. */
 function autoRouteDrawPts(l, pts){
   if(!linkAutoRoute(l) || pts.length<2) return pts;
-  const off = corridorCenterOffset(linkDispWidth(l));
-  if(!off) return pts;
-  const out = pts.map(p=>({x:p.x+off, y:p.y+off}));
-  const fixEnd=(i,j)=>{
-    const a=pts[i], b=pts[j];
-    if(a.y===b.y && a.x!==b.x) out[i].x=a.x;
-    else if(a.x===b.x && a.y!==b.y) out[i].y=a.y;
-  };
-  fixEnd(0,1); fixEnd(pts.length-1,pts.length-2);
-  return out;
+  return pts.map((p,index)=>{
+    const shift=corridorCenterShiftAt(pts,index,linkDispWidth(l));
+    return { ...p, x:p.x+shift.x, y:p.y+shift.y };
+  });
 }
 function linkDoorPoint(l, which){
   const A=editorRoom(l.a), B=editorRoom(l.b); if(!A || !B) return null;
@@ -5357,8 +5638,11 @@ function makeRouteBandGeometry(edges, width, y){
   for(const e of edges){
     if(!e.useEditorRoute) continue;
     const bandWidth = Math.max(0.5, Number.isFinite(e.visualWidth) ? e.visualWidth : width);
-    const centerOffset=corridorCenterOffset(bandWidth);
-    const pts=edgeRoutePoints(e).map(p=>({x:p.x-D.W/2+0.5+centerOffset, y:p.y-D.H/2+0.5+centerOffset}));
+    const sourcePts=edgeRoutePoints(e);
+    const pts=sourcePts.map((p,index)=>{
+      const shift=corridorCenterShiftAt(sourcePts,index,bandWidth);
+      return {x:p.x-D.W/2+0.5+shift.x, y:p.y-D.H/2+0.5+shift.y};
+    });
     for(let i=0;i<pts.length-1;i++){
       const a=pts[i], b=pts[i+1], dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy);
       if(len<=0) continue;
@@ -5393,7 +5677,10 @@ function syncDungeonRoutesFromEditor(){
         e.bx=b.x; e.by=b.y; if(b.side) e.bside=b.side;
       }
     }
-    e.visualWidth = linkWidth(l);
+    // Keep the preview on the carved width when a constrained door forced a
+    // narrower common width; clear autoWidth when the user changes width so
+    // the next edit still previews the new requested value.
+    e.visualWidth = linkDispWidth(l);
   }
 }
 function updateRouteOverlay(){
@@ -5686,7 +5973,7 @@ function drawEditor(){
   if(link) status = '已选路径 · ' + (link.manual?'手动':'生成') + ' · ' + (Array.isArray(link.bends)?link.bends.length:0) + ' 个转折点';
   const selectedStair=editorStairForLink(link);
   if(selectedStair){
-    status='已选楼梯 · '+((selectedStair.previewStyle || selectedStair.style)==='straight'?'直跑':'L 型')+' · 宽 '+formatStairWidth(selectedStair.previewWidth || selectedStair.width)+' · '+stairWidthHandleGlyph()+' 拖动改宽 · 0.25 步进 · '+(selectedStair.mode==='locked'?'已锁定':'稳定自动')+(selectedStair.invalid?' · 冲突':'');
+    status='已选楼梯 · '+((selectedStair.previewStyle || selectedStair.style)==='straight'?'直跑':'L 型')+' · 宽 '+formatStairWidth(selectedStair.previewWidth || selectedStair.width)+' · '+stairWidthHandleGlyph()+' 拖动改宽 · 1m 地砖卡尺 · '+(selectedStair.mode==='locked'?'已锁定':'稳定自动')+(selectedStair.invalid?' · 冲突':'');
   }
   if(selected) status = (selected.locked?'已选锁定':'已选可动') + ' · 区域#' + (si+1);
   if(floatingCount) status = '有 ' + floatingCount + ' 个悬浮区域 · 可作为密室';
@@ -6154,9 +6441,9 @@ function initEditor(){
       } else if(ctx && ctx.link && action==='reset-link'){
         ctx.link.bends=[]; ctx.link.doorA=null; ctx.link.doorB=null; hideEditorMenu(); drawEditor(); forgeFromEditor(false);
       } else if(ctx && ctx.link && action==='narrower'){
-        ctx.link.width=Math.max(1, linkWidth(ctx.link)-1); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
+        ctx.link.autoWidth=null; ctx.link.width=Math.max(CORRIDOR_WIDTH_MIN, linkWidth(ctx.link)-CORRIDOR_WIDTH_STEP); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
       } else if(ctx && ctx.link && action==='wider'){
-        ctx.link.width=Math.min(3, linkWidth(ctx.link)+1); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
+        ctx.link.autoWidth=null; ctx.link.width=Math.min(CORRIDOR_WIDTH_MAX, linkWidth(ctx.link)+CORRIDOR_WIDTH_STEP); hideEditorMenu(); drawEditor(); forgeFromEditor(false);
       } else if(ctx && ctx.link && action==='delete-link'){
         blockEditorLink(ctx.link.a, ctx.link.b);
         editor.links=editor.links.filter(l=>l!==ctx.link);
@@ -6348,9 +6635,9 @@ function initEditor(){
       const drag=editor.drag, dx=editorSnap(p.x-drag.start.x), dy=editorSnap(p.y-drag.start.y), s=drag.stairStart;
       drag.delta={x:dx,y:dy};
        drag.link.stair={...drag.link.stair,
-         lower:{x:s.lower.x+dx,y:s.lower.y+dy},turn:s.turn?{x:s.turn.x+dx,y:s.turn.y+dy}:null,upper:{x:s.upper.x+dx,y:s.upper.y+dy},
-        lowerApproach:{x:s.lowerApproach.x+dx,y:s.lowerApproach.y+dy},upperApproach:{x:s.upperApproach.x+dx,y:s.upperApproach.y+dy}};
-      drag.stair.previewAnchor={x:s.anchor.x+dx,y:s.anchor.y+dy};
+         lower:{x:editorSnap(s.lower.x+dx),y:editorSnap(s.lower.y+dy)},turn:s.turn?{x:editorSnap(s.turn.x+dx),y:editorSnap(s.turn.y+dy)}:null,upper:{x:editorSnap(s.upper.x+dx),y:editorSnap(s.upper.y+dy)},
+        lowerApproach:{x:editorSnap(s.lowerApproach.x+dx),y:editorSnap(s.lowerApproach.y+dy)},upperApproach:{x:editorSnap(s.upperApproach.x+dx),y:editorSnap(s.upperApproach.y+dy)}};
+      drag.stair.previewAnchor={x:editorSnap(s.anchor.x+dx),y:editorSnap(s.anchor.y+dy)};
       drag.stair.previewDirection=drag.stair.previewDirection || drag.stair.direction || drag.link.stair.direction;
       drag.stair.invalid=false; drag.stair.error=''; editor.stairError='';
       drawEditor(); return;
@@ -6426,7 +6713,7 @@ function initEditor(){
     }
     if(editor.drag.mode==='stairMove'){
       const {stair,stairStart,delta}=editor.drag;
-      const anchor={x:stairStart.anchor.x+(delta?.x||0),y:stairStart.anchor.y+(delta?.y||0)};
+      const anchor={x:editorSnap(stairStart.anchor.x+(delta?.x||0)),y:editorSnap(stairStart.anchor.y+(delta?.y||0))};
       stair.mode='locked'; stair.manualPreview=!!stair.pending; stair.previewAnchor=anchor;
       stair.previewDirection=stair.previewDirection || stair.direction;
       if(!stair.pending){ stair.anchor={...anchor}; stair.direction=stair.previewDirection; }
@@ -6578,9 +6865,17 @@ function forge(animate, useEditorLayout=false){
   el.vTheme.textContent = TH.paletteLabel;
   el.dname.textContent = d.name;
   const st = d.stats;
+  const stairAudits=Array.isArray(d.stairAudits)?d.stairAudits:[];
+  const passedStairAudits=stairAudits.filter(audit=>audit.pass).length;
+  const stairAuditStatus=stairAudits.length
+    ? ' · '+(passedStairAudits===stairAudits.length
+      ? '<span class="ok">楼梯验收 '+passedStairAudits+'/'+stairAudits.length+' ✓</span>'
+      : '<span class="bad">楼梯验收 '+passedStairAudits+'/'+stairAudits.length+'</span>')
+    : '';
   el.dsub.innerHTML = '<span style="color:var(--ember)">' + TH.label + '</span>' +
     ' \u00b7 \u79cd\u5b50 ' + d.seed +
-    ' \u00b7 ' + (d.valid ? '<span class="ok">\u5df2\u8fde\u901a \u2713</span>' : '<span class="bad">\u6709\u60ac\u6d6e\u533a\u57df</span>');
+    ' \u00b7 ' + (d.valid ? '<span class="ok">\u5df2\u8fde\u901a \u2713</span>' : '<span class="bad">\u6709\u60ac\u6d6e\u533a\u57df</span>')
+    + stairAuditStatus;
   el.sRooms.textContent  = st.rooms;
   el.sEdges.textContent  = st.edges + ' \u00b7 ' + st.loops;
   el.sCrit.textContent   = st.critLen + ' \u6bb5';
@@ -6718,7 +7013,7 @@ cnv.addEventListener('contextmenu', e=>e.preventDefault());
 cnv.addEventListener('wheel', e=>{
   if(gameplay.isActive()) return;
   e.preventDefault();
-  camDist = Math.min(360, Math.max(45, camDist*Math.exp(e.deltaY*0.0012)));
+  camDist = Math.min(CAMERA_MAX_DISTANCE, Math.max(CAMERA_MIN_DISTANCE, camDist*Math.exp(e.deltaY*0.0012)));
   updateCam();
 }, {passive:false});
 

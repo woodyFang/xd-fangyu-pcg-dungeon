@@ -1,4 +1,19 @@
-export const STAIR_WIDTH = Object.freeze({ min:1, max:5, step:.25, defaultValue:2 });
+export const STAIR_WIDTH = Object.freeze({ min:1, max:5, step:1, defaultValue:2 });
+export const STAIR_PLACEMENT_GRID = 1;
+
+export function snapStairGridValue(value, grid = STAIR_PLACEMENT_GRID) {
+  const numeric=Number(value);
+  const step=Number.isFinite(Number(grid))&&Number(grid)>0 ? Number(grid) : STAIR_PLACEMENT_GRID;
+  if(!Number.isFinite(numeric)) return null;
+  const snapped=Math.round(numeric/step)*step;
+  return Object.is(snapped,-0) ? 0 : Number(snapped.toFixed(6));
+}
+
+export function snapStairGridPoint(point, grid = STAIR_PLACEMENT_GRID) {
+  if(!point) return null;
+  const x=snapStairGridValue(point.x,grid),y=snapStairGridValue(point.y,grid);
+  return x===null||y===null ? null : {...point,x,y};
+}
 
 export const STAIR_DIRECTIONS = Object.freeze({
   east: Object.freeze({ x:1, y:0, name:'east', next:'south' }),
@@ -20,13 +35,14 @@ export function snapStairWidth(width, {
 }
 
 export function stairGridSpan(width = 1) {
-  const value=Number.isFinite(Number(width))?Number(width):1;
-  return Math.max(1,Math.ceil(value));
+  return snapStairWidth(width);
 }
 
 export function stairLateralCenterOffset(width = 1, preservedOffset) {
-  if(Number.isFinite(Number(preservedOffset))) return Number(preservedOffset);
-  return stairGridSpan(width)%2===0?.5:0;
+  const normalizedWidth=snapStairWidth(width);
+  const base=normalizedWidth%2===0?.5:0;
+  if(!Number.isFinite(Number(preservedOffset))) return base;
+  return base+Math.round((Number(preservedOffset)-base)/STAIR_PLACEMENT_GRID)*STAIR_PLACEMENT_GRID;
 }
 
 export function stairRunCenter(point, direction, width = 1, preservedOffset) {
@@ -49,7 +65,8 @@ export function stairShape(style, directionName, length, anchor) {
   const first=STAIR_DIRECTIONS[directionName];
   if(!first || !anchor) return null;
   const normalizedStyle=normalizeStairStyle(style);
-  const lower={...anchor};
+  const lower=snapStairGridPoint(anchor);
+  if(!lower) return null;
   if(normalizedStyle==='straight'){
     const upper={x:lower.x+first.x*length,y:lower.y+first.y*length};
     return {style:normalizedStyle,lower,turn:null,upper,first,second:first,
@@ -65,9 +82,11 @@ export function stairShape(style, directionName, length, anchor) {
 }
 
 export function stairEndpoints(lower, direction, run, style = 'l-turn') {
+  const snappedLower=snapStairGridPoint(lower);
+  if(!snappedLower) return null;
   const directionName=direction?.name || Object.keys(STAIR_DIRECTIONS)
     .find(name=>STAIR_DIRECTIONS[name].x===direction?.x && STAIR_DIRECTIONS[name].y===direction?.y);
-  const shape=stairShape(style,directionName,run,lower);
+  const shape=stairShape(style,directionName,run,snappedLower);
   if(shape){
     return {
       turn:shape.turn,
@@ -79,13 +98,13 @@ export function stairEndpoints(lower, direction, run, style = 'l-turn') {
   }
   const normalizedStyle=normalizeStairStyle(style);
   if(normalizedStyle==='straight'){
-    return {turn:null,upper:{x:lower.x+direction.x*run,y:lower.y+direction.y*run},
+    return {turn:null,upper:{x:snappedLower.x+direction.x*run,y:snappedLower.y+direction.y*run},
       secondDirection:{...direction},firstRun:run,secondRun:0};
   }
   const firstRun=Math.max(3,Math.floor(run/2));
   const secondRun=Math.max(3,run-firstRun);
   const secondDirection=stairTurnDirection(direction);
-  const turn={x:lower.x+direction.x*firstRun,y:lower.y+direction.y*firstRun};
+  const turn={x:snappedLower.x+direction.x*firstRun,y:snappedLower.y+direction.y*firstRun};
   return {turn,upper:{x:turn.x+secondDirection.x*secondRun,y:turn.y+secondDirection.y*secondRun},
     secondDirection,firstRun,secondRun};
 }
@@ -98,33 +117,36 @@ export function resolveStairStructure({
   style='l-turn',
   lateralCenterOffset
 }) {
+  const snappedLower=snapStairGridPoint(lower);
+  const normalizedWidth=snapStairWidth(width);
+  const normalizedLateralOffset=stairLateralCenterOffset(normalizedWidth,lateralCenterOffset);
   const normalizedStyle=normalizeStairStyle(style);
-  const endpoints=stairEndpoints(lower,direction,run,normalizedStyle);
+  const endpoints=stairEndpoints(snappedLower,direction,run,normalizedStyle);
   const platform=normalizedStyle==='l-turn' ? stairTurnPlatformMetrics({
-    lower,
+    lower:snappedLower,
     turn:endpoints.turn,
     upper:endpoints.upper,
     firstRun:endpoints.firstRun,
     secondRun:endpoints.secondRun,
-    width,
-    lateralCenterOffset,
+    width:normalizedWidth,
+    lateralCenterOffset:normalizedLateralOffset,
     directionVector:direction,
     secondDirectionVector:endpoints.secondDirection
   }) : null;
   return {
     style:normalizedStyle,
-    lower:{...lower},
+    lower:{...snappedLower},
     turn:endpoints.turn ? {...endpoints.turn} : null,
     anchorUpper:{...endpoints.upper},
     direction:{...direction},
     secondDirection:{...endpoints.secondDirection},
     firstRun:endpoints.firstRun,
     secondRun:endpoints.secondRun,
-    width,
-    lateralCenterOffset:stairLateralCenterOffset(width,lateralCenterOffset),
+    width:normalizedWidth,
+    lateralCenterOffset:normalizedLateralOffset,
     platform,
     visualUpper:platform ? {...platform.second.end} : stairRunCenter(
-      endpoints.upper,endpoints.secondDirection,width,lateralCenterOffset
+      endpoints.upper,endpoints.secondDirection,normalizedWidth,normalizedLateralOffset
     )
   };
 }
@@ -147,8 +169,8 @@ export function stairTurnPlatformMetrics(connector) {
     : {x:-first.y,y:first.x};
   const inferredSecondLength=Math.max(.001,Math.hypot(inferredSecond.x,inferredSecond.y));
   const second=connector.secondDirectionVector || {x:inferredSecond.x/inferredSecondLength,y:inferredSecond.y/inferredSecondLength};
-  const offset=stairLateralCenterOffset(connector.width,connector.lateralCenterOffset);
-  const visualWidth=Number.isFinite(Number(connector.width))?Math.max(.01,Number(connector.width)):1;
+  const visualWidth=snapStairWidth(connector.width);
+  const offset=stairLateralCenterOffset(visualWidth,connector.lateralCenterOffset);
   const firstStart=stairRunCenter(connector.lower || connector.turn,first,visualWidth,offset);
   const entry={x:firstStart.x+first.x*firstRun,y:firstStart.y+first.y*firstRun};
   const center={x:entry.x+first.x*visualWidth/2,y:entry.y+first.y*visualWidth/2};
