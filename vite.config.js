@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { fileURLToPath } from 'node:url';
 
 // Single-page Vite app. `base: './'` makes the production build path-relative, so
 // the contents of `dist/` can be dropped onto any static host (Netlify, GitHub
@@ -8,5 +9,11 @@ export default defineConfig({
   build: {
     target: 'es2020',
     outDir: 'dist',
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        stairRuleTest: fileURLToPath(new URL('./stair-rule-test.html', import.meta.url)),
+      },
+    },
   },
 });
